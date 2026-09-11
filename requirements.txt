@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+tortoise-orm
+aerich
+pydantic-settings
+python-dotenv
+bcrypt
+pyjwt
+tzdata

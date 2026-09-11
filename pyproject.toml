@@ -1,0 +1,4 @@
+[tool.tortoise]
+tortoise_orm = "app.core.config.TORTOISE_ORM"
+location = "./migrations"
+src_folder = "./."
