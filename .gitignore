@@ -10,3 +10,4 @@ run.bat
 # Manual safety copies taken before a migration or a data change. Never committed —
 # these are whole branch/cloud databases.
 *.db.bak-*
+*.replaced
