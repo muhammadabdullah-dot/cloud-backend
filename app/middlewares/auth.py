@@ -30,3 +30,19 @@ def require_permission(resource: str, action: str):
         return user
 
     return checker
+
+
+def require_any_permission(*pairs: tuple[str, str]):
+    """Passes if the caller holds ANY of the given (resource, action) pairs — for read-only data
+    that more than one module legitimately needs. The branch list is the clearest case: it is
+    registered under Admin, but Executive ranks by it and Warehouse ships to it, and none of those
+    three resources is a subset of another. Writes always stay on a single owning resource."""
+
+    async def checker(user: User = Depends(get_current_user)) -> User:
+        for resource, action in pairs:
+            if await has_permission(user, resource, action):
+                return user
+        wanted = ", ".join(f"{a} on {r}" for r, a in pairs)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, f"Missing any of: {wanted}")
+
+    return checker
