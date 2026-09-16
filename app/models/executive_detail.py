@@ -48,6 +48,8 @@ class BranchTillClose(models.Model):
     day = fields.DateField()
     session_number = fields.CharField(max_length=40)
     cashier_name = fields.CharField(max_length=140)
+    # Which counter the drawer belonged to. Null from a branch still on one till for the whole shop.
+    counter_name = fields.CharField(max_length=80, null=True)
     opened_at = fields.DatetimeField(null=True)
     closed_at = fields.DatetimeField(null=True)
     opening_float = fields.DecimalField(max_digits=16, decimal_places=2, default=0)
@@ -58,6 +60,32 @@ class BranchTillClose(models.Model):
     class Meta:
         table = "branch_till_closes"
         ordering = ["-closed_at"]
+
+
+class BranchStaffDuty(models.Model):
+    """Who was on a counter, where, and for how long — per branch, per day, per person.
+
+    This is the one staffing fact head office cannot work out backwards from sales. Everything else it
+    knows about people is a by-product of trading, so somebody who stood on the floor all morning and
+    sold nothing does not exist in it. Duty is recorded by the branch when a manager puts a person on a
+    counter (or a cashier opens a till at one), so an empty day here means nobody was assigned, not that
+    nobody was there.
+    """
+
+    id = fields.UUIDField(pk=True)
+    branch: fields.ForeignKeyRelation["Branch"] = fields.ForeignKeyField(
+        "models.Branch", related_name="staff_duties"
+    )
+    day = fields.DateField()
+    cashier_name = fields.CharField(max_length=140)
+    counter_name = fields.CharField(max_length=80, null=True)
+    # Spells, not sessions: somebody moved from one counter to another and back has three.
+    spells = fields.IntField(default=0)
+    minutes = fields.IntField(default=0)
+
+    class Meta:
+        table = "branch_staff_duties"
+        unique_together = (("branch", "day", "cashier_name", "counter_name"),)
 
 
 class BranchTenderStat(models.Model):

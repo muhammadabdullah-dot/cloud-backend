@@ -105,6 +105,30 @@ class BranchProductStat(models.Model):
         unique_together = (("branch", "day", "product_sku"),)
 
 
+class BranchProductCashierStat(models.Model):
+    """Per item per person per day: who sold how much of what.
+
+    The person is whoever rang the bill (the sale's cashier), the same attribution Best Salesperson uses. Summed over
+    people it gives back the item's own day in BranchProductStat; summed over items, what that person sold. It is what
+    lets an item open onto the people who sold it, and a person onto the items they sold."""
+    id = fields.UUIDField(pk=True)
+    branch: fields.ForeignKeyRelation["Branch"] = fields.ForeignKeyField(
+        "models.Branch", related_name="product_cashier_stats"
+    )
+    day = fields.DateField()
+    product_sku = fields.CharField(max_length=60)
+    cashier_name = fields.CharField(max_length=140)
+    # Bills the item was on, so "sold 24 over 3 bills" and "sold 24 on one bill" read differently.
+    invoices = fields.IntField(default=0)
+    qty = fields.DecimalField(max_digits=16, decimal_places=3, default=0)
+    net_sales = fields.DecimalField(max_digits=16, decimal_places=2, default=0)
+    cogs = fields.DecimalField(max_digits=16, decimal_places=2, default=0)
+
+    class Meta:
+        table = "branch_product_cashier_stats"
+        unique_together = (("branch", "day", "product_sku", "cashier_name"),)
+
+
 class BranchStockAlert(models.Model):
     """Current stock exceptions at a branch — out of stock, running low, near expiry, expired.
 

@@ -12,6 +12,14 @@ class Settings(BaseSettings):
     # credentials is safe per the CORS spec). Revisit before any real deployment: set this to
     # the actual frontend origin(s) via .env instead of leaving it wide open.
     cors_origins: str = "*"
+    # Item pictures and attachments. Served only through authenticated endpoints, never as a static folder.
+    media_dir: str = "./media"
+
+    # Where the server's log goes (server.log, rotated). Blank = a "logs" folder beside the database.
+    log_dir: str = ""
+    # The built app this server hands out on its own port. Blank = the app's dist/ folder in this
+    # repo (cloud-app/dist); a path = that folder; "off" = API only.
+    frontend_dir: str = ""
 
 
 settings = Settings()

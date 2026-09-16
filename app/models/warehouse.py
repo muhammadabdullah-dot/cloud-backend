@@ -10,7 +10,7 @@ the registered branch.
 """
 from tortoise import fields, models
 
-MOVEMENT_KINDS = ("receive", "dispatch", "count-correction", "adjust")
+MOVEMENT_KINDS = ("receive", "dispatch", "count-correction", "adjust", "move")
 REQUISITION_STATUSES = ("pending", "approved", "rejected")
 # The full pass-the-pen lifecycle. Cloud owns this record (contracts.md §5.4) — it is the source
 # of dispatch truth — and the receiving branch sees the same row rather than a mirrored copy.
@@ -34,6 +34,8 @@ class StockMovement(models.Model):
         "models.User", related_name="warehouse_movements", null=True
     )
     at = fields.DatetimeField()
+    # What one unit was worth at cost when it moved. Null on older movements.
+    unit_cost = fields.DecimalField(max_digits=14, decimal_places=4, null=True)
 
     class Meta:
         table = "warehouse_stock_movements"
@@ -70,6 +72,10 @@ class GRN(models.Model):
     received_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
         "models.User", related_name="warehouse_grns", null=True
     )
+    # The order this delivery was received against, if any.
+    purchase_order: fields.ForeignKeyNullableRelation["PurchaseOrder"] = fields.ForeignKeyField(
+        "models.PurchaseOrder", related_name="grns", null=True, on_delete=fields.SET_NULL
+    )
     at = fields.DatetimeField(auto_now_add=True)
 
     class Meta:
@@ -91,6 +97,10 @@ class GRNLine(models.Model):
     disc_percent = fields.DecimalField(max_digits=6, decimal_places=2, default=0)
     expiry = fields.DatetimeField(null=True)
     tax_rate = fields.DecimalField(max_digits=6, decimal_places=2, default=0)
+    # Where this line was put away. Null on GRNs from before each line had its own bin (they used the GRN's bin).
+    bin: fields.ForeignKeyNullableRelation["Bin"] = fields.ForeignKeyField(
+        "models.Bin", related_name="grn_lines", null=True, on_delete=fields.SET_NULL
+    )
 
     class Meta:
         table = "warehouse_grn_lines"
@@ -120,11 +130,21 @@ class Requisition(models.Model):
 
 
 class Transfer(models.Model):
+    """Stock on its way to a branch — from the central godown, or from another branch.
+
+    `branch` is always where it's going. `source_branch` is null when it leaves the godown, and is the
+    sending branch for a branch-to-branch transfer, which that branch dispatches itself and head office
+    relays. Either way the receiving branch counts what arrived and its receipt comes back up here."""
     id = fields.UUIDField(pk=True)
     transfer_number = fields.CharField(max_length=30, unique=True)
     branch: fields.ForeignKeyRelation["Branch"] = fields.ForeignKeyField(
         "models.Branch", related_name="transfers"
     )
+    source_branch: fields.ForeignKeyNullableRelation["Branch"] = fields.ForeignKeyField(
+        "models.Branch", related_name="outbound_transfers", null=True, on_delete=fields.SET_NULL
+    )
+    notes = fields.CharField(max_length=255, null=True)
+    received_by_name = fields.CharField(max_length=120, null=True)
     # Set when a requisition produced this transfer, so the two stay linked rather than the
     # requisition simply flipping status and the connection living only in someone's memory.
     requisition: fields.ForeignKeyNullableRelation["Requisition"] = fields.ForeignKeyField(
@@ -140,7 +160,23 @@ class Transfer(models.Model):
     # A short receipt is money, so it becomes a visible dispute with qty_sent frozen rather than
     # being quietly overwritten by whatever arrived.
     dispute_open = fields.BooleanField(default=False)
+    # The receiving branch held the shipment back from being received, and why.
+    hold_note = fields.CharField(max_length=255, null=True)
+    held_at = fields.DatetimeField(null=True)
+    held_by_name = fields.CharField(max_length=120, null=True)
     dispute_note = fields.CharField(max_length=255, null=True)
+    # The receiving branch's answer before anything leaves: awaiting · acknowledged · declined, or skipped (the
+    # branch asked for it, or has no server of its own) · overridden (sent after the branch stayed offline, with
+    # a written reason). Null on transfers from before this step existed.
+    ack_status = fields.CharField(max_length=12, null=True)
+    ack_requested_at = fields.DatetimeField(null=True)
+    ack_at = fields.DatetimeField(null=True)
+    ack_by_name = fields.CharField(max_length=120, null=True)
+    ack_note = fields.CharField(max_length=255, null=True)
+    override_reason = fields.CharField(max_length=255, null=True)
+    override_by_name = fields.CharField(max_length=120, null=True)
+    override_at = fields.DatetimeField(null=True)
+    cancelled_at = fields.DatetimeField(null=True)
 
     class Meta:
         table = "transfers"
@@ -157,6 +193,8 @@ class TransferLine(models.Model):
     )
     qty_sent = fields.DecimalField(max_digits=16, decimal_places=3)
     qty_received = fields.DecimalField(max_digits=16, decimal_places=3, null=True)
+    # What one unit cost the sender when it left (the godown's average cost, or the sending branch's).
+    unit_cost = fields.DecimalField(max_digits=14, decimal_places=4, null=True)
 
     class Meta:
         table = "transfer_lines"
@@ -185,4 +223,26 @@ class CycleCount(models.Model):
 
     class Meta:
         table = "cycle_counts"
+        ordering = ["-at"]
+
+
+class BinMove(models.Model):
+    """Stock moved from one bin to another — put away from where it was received, or tidied. The ledger gets a
+    `move` out of one bin and a `move` into the other under the same number, so the godown total never changes."""
+
+    id = fields.UUIDField(pk=True)
+    number = fields.CharField(max_length=20, unique=True)
+    product: fields.ForeignKeyRelation["Product"] = fields.ForeignKeyField("models.Product", related_name="bin_moves")
+    from_bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField("models.Bin", related_name="moves_out")
+    to_bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField("models.Bin", related_name="moves_in")
+    qty = fields.DecimalField(max_digits=16, decimal_places=3)
+    note = fields.CharField(max_length=255, null=True)
+    moved_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
+        "models.User", related_name="bin_moves", null=True, on_delete=fields.SET_NULL
+    )
+    moved_by_name = fields.CharField(max_length=120, null=True)
+    at = fields.DatetimeField()
+
+    class Meta:
+        table = "warehouse_bin_moves"
         ordering = ["-at"]

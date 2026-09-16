@@ -5,6 +5,9 @@ class Role(models.Model):
     id = fields.CharField(max_length=40, pk=True)
     name = fields.CharField(max_length=80)
     landing = fields.CharField(max_length=120)
+    # The role's standard access as last handed out to its people at startup. Only what's been added
+    # since goes out next time, so a screen an admin deliberately took away stays away.
+    rolled_out_resources = fields.JSONField(null=True)
 
     class Meta:
         table = "roles"

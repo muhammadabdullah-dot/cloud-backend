@@ -46,6 +46,9 @@ class BinOut(BaseModel):
     label: str
     priority: int
     capacityUnits: int
+    level: int | None = None
+    position: int | None = None
+    active: bool = True
 
 
 class BalanceOut(BaseModel):
@@ -55,6 +58,9 @@ class BalanceOut(BaseModel):
     binId: str | None = None
     binLabel: str | None = None
     balance: Qty
+    # The Item's sale price and average cost, so stock can be valued without holding the whole master.
+    price: Money | None = None
+    avgCost: Money | None = None
 
 
 class BalanceListOut(BaseModel):
@@ -106,6 +112,8 @@ class GRNLineIn(BaseModel):
     discPercent: Decimal = Decimal("0")
     expiry: datetime | None = None
     taxRate: Decimal = Decimal("0")
+    # The bin this line goes into. Empty: the Item's home bin, else the GRN's bin.
+    binId: str | None = None
 
 
 class GRNCreateRequest(BaseModel):
@@ -115,6 +123,8 @@ class GRNCreateRequest(BaseModel):
     gstMode: str = "normal"
     advanceTax: Decimal = Decimal("0")
     approved: bool = False
+    # Receiving against an approved purchase order ticks off what arrived.
+    purchaseOrderId: str | None = None
     lines: list[GRNLineIn]
 
 
@@ -128,6 +138,8 @@ class GRNLineOut(BaseModel):
     discPercent: Decimal
     expiry: datetime | None = None
     taxRate: Decimal
+    binId: str | None = None
+    binLabel: str | None = None
 
 
 class GRNOut(BaseModel):
@@ -207,12 +219,47 @@ class TransferOut(BaseModel):
     receivedAt: datetime | None = None
     disputeOpen: bool
     disputeNote: str | None = None
+    # Null source = the central godown; otherwise the branch that sent it.
+    sourceBranchId: str | None = None
+    sourceBranchName: str | None = None
+    sourceBranchCode: str | None = None
+    notes: str | None = None
+    receivedBy: str | None = None
+    # The receiving branch has held it back from being received: why, by whom, when.
+    holdNote: str | None = None
+    heldBy: str | None = None
+    heldAt: datetime | None = None
+    # Whether the receiving branch has its own server (and so receives this itself).
+    branchReceivesItself: bool = False
+    # The receiving branch's answer before anything leaves: awaiting · acknowledged · declined · skipped · overridden.
+    ackStatus: str | None = None
+    ackRequestedAt: datetime | None = None
+    ackAt: datetime | None = None
+    ackBy: str | None = None
+    ackNote: str | None = None
+    overrideReason: str | None = None
+    overrideBy: str | None = None
+    overrideAt: datetime | None = None
+    # When the receiving branch last checked in, and whether that's long enough ago to send without its answer.
+    branchLastSeenAt: datetime | None = None
+    canSendWithoutAnswer: bool = False
     lines: list[TransferLineOut]
 
 
 class TransferListOut(BaseModel):
     items: list[TransferOut]
     total: int
+
+
+class TransferCreateLine(BaseModel):
+    productId: str
+    qty: Decimal
+
+
+class TransferCreateRequest(BaseModel):
+    branchId: str
+    notes: str | None = None
+    lines: list[TransferCreateLine]
 
 
 class DispatchRequest(BaseModel):
@@ -232,6 +279,10 @@ class ReceiveTransferRequest(BaseModel):
 
 class ResolveDisputeRequest(BaseModel):
     note: str | None = None
+
+
+class TransferReasonRequest(BaseModel):
+    reason: str | None = None
 
 
 # ── cycle counts ────────────────────────────────────────────────────────────

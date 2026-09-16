@@ -31,8 +31,10 @@ class SyncInboxEvent(models.Model):
     # how long the branch was offline, which is a real operational fact worth being able to see.
     occurred_at = fields.DatetimeField(null=True)
     received_at = fields.DatetimeField(auto_now_add=True)
-    # 'stored' until a projector consumes it. The projector will move it to 'applied'/'failed'.
+    # 'stored' until a projector consumes it; then 'applied', 'failed' (with apply_error), or left
+    # 'stored' when no projector handles its type yet — kept, so it can be projected later.
     status = fields.CharField(max_length=20, default="stored")
+    apply_error = fields.TextField(null=True)
 
     class Meta:
         table = "sync_inbox_events"

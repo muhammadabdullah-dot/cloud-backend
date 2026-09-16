@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 from app.controllers import warehouse_controller
 from app.middlewares.auth import require_any_permission, require_permission
 from app.models import User
+from app.services.rbac_service import can_see_costs
 from app.schemas.warehouse import (
     BalanceListOut,
     BalanceOut,
@@ -23,6 +24,8 @@ from app.schemas.warehouse import (
     ResolveDisputeRequest,
     StockMovementListOut,
     SupplierOut,
+    TransferCreateRequest,
+    TransferReasonRequest,
     TransferListOut,
     TransferOut,
 )
@@ -37,6 +40,8 @@ _requisitions_read = require_permission("warehouse.requisitions", "R")
 _requisitions_approve = require_permission("warehouse.requisitions.approve", "X")
 _transfers_read = require_permission("warehouse.transfers", "R")
 _transfers_dispatch = require_permission("warehouse.transfers.dispatch", "X")
+_transfers_manage = require_permission("warehouse.transfers.manage", "X")
+_requisitions_write = require_permission("warehouse.requisitions", "W")
 _counts_read = require_permission("warehouse.counts", "R")
 _counts_write = require_permission("warehouse.counts", "W")
 _counts_approve = require_permission("warehouse.counts.approve", "X")
@@ -51,7 +56,7 @@ _masters_read = require_any_permission(
 )
 _picking_read = require_any_permission(("warehouse.picking", "R"), ("warehouse.transfers", "R"))
 _decisions_read = require_any_permission(
-    ("warehouse.decisions", "R"), ("warehouse.requisitions", "R"), ("warehouse.transfers", "R"),
+    ("warehouse.decisions", "R"), ("warehouse.requisitions", "R"), ("warehouse.transfers", "R"), ("warehouse.picking", "R"),
 )
 
 
@@ -67,8 +72,9 @@ async def suppliers(user: User = Depends(_masters_read)) -> list[SupplierOut]:
 
 
 @router.get("/bins", response_model=list[BinOut])
-async def bins(user: User = Depends(_masters_read)) -> list[BinOut]:
-    return await warehouse_controller.list_bins()
+async def bins(includeInactive: bool = False, user: User = Depends(_masters_read)) -> list[BinOut]:
+    """Bins stock can go into — switched-off bins only when asked."""
+    return await warehouse_controller.list_bins(includeInactive)
 
 
 # ── balances & ledger ───────────────────────────────────────────────────────
@@ -80,8 +86,12 @@ async def get_balance(productId: str, binId: str | None = None, user: User = Dep
 @router.get("/balances", response_model=BalanceListOut)
 async def balances(user: User = Depends(_masters_read)) -> BalanceListOut:
     """Every non-zero (product, bin) balance, folded in one grouped query. What the dashboard,
-    Racks & Bins and Executive's stock value all need."""
-    return await warehouse_controller.list_balances()
+    Racks & Bins and Executive's stock value all need. Average cost only for people who see cost."""
+    out = await warehouse_controller.list_balances()
+    if not await can_see_costs(user):
+        for row in out.items:
+            row.avgCost = None
+    return out
 
 
 @router.get("/movements", response_model=StockMovementListOut)
@@ -115,7 +125,7 @@ async def requisitions(status: str | None = None, limit: int = 100, offset: int 
 
 
 @router.post("/requisitions", response_model=RequisitionOut)
-async def create_requisition(payload: RequisitionCreateRequest, user: User = Depends(_requisitions_read)) -> RequisitionOut:
+async def create_requisition(payload: RequisitionCreateRequest, user: User = Depends(_requisitions_write)) -> RequisitionOut:
     """A branch asking for stock. Nothing on either frontend authors one yet — branch-app has no
     requisition screen — so this is here to be the endpoint a branch calls, and to let the Cloud
     approval flow be exercised with data that wasn't seeded."""
@@ -138,20 +148,44 @@ async def transfers(status: str | None = None, limit: int = 100, offset: int = 0
     return await warehouse_controller.list_transfers(status, limit, offset)
 
 
+@router.post("/transfers", response_model=TransferOut)
+async def create_transfer(payload: TransferCreateRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
+    """Send stock to a branch without waiting for a requisition. Starts approved; dispatch it next."""
+    return await warehouse_controller.create_transfer(user, payload)
+
+
 @router.post("/transfers/{transfer_id}/dispatch", response_model=TransferOut)
 async def dispatch_transfer(transfer_id: str, payload: DispatchRequest, user: User = Depends(_transfers_dispatch)) -> TransferOut:
     return await warehouse_controller.dispatch_transfer(user, transfer_id, payload)
 
 
 @router.post("/transfers/{transfer_id}/receive", response_model=TransferOut)
-async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest, user: User = Depends(_transfers_read)) -> TransferOut:
+async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
     """Confirming what actually arrived. A branch server calls this once sync exists; until then
     it is how the received / short-received half of the lifecycle can be reached at all."""
     return await warehouse_controller.receive_transfer(transfer_id, payload)
 
 
+@router.post("/transfers/{transfer_id}/send-without-answer", response_model=TransferOut)
+async def send_without_answer(transfer_id: str, payload: TransferReasonRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
+    """The branch has been offline a long time: let the transfer go without its answer, with a written reason."""
+    return await warehouse_controller.transfer_step("send-without-answer", user, transfer_id, payload.reason)
+
+
+@router.post("/transfers/{transfer_id}/ask-again", response_model=TransferOut)
+async def ask_again(transfer_id: str, user: User = Depends(_transfers_manage)) -> TransferOut:
+    """The branch declined: ask it again (after talking to them)."""
+    return await warehouse_controller.transfer_step("ask-again", user, transfer_id)
+
+
+@router.post("/transfers/{transfer_id}/cancel", response_model=TransferOut)
+async def cancel_transfer(transfer_id: str, payload: TransferReasonRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
+    """Cancel a transfer that hasn't left yet. The branches involved are told."""
+    return await warehouse_controller.transfer_step("cancel", user, transfer_id, payload.reason)
+
+
 @router.post("/transfers/{transfer_id}/resolve-dispute", response_model=TransferOut)
-async def resolve_dispute(transfer_id: str, payload: ResolveDisputeRequest, user: User = Depends(_transfers_dispatch)) -> TransferOut:
+async def resolve_dispute(transfer_id: str, payload: ResolveDisputeRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
     return await warehouse_controller.resolve_dispute(transfer_id, payload.note)
 
 

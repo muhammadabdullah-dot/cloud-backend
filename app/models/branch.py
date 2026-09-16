@@ -50,6 +50,9 @@ class Branch(models.Model):
     # Set by the sync ingest endpoint once it exists; null means "never heard from". Executive's
     # freshness display reads this rather than a seeded timestamp.
     last_seen_at = fields.DatetimeField(null=True)
+    # Downstream: when the branch last collected its messages, and the last one it said it applied.
+    last_pulled_at = fields.DatetimeField(null=True)
+    last_applied_seq = fields.IntField(default=0)
     created_at = fields.DatetimeField(auto_now_add=True)
 
     # --- Pairing: the one-shot credential main office hands to the branch -------------------

@@ -33,6 +33,8 @@ from app.schemas.warehouse import (
 )
 
 ZERO = Decimal("0")
+MANAGERS = [("warehouse.transfers.manage", "X")]
+EXECUTIVE = [("executive.dashboard", "R")]
 
 
 class WarehouseError(Exception):
@@ -77,8 +79,18 @@ async def list_suppliers() -> list[Supplier]:
     return await Supplier.all().order_by("name")
 
 
-async def list_bins() -> list[Bin]:
-    return await Bin.all().order_by("rack", "bin")
+async def list_bins(include_inactive: bool = False) -> list[Bin]:
+    qs = Bin.all() if include_inactive else Bin.filter(active=True)
+    return await qs.order_by("rack", "level", "position", "bin")
+
+
+async def _active_bin(bin_id: str) -> Bin:
+    found = await Bin.get_or_none(id=bin_id)
+    if not found:
+        raise WarehouseError("No such bin")
+    if not found.active:
+        raise WarehouseError(f"{found.label} is switched off. Pick another bin, or switch it back on under Racks & Bins.")
+    return found
 
 
 # ── ledger ──────────────────────────────────────────────────────────────────
@@ -109,8 +121,7 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
         raise WarehouseError("A GRN needs at least one line")
     if not await Supplier.exists(id=payload.supplierId):
         raise WarehouseError("No such supplier")
-    if not await Bin.exists(id=payload.binId):
-        raise WarehouseError("No such bin")
+    await _active_bin(payload.binId)
     if payload.gstMode not in ("normal", "normal-bonus"):
         raise WarehouseError("GST mode must be 'normal' or 'normal-bonus'")
 
@@ -130,17 +141,50 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
     grn = await GRN.create(
         grn_number=f"WGRN-{seq:04d}", supplier_id=payload.supplierId, party_inv_no=payload.partyInvNo,
         bin_id=payload.binId, gst_mode=payload.gstMode, advance_tax=payload.advanceTax,
-        approved=payload.approved, received_by=user, at=now,
+        approved=payload.approved, received_by=user, at=now, purchase_order_id=payload.purchaseOrderId or None,
     )
+    if payload.purchaseOrderId:
+        from app.services import purchasing_service
+
+        try:
+            await purchasing_service.receive_against(
+                payload.purchaseOrderId, payload.supplierId, [(l.productId, l.qty, l.unitPrice) for l in payload.lines], grn.grn_number,
+            )
+        except purchasing_service.PurchasingError as exc:
+            raise WarehouseError(exc.message) from exc
+    from app.services import putaway_service
+
     for line in payload.lines:
+        product = await Product.get(id=line.productId)
+        # Each line goes to its own bin, else the Item's home bin, else the GRN's bin — and the first bin an Item is
+        # ever received into becomes its home.
+        line_bin_id = await putaway_service.home_bin_for_receipt(product, line.binId, payload.binId)
+        if line_bin_id != payload.binId:
+            await _active_bin(line_bin_id)
+        if not product.home_bin_id:
+            product.home_bin_id = line_bin_id
+            await product.save(update_fields=["home_bin_id"])
         await GRNLine.create(
             grn=grn, product_id=line.productId, qty=line.qty, bonus_qty=line.bonusQty,
             unit_price=line.unitPrice, disc_percent=line.discPercent, expiry=line.expiry, tax_rate=line.taxRate,
+            bin_id=line_bin_id,
         )
+        # Weighted-average cost of godown stock: what was paid for the line (less its discount) spread over
+        # every unit that arrived, bonus included. Stock at or below zero has no cost left to average with.
+        on_hand = await balance(line.productId)
+        incoming = line.qty + line.bonusQty
+        paid = line.qty * line.unitPrice * (Decimal("1") - line.discPercent / Decimal("100"))
+        if incoming > ZERO:
+            if on_hand > ZERO:
+                product.avg_cost = (product.avg_cost * on_hand + paid) / (on_hand + incoming)
+            else:
+                product.avg_cost = paid / incoming
+            await product.save(update_fields=["avg_cost"])
         # Bonus units are real stock — they go onto the shelf even though they were not paid for.
         await StockMovement.create(
-            product_id=line.productId, bin_id=payload.binId, kind="receive",
+            product_id=line.productId, bin_id=line_bin_id, kind="receive",
             qty=line.qty + line.bonusQty, reason=grn.grn_number, origin_user=user, at=now,
+            unit_cost=(paid / incoming) if incoming > ZERO else None,
         )
         if line.expiry:
             await Batch.create(
@@ -206,15 +250,63 @@ async def approve_requisition(user: User, requisition_id: str) -> tuple[Requisit
     await req.save()
 
     seq = await next_value("transfer", 45)
+    branch = await Branch.get(id=req.branch_id)
+    # The branch asked for this stock, so it doesn't have to agree to it again.
     transfer = await Transfer.create(
         transfer_number=f"TR-{seq:04d}", branch_id=req.branch_id, requisition=req,
         status="approved", requested_at=req.requested_at, approved_at=now, dispute_open=False,
+        ack_status="skipped", ack_note=f"{branch.name} asked for it ({req.requisition_number})",
     )
     await TransferLine.create(
         transfer=transfer, product_id=req.product_id, qty_sent=req.qty_requested, qty_received=None,
     )
+    from app.services import transfer_sync_service
+    await transfer_sync_service.publish(transfer)
     await transfer.fetch_related("lines")
     return req, transfer
+
+
+@atomic()
+async def create_transfer(user: User, branch_id: str, lines: list[tuple[str, Decimal]], notes: str | None) -> Transfer:
+    """Head office decides to send stock to a branch without waiting for it to ask. Starts approved;
+    dispatching it is the next step, exactly as for a transfer that came from a requisition."""
+    branch = await Branch.get_or_none(id=branch_id)
+    if not branch:
+        raise WarehouseError("No such branch")
+    if not lines:
+        raise WarehouseError("A transfer needs at least one line")
+    seen: set[str] = set()
+    for product_id, qty in lines:
+        if product_id in seen:
+            raise WarehouseError("An Item is on the transfer twice. Put the whole quantity on one line.")
+        seen.add(product_id)
+        if qty <= ZERO:
+            raise WarehouseError("Every line needs a quantity above zero")
+        if not await Product.exists(id=product_id):
+            raise WarehouseError(f"Unknown product {product_id}")
+    now = datetime.now(timezone.utc)
+    seq = await next_value("transfer", 45)
+    # A branch with its own server says whether it can take the stock before anything is picked. One without a
+    # server is handled here at head office, so there is nobody to ask.
+    asks = branch.verified_at is not None
+    transfer = await Transfer.create(
+        transfer_number=f"TR-{seq:04d}", branch=branch, status="approved", requested_at=now, approved_at=now,
+        dispute_open=False, notes=(notes or "").strip() or None,
+        ack_status="awaiting" if asks else "skipped", ack_requested_at=now if asks else None,
+        ack_note=None if asks else f"{branch.name} has no branch server; head office receives for it",
+    )
+    for product_id, qty in lines:
+        await TransferLine.create(transfer=transfer, product_id=product_id, qty_sent=qty, qty_received=None)
+    from app.services import alerts_service, transfer_sync_service
+    await transfer_sync_service.publish(transfer)
+    if asks:
+        await alerts_service.notify(
+            "transfer.created", f"{transfer.transfer_number}: {len(lines)} Item{'' if len(lines) == 1 else 's'} for {branch.name}",
+            body=f"Created by {user.name}. Waiting for {branch.name} to agree before it's picked.", link="/warehouse/transfers",
+            audience_any=EXECUTIVE, subject=("transfer", str(transfer.id)),
+        )
+    await transfer.fetch_related("lines")
+    return transfer
 
 
 @atomic()
@@ -266,23 +358,51 @@ async def dispatch_transfer(user: User, transfer_id: str, payload: DispatchReque
     transfer = await Transfer.get_or_none(id=transfer_id).prefetch_related("lines")
     if not transfer:
         raise WarehouseError("Transfer not found")
+    if transfer.source_branch_id:
+        raise WarehouseError("This transfer is between two branches — the sending branch dispatches it.")
     if transfer.status != "approved":
         raise WarehouseError(f"Only an approved transfer can be dispatched — this one is {transfer.status}")
+    if transfer.ack_status in ("awaiting", "declined"):
+        await transfer.fetch_related("branch")
+        if transfer.ack_status == "declined":
+            raise WarehouseError(f"{transfer.branch.name} declined {transfer.transfer_number}: {transfer.ack_note or 'no reason given'}. Ask again or cancel it.")
+        raise WarehouseError(
+            f"{transfer.branch.name} hasn't agreed to receive {transfer.transfer_number} yet. It's dispatched once they have — "
+            "or, if they stay offline, send it without their answer with a written reason."
+        )
     if not payload.vehicle.strip() or not payload.driver.strip():
         raise WarehouseError("A dispatch needs both a vehicle and a driver")
 
+    from app.services import putaway_service
+
     now = datetime.now(timezone.utc)
+    # Picked from the home bin first, then the other bins by priority, split across bins where one isn't enough.
+    # Stock that isn't in the godown at all stops the dispatch rather than sending a bin below zero.
+    plans = []
     for line in transfer.lines:
-        bin_id = await _pick_bin_for(line.product_id, line.qty_sent)
-        await StockMovement.create(
-            product_id=line.product_id, bin_id=bin_id, kind="dispatch",
-            qty=-line.qty_sent, reason=transfer.transfer_number, origin_user=user, at=now,
-        )
+        plan, short = await putaway_service.pick_plan(str(line.product_id), line.qty_sent)
+        if short > ZERO:
+            product = await Product.get(id=line.product_id)
+            have = line.qty_sent - short
+            raise WarehouseError(f"The godown holds {have.normalize():f} of {product.name}; this transfer needs {line.qty_sent.normalize():f}. Receive or count the stock first.")
+        plans.append((line, plan))
+    for line, plan in plans:
+        product = await Product.get(id=line.product_id)
+        line.unit_cost = product.avg_cost
+        await line.save(update_fields=["unit_cost"])
+        for bin_id, qty in plan:
+            await StockMovement.create(
+                product_id=line.product_id, bin_id=bin_id, kind="dispatch",
+                qty=-qty, reason=transfer.transfer_number, origin_user=user, at=now, unit_cost=product.avg_cost,
+            )
     transfer.status = "dispatched"
     transfer.vehicle = payload.vehicle.strip()
     transfer.driver = payload.driver.strip()
     transfer.dispatched_at = now
     await transfer.save()
+    # The branch sees it on its way at its next pull, and receives it from there.
+    from app.services import transfer_sync_service
+    await transfer_sync_service.publish(transfer)
     return transfer
 
 
@@ -290,9 +410,13 @@ async def dispatch_transfer(user: User, transfer_id: str, payload: DispatchReque
 async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest) -> Transfer:
     """The receiving half — what a branch confirms. Short receipts open a dispute with the sent
     quantity frozen, rather than overwriting it with whatever turned up."""
-    transfer = await Transfer.get_or_none(id=transfer_id).prefetch_related("lines")
+    transfer = await Transfer.get_or_none(id=transfer_id).prefetch_related("lines", "branch")
     if not transfer:
         raise WarehouseError("Transfer not found")
+    if transfer.branch.verified_at:
+        # A branch with its own server counts what arrived itself; recording it here would say stock
+        # arrived that never went onto that branch's shelves.
+        raise WarehouseError(f"{transfer.branch.name} receives its transfers in the Branch App. Its receipt comes back here by sync.")
     if transfer.status not in ("dispatched", "in_transit"):
         raise WarehouseError(f"Only a dispatched transfer can be received — this one is {transfer.status}")
 
@@ -316,6 +440,82 @@ async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest) ->
         transfer.dispute_open = True
         transfer.dispute_note = payload.note or "Short receipt — quantities received are below what was dispatched."
     await transfer.save()
+    from app.services import alerts_service
+    await alerts_service.notify(
+        "transfer.received", f"{transfer.transfer_number} received for {transfer.branch.name}" + (" — short" if short else ""),
+        body=transfer.dispute_note if short else None, link="/warehouse/transfers", audience_any=MANAGERS + EXECUTIVE,
+        subject=("transfer", str(transfer.id)), tone="bad" if short else "good",
+    )
+    return transfer
+
+
+async def _open_transfer(transfer_id: str) -> Transfer:
+    transfer = await Transfer.get_or_none(id=transfer_id).prefetch_related("lines", "branch", "source_branch")
+    if not transfer:
+        raise WarehouseError("Transfer not found")
+    if transfer.status not in ("approved", "requested"):
+        raise WarehouseError(f"{transfer.transfer_number} has already left — it's {transfer.status.replace('_', ' ')}.")
+    return transfer
+
+
+@atomic()
+async def send_without_answer(user: User, transfer_id: str, reason: str | None) -> Transfer:
+    """The branch has been offline for a long time: clear the transfer to go without its answer. Needs a written
+    reason; the Executive and the branch are both told."""
+    from app.services import alerts_service, transfer_sync_service
+
+    transfer = await _open_transfer(transfer_id)
+    if transfer.ack_status != "awaiting":
+        raise WarehouseError(f"{transfer.transfer_number} isn't waiting for {transfer.branch.name}'s answer.")
+    if not alerts_service.branch_offline(transfer.branch):
+        hours = int(alerts_service.OFFLINE_AFTER.total_seconds() // 3600)
+        raise WarehouseError(
+            f"{transfer.branch.name} is online — it checked in within the last {hours} hours. Wait for their answer, or call them."
+        )
+    reason = (reason or "").strip()
+    if len(reason) < 10:
+        raise WarehouseError("Write why it can't wait for the branch — at least a sentence.")
+    now = datetime.now(timezone.utc)
+    transfer.ack_status, transfer.override_reason, transfer.override_by_name, transfer.override_at = "overridden", reason[:255], user.name, now
+    if transfer.status == "requested":
+        transfer.status = "approved"
+    await transfer.save()
+    await transfer_sync_service.publish(transfer)
+    await alerts_service.notify(
+        "transfer.sent_without_answer", f"{transfer.transfer_number} cleared to go without {transfer.branch.name}'s answer",
+        body=f"{user.name}: “{reason}”", link="/warehouse/transfers", audience_any=EXECUTIVE + MANAGERS,
+        subject=("transfer", str(transfer.id)), tone="warning",
+    )
+    return transfer
+
+
+@atomic()
+async def ask_again(user: User, transfer_id: str) -> Transfer:
+    from app.services import transfer_sync_service
+
+    transfer = await _open_transfer(transfer_id)
+    if transfer.ack_status != "declined":
+        raise WarehouseError(f"{transfer.branch.name} hasn't declined {transfer.transfer_number}.")
+    transfer.ack_status, transfer.ack_requested_at = "awaiting", datetime.now(timezone.utc)
+    transfer.ack_note = f"Declined earlier: {transfer.ack_note}"[:255] if transfer.ack_note else None
+    await transfer.save()
+    await transfer_sync_service.publish(transfer)
+    return transfer
+
+
+@atomic()
+async def cancel_transfer(user: User, transfer_id: str, reason: str | None) -> Transfer:
+    from app.services import alerts_service, transfer_sync_service
+
+    transfer = await _open_transfer(transfer_id)
+    transfer.status, transfer.cancelled_at = "cancelled", datetime.now(timezone.utc)
+    transfer.notes = ((transfer.notes or "") + (f" — cancelled by {user.name}: {reason.strip()}" if reason and reason.strip() else f" — cancelled by {user.name}"))[:255]
+    await transfer.save()
+    await transfer_sync_service.publish(transfer)
+    await alerts_service.notify(
+        "transfer.cancelled", f"{transfer.transfer_number} to {transfer.branch.name} cancelled", body=transfer.notes,
+        link="/warehouse/transfers", audience_any=EXECUTIVE, subject=("transfer", str(transfer.id)), tone="warning",
+    )
     return transfer
 
 
@@ -332,6 +532,8 @@ async def resolve_dispute(transfer_id: str, note: str | None) -> Transfer:
     if note:
         transfer.dispute_note = f"{transfer.dispute_note or ''} · Resolved: {note}".strip(" ·")
     await transfer.save()
+    from app.services import transfer_sync_service
+    await transfer_sync_service.publish(transfer)
     return transfer
 
 
@@ -346,8 +548,7 @@ async def list_counts(limit: int, offset: int) -> tuple[list[CycleCount], int]:
 async def submit_count(user: User, payload: CountSubmitRequest) -> CycleCount:
     if not await Product.exists(id=payload.productId):
         raise WarehouseError("No such product")
-    if not await Bin.exists(id=payload.binId):
-        raise WarehouseError("No such bin")
+    await _active_bin(payload.binId)
     if payload.countedQty < ZERO:
         raise WarehouseError("A counted quantity can't be negative")
     system_qty = await balance(payload.productId, payload.binId)
@@ -368,9 +569,10 @@ async def approve_count(user: User, count_id: str) -> CycleCount:
     if delta != ZERO:
         # Post only the difference, not the counted quantity — the ledger records the correction,
         # not a restatement of the whole balance.
+        product = await Product.get(id=count.product_id)
         await StockMovement.create(
             product_id=count.product_id, bin_id=count.bin_id, kind="count-correction",
-            qty=delta, reason="Cycle count", origin_user=user, at=datetime.now(timezone.utc),
+            qty=delta, reason="Cycle count", origin_user=user, at=datetime.now(timezone.utc), unit_cost=product.avg_cost,
         )
     count.status = "approved"
     count.approved_by = user

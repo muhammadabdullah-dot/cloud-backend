@@ -49,7 +49,7 @@ from app.schemas.warehouse import (
     TransferListOut,
     TransferOut,
 )
-from app.services import warehouse_service
+from app.services import alerts_service, warehouse_service
 
 # Chunked well under SQLite's parameter cap so a full page of movements still resolves in a
 # handful of queries rather than blowing the IN(...) limit.
@@ -130,10 +130,13 @@ async def list_suppliers() -> list[SupplierOut]:
     ]
 
 
-async def list_bins() -> list[BinOut]:
+async def list_bins(include_inactive: bool = False) -> list[BinOut]:
     return [
-        BinOut(id=str(b.id), rack=b.rack, bin=b.bin, label=b.label, priority=b.priority, capacityUnits=b.capacity_units)
-        for b in await warehouse_service.list_bins()
+        BinOut(
+            id=str(b.id), rack=b.rack, bin=b.bin, label=b.label, priority=b.priority, capacityUnits=b.capacity_units,
+            level=b.level, position=b.position, active=b.active,
+        )
+        for b in await warehouse_service.list_bins(include_inactive)
     ]
 
 
@@ -156,9 +159,11 @@ async def list_balances() -> BalanceListOut:
     items = []
     for r in rows:
         name, sku = names.product(r["product_id"])
+        product = names.products.get(r["product_id"])
         items.append(BalanceOut(
             productId=r["product_id"], productName=name, productSku=sku,
             binId=r["bin_id"], binLabel=names.bin_label(r["bin_id"]), balance=r["total"],
+            price=product.price if product else None, avgCost=product.avg_cost if product else None,
         ))
     items.sort(key=lambda b: (b.productName or "", b.binLabel or ""))
     return BalanceListOut(items=items, total=len(items))
@@ -209,9 +214,11 @@ def _grn_out(g: GRN, names: _Names) -> GRNOut:
     for l in g.lines:
         pid = str(l.product_id)
         name, sku = names.product(pid)
+        line_bin = str(l.bin_id) if l.bin_id else str(g.bin_id)
         lines.append(GRNLineOut(
             productId=pid, productName=name, productSku=sku, qty=l.qty, bonusQty=l.bonus_qty,
             unitPrice=l.unit_price, discPercent=l.disc_percent, expiry=l.expiry, taxRate=l.tax_rate,
+            binId=line_bin, binLabel=names.bin_label(line_bin),
         ))
     uid = str(g.received_by_id) if g.received_by_id else None
     return GRNOut(
@@ -226,7 +233,7 @@ def _grn_out(g: GRN, names: _Names) -> GRNOut:
 async def _grn_names(grns: list[GRN]) -> _Names:
     return await _resolve(
         product_ids={str(l.product_id) for g in grns for l in g.lines},
-        bin_ids={str(g.bin_id) for g in grns},
+        bin_ids={str(g.bin_id) for g in grns} | {str(l.bin_id) for g in grns for l in g.lines if l.bin_id},
         supplier_ids={str(g.supplier_id) for g in grns},
         user_ids={str(g.received_by_id) for g in grns if g.received_by_id},
     )
@@ -310,6 +317,7 @@ def _transfer_out(t: Transfer, names: _Names, requisition_numbers: dict[str, str
             productId=pid, productName=name, productSku=sku, qtySent=l.qty_sent, qtyReceived=l.qty_received,
         ))
     bname, bcode = names.branch(str(t.branch_id))
+    sname, scode = names.branch(str(t.source_branch_id)) if t.source_branch_id else (None, None)
     rid = str(t.requisition_id) if t.requisition_id else None
     return TransferOut(
         id=str(t.id), transferNumber=t.transfer_number, branchId=str(t.branch_id),
@@ -317,14 +325,26 @@ def _transfer_out(t: Transfer, names: _Names, requisition_numbers: dict[str, str
         requisitionId=rid, requisitionNumber=requisition_numbers.get(rid) if rid else None,
         status=t.status, vehicle=t.vehicle, driver=t.driver, requestedAt=t.requested_at,
         approvedAt=t.approved_at, dispatchedAt=t.dispatched_at, receivedAt=t.received_at,
-        disputeOpen=t.dispute_open, disputeNote=t.dispute_note, lines=lines,
+        disputeOpen=t.dispute_open, disputeNote=t.dispute_note,
+        sourceBranchId=str(t.source_branch_id) if t.source_branch_id else None,
+        sourceBranchName=sname, sourceBranchCode=scode, notes=t.notes, receivedBy=t.received_by_name,
+        holdNote=t.hold_note, heldBy=t.held_by_name, heldAt=t.held_at,
+        branchReceivesItself=bool(names.branches.get(str(t.branch_id)) and names.branches[str(t.branch_id)].verified_at),
+        ackStatus=t.ack_status, ackRequestedAt=t.ack_requested_at, ackAt=t.ack_at, ackBy=t.ack_by_name, ackNote=t.ack_note,
+        overrideReason=t.override_reason, overrideBy=t.override_by_name, overrideAt=t.override_at,
+        branchLastSeenAt=names.branches[str(t.branch_id)].last_pulled_at if names.branches.get(str(t.branch_id)) else None,
+        canSendWithoutAnswer=(
+            t.ack_status == "awaiting" and t.status in ("approved", "requested") and bool(names.branches.get(str(t.branch_id)))
+            and alerts_service.branch_offline(names.branches[str(t.branch_id)])
+        ),
+        lines=lines,
     )
 
 
 async def _transfer_context(rows: list[Transfer]) -> tuple[_Names, dict[str, str]]:
     names = await _resolve(
         product_ids={str(l.product_id) for t in rows for l in t.lines},
-        branch_ids={str(t.branch_id) for t in rows},
+        branch_ids={str(t.branch_id) for t in rows} | {str(t.source_branch_id) for t in rows if t.source_branch_id},
     )
     req_ids = [str(t.requisition_id) for t in rows if t.requisition_id]
     numbers = {}
@@ -347,6 +367,16 @@ async def _one_transfer(t: Transfer) -> TransferOut:
     return _transfer_out(t, names, numbers)
 
 
+async def create_transfer(user: User, payload) -> TransferOut:
+    try:
+        transfer = await warehouse_service.create_transfer(
+            user, payload.branchId, [(line.productId, line.qty) for line in payload.lines], payload.notes,
+        )
+    except warehouse_service.WarehouseError as exc:
+        raise _fail(exc)
+    return await _one_transfer(transfer)
+
+
 async def dispatch_transfer(user: User, transfer_id: str, payload: DispatchRequest) -> TransferOut:
     try:
         transfer = await warehouse_service.dispatch_transfer(user, transfer_id, payload)
@@ -358,6 +388,19 @@ async def dispatch_transfer(user: User, transfer_id: str, payload: DispatchReque
 async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest) -> TransferOut:
     try:
         transfer = await warehouse_service.receive_transfer(transfer_id, payload)
+    except warehouse_service.WarehouseError as exc:
+        raise _fail(exc)
+    return await _one_transfer(transfer)
+
+
+async def transfer_step(step: str, user: User, transfer_id: str, reason: str | None = None) -> TransferOut:
+    try:
+        if step == "send-without-answer":
+            transfer = await warehouse_service.send_without_answer(user, transfer_id, reason)
+        elif step == "ask-again":
+            transfer = await warehouse_service.ask_again(user, transfer_id)
+        else:
+            transfer = await warehouse_service.cancel_transfer(user, transfer_id, reason)
     except warehouse_service.WarehouseError as exc:
         raise _fail(exc)
     return await _one_transfer(transfer)

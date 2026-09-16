@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from pydantic import BaseModel, field_validator
 
 from app.schemas.auth import PermissionOut
@@ -9,6 +11,8 @@ class UserSummaryOut(BaseModel):
     email: str
     roleId: str
     active: bool
+    # The largest purchase order they may approve; null = their role's usual limit.
+    poLimit: str | None = None
 
 
 class UserNameOut(BaseModel):
@@ -61,6 +65,7 @@ class UserUpdate(BaseModel):
     roleId: str | None = None
     active: bool | None = None
     password: str | None = None
+    poLimit: Decimal | None = None
 
     @field_validator("email")
     @classmethod

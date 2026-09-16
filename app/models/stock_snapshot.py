@@ -43,6 +43,22 @@ class BranchProductStock(models.Model):
     units_sold_period = fields.DecimalField(max_digits=16, decimal_places=3, default=0)
     days_with_sales = fields.IntField(default=0)
 
+    # Where it came from and where it went, as the branch worked it out from its own ledger.
+    # What's on hand, split by where it came from (oldest stock assumed sold first):
+    origin_warehouse = fields.DecimalField(max_digits=16, decimal_places=3, default=0)
+    origin_branches = fields.DecimalField(max_digits=16, decimal_places=3, default=0)
+    origin_within = fields.DecimalField(max_digits=16, decimal_places=3, default=0)
+    # Lifetime totals in and out: fromWarehouse, fromBranches, fromSuppliers, opening, found, customerReturns,
+    # sold, toBranches, toSuppliers, writtenOff — only the non-zero ones.
+    flows = fields.JSONField(null=True)
+    # [{name, qty}] — stock per shop location.
+    locations = fields.JSONField(null=True)
+    # The latest arrival from the godown, another branch or a supplier: {kind, ref, qty, at, from, code}.
+    last_in = fields.JSONField(null=True)
+    last_moved_at = fields.DatetimeField(null=True)
+    # Set when the branch updated just this item between full pushes.
+    changed_at = fields.DatetimeField(null=True)
+
     class Meta:
         table = "branch_product_stock"
         unique_together = (("branch", "snapshot_id", "product_sku"),)
@@ -64,6 +80,8 @@ class BranchSnapshotRun(models.Model):
     # 'building' while chunks are arriving, 'complete' once the branch says so.
     status = fields.CharField(max_length=20, default="building")
     source = fields.CharField(max_length=20, default="sync")
+    # The last time the branch sent stock for items that moved since this picture was taken.
+    last_change_at = fields.DatetimeField(null=True)
 
     class Meta:
         table = "branch_snapshot_runs"

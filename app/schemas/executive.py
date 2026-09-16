@@ -129,6 +129,30 @@ class TableColumn(BaseModel):
     # the godown side by side, and those drill into different places. Names a row field holding
     # the KPI id for THAT row; it overrides `linkTo`, and a row leaving it empty is not a link.
     linkToKey: str | None = None
+    # A link that needs more than one thing to land: one person's sales of one item wants both the
+    # person and the item. Maps query param -> row field; when set it replaces `linkParam`.
+    linkParams: dict[str, str] | None = None
+
+
+class Crumb(BaseModel):
+    """One step back up the way the reader came: which view, focused on what."""
+    label: str
+    kpi: str
+    focus: dict[str, str] = {}
+
+
+class DetailSection(BaseModel):
+    """A further table under the main one. A person is more than one list: what they sold, their days,
+    the categories, the tills they closed, the discounts and returns that went through them."""
+    title: str
+    subtitle: str | None = None
+    columns: list[TableColumn] = []
+    rows: list[dict] = []
+    emptyText: str = "Nothing to show for this period."
+    # An onward link for the section as a whole ("Open the item").
+    actionLabel: str | None = None
+    actionKpi: str | None = None
+    actionFocus: dict[str, str] = {}
 
 
 class KpiDetailOut(BaseModel):
@@ -141,6 +165,9 @@ class KpiDetailOut(BaseModel):
     focusLabel: str | None = None
     parentKpi: str | None = None
     parentLabel: str | None = None
+    # The whole way back up when it is more than one step (Best Salesperson > Hina Malik > this item).
+    # When set, it replaces parentKpi/parentLabel in the breadcrumb.
+    trail: list[Crumb] = []
     headline: KpiOut
     period: PeriodOut
     seriesLabel: str | None = None
@@ -148,6 +175,9 @@ class KpiDetailOut(BaseModel):
     columns: list[TableColumn] = []
     rows: list[dict] = []
     emptyText: str = "Nothing to show for this period."
+    # What the main table is, when "Breakdown" undersells it ("Who sold it", "What they sold").
+    tableTitle: str | None = None
+    sections: list[DetailSection] = []
     # How the figure was computed, and what it deliberately does not include.
     notes: list[str] = []
     source: str

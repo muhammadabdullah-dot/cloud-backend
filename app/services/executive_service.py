@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
+from tortoise.exceptions import ValidationError
 from tortoise.functions import Count, Sum
 
 from app.models import (
@@ -30,8 +31,10 @@ from app.models import (
     BranchDailyStat,
     BranchDiscountOverride,
     BranchHourlyStat,
+    BranchProductCashierStat,
     BranchProductStat,
     BranchReturn,
+    BranchStaffDuty,
     BranchStockAlert,
     BranchTenderStat,
     BranchTillClose,
@@ -90,7 +93,11 @@ def resolve_period(period_id: str, today: date | None = None) -> Period:
         return Period("30d", "Last 30 days", start, t, start - timedelta(days=30), start - timedelta(days=1), "the previous 30 days")
     if period_id == "ytd":
         start = date(t.year, 1, 1)
-        return Period("ytd", "This year", start, t, date(t.year - 1, 1, 1), date(t.year - 1, t.month, t.day), "the same period last year")
+        # 29 February has no counterpart in the previous year, so the comparison window ends on the
+        # 28th. Without this the whole Executive module is a 500 for that one day of the year, because
+        # every endpoint here resolves a period before it does anything else.
+        prev_day = 28 if (t.month, t.day) == (2, 29) else t.day
+        return Period("ytd", "This year", start, t, date(t.year - 1, 1, 1), date(t.year - 1, t.month, prev_day), "the same period last year")
     if period_id == "all":
         return Period("all", "All time", date(2000, 1, 1), t, date(2000, 1, 1), date(2000, 1, 1), "—")
     return resolve_period("30d", t)
@@ -322,33 +329,110 @@ async def top_by(period: Period, attr: str, limit: int = 15) -> list[dict]:
 
 async def cashier_ranking(period: Period, limit: int = 20) -> list[dict]:
     rows = await BranchCashierStat.filter(day__gte=period.start, day__lte=period.end)
+    branches = await _branch_codes()
     agg: dict[str, dict] = {}
     for r in rows:
         row = agg.setdefault(r.cashier_name, {
-            "name": r.cashier_name, "invoices": 0, "netSales": D0, "days": 0,
+            "name": r.cashier_name, "invoices": 0, "netSales": D0, "days": 0, "branchSet": set(),
+            "qty": D0, "itemNetSales": D0, "cogs": D0, "items": set(),
         })
         row["invoices"] += r.invoices
         row["netSales"] += r.net_sales or D0
         row["days"] += 1
+        row["branchSet"].add(branches.get(str(r.branch_id), "?"))
+    # What each person's bills were made of, where the branch sends it: items, units, and the profit on them.
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end):
+        row = agg.get(r.cashier_name)
+        if row is None:
+            continue
+        row["qty"] += r.qty or D0
+        row["itemNetSales"] += r.net_sales or D0
+        row["cogs"] += r.cogs or D0
+        row["items"].add(r.product_sku)
+    total = sum((row["netSales"] for row in agg.values()), D0)
     for row in agg.values():
         row["avgBasket"] = _money(row["netSales"] / row["invoices"]) if row["invoices"] else D0
+        row["share"] = _money(row["netSales"] / total * 100) if total else D0
+        row["branches"] = ", ".join(sorted(row.pop("branchSet")))
+        row["distinctItems"] = len(row.pop("items"))
+        row["grossProfit"] = row["itemNetSales"] - row["cogs"] if row["itemNetSales"] else None
+        row["marginPercent"] = _money(row["grossProfit"] / row["itemNetSales"] * 100) if row["itemNetSales"] else None
     return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
 
 
+async def duty_by_day(period: Period) -> dict[tuple[str, date], dict]:
+    """Per branch-day: how many people were put on a counter, and for how long."""
+    out: dict[tuple[str, date], dict] = {}
+    for r in await BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end):
+        row = out.setdefault((str(r.branch_id), r.day), {"people": set(), "minutes": 0, "counters": set()})
+        row["people"].add(r.cashier_name)
+        row["minutes"] += r.minutes
+        if r.counter_name:
+            row["counters"].add(r.counter_name)
+    return out
+
+
+async def duty_people(period: Period, day_iso: str | None = None) -> list[dict]:
+    """Every spell on a counter in the period — who, where, how long."""
+    qs = BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end)
+    if day_iso:
+        try:
+            qs = qs.filter(day=date.fromisoformat(day_iso))
+        except ValueError:
+            return []
+    branches = await _branch_codes()
+    rows: dict[tuple, dict] = {}
+    for r in await qs:
+        key = (r.day, r.cashier_name, r.counter_name)
+        row = rows.setdefault(key, {
+            "day": r.day.isoformat(), "name": r.cashier_name, "counter": r.counter_name or "—",
+            "branch": branches.get(str(r.branch_id), "?"), "spells": 0, "minutes": 0,
+        })
+        row["spells"] += r.spells
+        row["minutes"] += r.minutes
+    for row in rows.values():
+        row["hours"] = _money(Decimal(row["minutes"]) / 60)
+    return sorted(rows.values(), key=lambda r: (r["day"], -r["minutes"]), reverse=True)
+
+
 async def staffing(period: Period) -> list[dict]:
-    """Staff on duty per branch per day — how many distinct people actually rang a sale. It is a
-    measured figure, not a roster: nothing in this MVP records who was scheduled, only who traded.
+    """Per branch per day: how many people were put on a counter, how long they stood there, and how
+    many of them actually rang a sale.
+
+    Traded is measured from sales and always has been. On the floor is now a record of its own, kept by
+    the branch when somebody is put on a counter — the only way a person who was there all morning and
+    sold nothing can be counted at all. A branch that has not set counters up reports no duty, and the
+    column says so rather than guessing.
     """
     rows = await BranchDailyStat.filter(day__gte=period.start, day__lte=period.end)
     branches = {str(b.id): b for b in await Branch.all()}
+    duty = await duty_by_day(period)
     out = []
     for r in rows:
         b = branches.get(str(r.branch_id))
+        d = duty.get((str(r.branch_id), r.day))
+        traded = r.staff_on_duty
+        assigned = len(d["people"]) if d else None
         out.append({
             "day": r.day.isoformat(), "branch": b.name if b else None, "code": b.code if b else None,
-            "staffOnDuty": r.staff_on_duty, "invoices": r.invoices, "netSales": r.net_sales or D0,
+            "onDuty": assigned, "staffOnDuty": traded, "traded": traded,
+            "hours": _money(Decimal(d["minutes"]) / 60) if d else None,
+            "counters": len(d["counters"]) if d else None,
+            # Somebody on a counter who never rang a sale — the person the old figure could not see.
+            "onDutyNoSale": max(assigned - traded, 0) if assigned is not None else None,
+            "invoices": r.invoices, "netSales": r.net_sales or D0,
         })
     return sorted(out, key=lambda r: r["day"], reverse=True)
+
+
+async def branch_by_code(code: str) -> Branch | None:
+    """The branch a drill-down was asked for, or None. A code off the query string may be anything,
+    including longer than the column, which is rejected before the lookup runs — and either way there
+    is no such branch."""
+    try:
+        return await Branch.get_or_none(code=code.upper())
+    except ValidationError:
+        return None
 
 
 async def branch_comparison(period: Period) -> list[dict]:
@@ -731,7 +815,32 @@ async def cashier_days(period: Period, name: str) -> tuple[list[dict], dict]:
         totals["netSales"] += r.net_sales or D0
         totals["days"] += 1
     totals["avgBasket"] = _money(totals["netSales"] / totals["invoices"]) if totals["invoices"] else D0
+    by_day: dict[str, dict] = {}
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name):
+        d = by_day.setdefault(r.day.isoformat(), {"qty": D0, "itemNet": D0, "cogs": D0, "items": set()})
+        d["qty"] += r.qty or D0
+        d["itemNet"] += r.net_sales or D0
+        d["cogs"] += r.cogs or D0
+        d["items"].add(r.product_sku)
+    for row in days:
+        d = by_day.get(row["day"])
+        row["qty"] = d["qty"] if d else None
+        row["items"] = len(d["items"]) if d else None
+        row["grossProfit"] = d["itemNet"] - d["cogs"] if d else None
     return days, totals
+
+
+async def product_day_people(period: Period, sku: str) -> dict[str, str]:
+    """For each day an item sold, who sold it and how many: "Hina Malik 12 · Ali Raza 4"."""
+    per: dict[str, dict[str, Decimal]] = {}
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+        people = per.setdefault(r.day.isoformat(), {})
+        people[r.cashier_name] = people.get(r.cashier_name, D0) + (r.qty or D0)
+    out = {}
+    for day, people in per.items():
+        ranked = sorted(people.items(), key=lambda kv: kv[1], reverse=True)
+        out[day] = " · ".join(f"{n} ({q.normalize():f})" for n, q in ranked)
+    return out
 
 
 async def day_detail(day_iso: str) -> dict:
@@ -754,8 +863,14 @@ async def day_detail(day_iso: str) -> dict:
 
 async def supplier_receipts(supplier_id: str) -> tuple[list[dict], dict]:
     """Every GRN line the godown booked in from one supplier — live, from Cloud's own records."""
-    supplier = await Supplier.get_or_none(id=supplier_id)
-    grns = await GRN.filter(supplier_id=supplier_id).prefetch_related("lines")
+    # The id arrives off the query string and may be anything: one the column cannot even hold is
+    # rejected before the lookup runs, which turned a hand-edited link into a 500 rather than the
+    # empty view an id that simply doesn't exist already gives.
+    try:
+        supplier = await Supplier.get_or_none(id=supplier_id)
+        grns = await GRN.filter(supplier_id=supplier_id).prefetch_related("lines")
+    except ValidationError:
+        supplier, grns = None, []
     product_ids = {str(l.product_id) for g in grns for l in g.lines}
     products = {str(p.id): p for p in await Product.filter(id__in=list(product_ids))} if product_ids else {}
     bins = {str(b.id): b for b in await Bin.all()}
@@ -793,3 +908,209 @@ async def godown_stock_rows(limit: int = 300) -> list[dict]:
             "price": price, "value": b["qty"] * price,
         })
     return sorted(rows, key=lambda r: r["value"], reverse=True)[:limit]
+
+
+# ── who sold what: an item opens onto its people, a person onto their items ──────────────────────
+async def _branch_codes() -> dict[str, str]:
+    return {str(b.id): b.code for b in await Branch.all()}
+
+
+async def _item_info(period: Period) -> dict[str, dict]:
+    """Names and taxonomy by sku. The per-person rows carry only the sku; the item rows carry the rest."""
+    info: dict[str, dict] = {}
+    for r in await BranchProductStat.filter(day__gte=period.start, day__lte=period.end):
+        info[r.product_sku] = {"name": r.product_name, "category": r.category or "Unclassified", "brand": r.brand or "Unclassified",
+                               "department": r.department or "Unclassified"}
+    return info
+
+
+def _profit(row: dict) -> dict:
+    row["grossProfit"] = row["netSales"] - row["cogs"]
+    row["marginPercent"] = _money(row["grossProfit"] / row["netSales"] * 100) if row["netSales"] else D0
+    return row
+
+
+async def person_items_known(period: Period) -> bool:
+    """Whether any branch has sent who-sold-what for this period (an older branch version doesn't)."""
+    return await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end).exists()
+
+
+async def product_people(period: Period, sku: str) -> list[dict]:
+    """Everyone who sold one item: how many, for how much, over how many bills, and their share of the item."""
+    branches = await _branch_codes()
+    agg: dict[str, dict] = {}
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+        row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "sku": sku, "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0,
+                                               "daySet": set(), "branchSet": set()})
+        row["invoices"] += r.invoices
+        row["qty"] += r.qty or D0
+        row["netSales"] += r.net_sales or D0
+        row["cogs"] += r.cogs or D0
+        row["daySet"].add(r.day)
+        row["branchSet"].add(branches.get(str(r.branch_id), "?"))
+    total_net = sum((row["netSales"] for row in agg.values()), D0)
+    total_qty = sum((row["qty"] for row in agg.values()), D0)
+    for row in agg.values():
+        _profit(row)
+        row["days"] = len(row.pop("daySet"))
+        row["branches"] = ", ".join(sorted(row.pop("branchSet")))
+        row["share"] = _money(row["netSales"] / total_net * 100) if total_net else D0
+        row["qtyShare"] = _money(row["qty"] / total_qty * 100) if total_qty else D0
+    return sorted(agg.values(), key=lambda r: (r["netSales"], r["qty"]), reverse=True)
+
+
+async def product_branches(period: Period, sku: str) -> list[dict]:
+    branches = await _branch_codes()
+    agg: dict[str, dict] = {}
+    for r in await BranchProductStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+        code = branches.get(str(r.branch_id), "?")
+        row = agg.setdefault(code, {"code": code, "qty": D0, "netSales": D0, "cogs": D0})
+        row["qty"] += r.qty or D0
+        row["netSales"] += r.net_sales or D0
+        row["cogs"] += r.cogs or D0
+    return sorted((_profit(r) for r in agg.values()), key=lambda r: r["netSales"], reverse=True)
+
+
+async def person_products(period: Period, name: str) -> list[dict]:
+    """Everything one person sold: each item with units, value, profit, bills, days, the share of this person's own
+    sales it makes up, and the share of that item's sales this person made."""
+    info = await _item_info(period)
+    mine = await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name)
+    skus = {r.product_sku for r in mine}
+    item_totals: dict[str, Decimal] = {}
+    if skus:
+        for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)):
+            item_totals[r.product_sku] = item_totals.get(r.product_sku, D0) + (r.net_sales or D0)
+    agg: dict[str, dict] = {}
+    for r in mine:
+        meta = info.get(r.product_sku, {})
+        row = agg.setdefault(r.product_sku, {"sku": r.product_sku, "name": meta.get("name", r.product_sku), "person": name,
+                                             "category": meta.get("category", "Unclassified"), "brand": meta.get("brand", "Unclassified"),
+                                             "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0, "daySet": set()})
+        row["invoices"] += r.invoices
+        row["qty"] += r.qty or D0
+        row["netSales"] += r.net_sales or D0
+        row["cogs"] += r.cogs or D0
+        row["daySet"].add(r.day)
+    person_total = sum((row["netSales"] for row in agg.values()), D0)
+    for sku, row in agg.items():
+        _profit(row)
+        row["days"] = len(row.pop("daySet"))
+        row["shareOfPerson"] = _money(row["netSales"] / person_total * 100) if person_total else D0
+        row["shareOfItem"] = _money(row["netSales"] / item_totals[sku] * 100) if item_totals.get(sku) else D0
+    return sorted(agg.values(), key=lambda r: (r["netSales"], r["qty"]), reverse=True)
+
+
+async def person_categories(period: Period, name: str) -> list[dict]:
+    agg: dict[str, dict] = {}
+    for item in await person_products(period, name):
+        row = agg.setdefault(item["category"], {"name": item["category"], "person": name, "items": 0, "qty": D0, "netSales": D0, "cogs": D0})
+        row["items"] += 1
+        row["qty"] += item["qty"]
+        row["netSales"] += item["netSales"]
+        row["cogs"] += item["cogs"]
+    total = sum((row["netSales"] for row in agg.values()), D0)
+    out = []
+    for row in agg.values():
+        _profit(row)
+        row["share"] = _money(row["netSales"] / total * 100) if total else D0
+        out.append(row)
+    return sorted(out, key=lambda r: r["netSales"], reverse=True)
+
+
+async def person_product_days(period: Period, name: str, sku: str) -> tuple[list[dict], dict]:
+    """One person and one item, day by day, with where that sits against the item's and the person's whole period."""
+    info = (await _item_info(period)).get(sku, {})
+    days: dict[date, dict] = {}
+    item_net = item_qty = person_net = D0
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+        item_net += r.net_sales or D0
+        item_qty += r.qty or D0
+        if r.cashier_name != name:
+            continue
+        d = days.setdefault(r.day, {"day": r.day.isoformat(), "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0})
+        d["invoices"] += r.invoices
+        d["qty"] += r.qty or D0
+        d["netSales"] += r.net_sales or D0
+        d["cogs"] += r.cogs or D0
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name):
+        person_net += r.net_sales or D0
+    rows = [_profit(d) for d in sorted(days.values(), key=lambda d: d["day"])]
+    totals = _profit({
+        "name": info.get("name", sku), "category": info.get("category"), "brand": info.get("brand"),
+        "invoices": sum((d["invoices"] for d in rows), 0), "qty": sum((d["qty"] for d in rows), D0),
+        "netSales": sum((d["netSales"] for d in rows), D0), "cogs": sum((d["cogs"] for d in rows), D0),
+    })
+    totals["days"] = len(rows)
+    totals["shareOfItem"] = _money(totals["netSales"] / item_net * 100) if item_net else D0
+    totals["qtyShareOfItem"] = _money(totals["qty"] / item_qty * 100) if item_qty else D0
+    totals["shareOfPerson"] = _money(totals["netSales"] / person_net * 100) if person_net else D0
+    return rows, totals
+
+
+async def people_where(period: Period, attr: str, value: str) -> list[dict]:
+    """Who sells a category or a brand, and how much of it each."""
+    wanted = (value or "").strip().lower()
+    skus = {sku for sku, meta in (await _item_info(period)).items() if meta.get(attr, "Unclassified").strip().lower() == wanted}
+    agg: dict[str, dict] = {}
+    if skus:
+        for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)):
+            row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
+            row["invoices"] += r.invoices
+            row["qty"] += r.qty or D0
+            row["netSales"] += r.net_sales or D0
+            row["cogs"] += r.cogs or D0
+            row["itemSet"].add(r.product_sku)
+    total = sum((row["netSales"] for row in agg.values()), D0)
+    for row in agg.values():
+        _profit(row)
+        row["items"] = len(row.pop("itemSet"))
+        row["share"] = _money(row["netSales"] / total * 100) if total else D0
+    return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)
+
+
+async def top_sellers(period: Period) -> dict[str, dict]:
+    """For each item, the person who sold the most of it, their share, and how many people sold it at all."""
+    per: dict[str, dict[str, Decimal]] = {}
+    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end):
+        people = per.setdefault(r.product_sku, {})
+        people[r.cashier_name] = people.get(r.cashier_name, D0) + (r.net_sales or D0)
+    out = {}
+    for sku, people in per.items():
+        name, amount = max(people.items(), key=lambda kv: kv[1])
+        total = sum(people.values(), D0)
+        out[sku] = {"name": name, "share": _money(amount / total * 100) if total else D0, "people": len(people)}
+    return out
+
+
+async def people_on_day(day_iso: str) -> list[dict]:
+    """Everyone who sold on one day: their bills and takings, and what those bills were made of."""
+    try:
+        day = date.fromisoformat(day_iso)
+    except ValueError:
+        return []
+    agg: dict[str, dict] = {}
+    for r in await BranchCashierStat.filter(day=day):
+        row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "billTotal": D0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
+        row["invoices"] += r.invoices
+        row["billTotal"] += r.net_sales or D0
+    for r in await BranchProductCashierStat.filter(day=day):
+        row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "billTotal": D0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
+        row["qty"] += r.qty or D0
+        row["netSales"] += r.net_sales or D0
+        row["cogs"] += r.cogs or D0
+        row["itemSet"].add(r.product_sku)
+    for row in agg.values():
+        _profit(row)
+        row["items"] = len(row.pop("itemSet"))
+        row["avgBasket"] = _money(row["billTotal"] / row["invoices"]) if row["invoices"] else D0
+    return sorted(agg.values(), key=lambda r: r["billTotal"], reverse=True)
+
+
+async def returns_handled(period: Period, name: str) -> list[dict]:
+    return [r for r in await returns_detail(period) if r["cashier"] == name]
+
+
+async def overrides_rung(period: Period, name: str) -> list[dict]:
+    return [r for r in await discount_overrides(period) if r["cashier"] == name]
+

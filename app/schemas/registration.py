@@ -81,8 +81,12 @@ class SnapshotIn(BaseModel):
     daily: list[dict] = Field(default_factory=list)
     cashiers: list[dict] = Field(default_factory=list)
     products: list[dict] = Field(default_factory=list)
+    # Who sold how much of each item, each day. Older branches don't send it.
+    productCashiers: list[dict] = Field(default_factory=list)
     hourly: list[dict] = Field(default_factory=list)
     tillCloses: list[dict] = Field(default_factory=list)
+    # Who was on which counter, and for how long. Older branches don't send it.
+    duties: list[dict] = Field(default_factory=list)
     tenders: list[dict] = Field(default_factory=list)
     overrides: list[dict] = Field(default_factory=list)
     returns: list[dict] = Field(default_factory=list)
@@ -95,6 +99,10 @@ class SnapshotOut(BaseModel):
     tradingDays: int
     productDays: int
     cashierDays: int
+    productPersonDays: int = 0
+    dutyDays: int = 0
+    # Rows head office could not identify and left out, so a branch can see its own figures were trimmed.
+    skippedRows: int = 0
     alerts: int
     stockValue: str
     serverTime: datetime
@@ -111,6 +119,19 @@ class StockChunkIn(BaseModel):
 class StockChunkOut(BaseModel):
     snapshotId: str
     received: int
+
+
+class StockChangesIn(BaseModel):
+    """Stock for items that moved at the branch since its last full push."""
+
+    rows: list[dict] = Field(default_factory=list, max_length=5000)
+
+
+class StockChangesOut(BaseModel):
+    applied: int
+    # No complete stock picture here yet: the branch should send its full list first.
+    needsFull: bool
+    serverTime: datetime
 
 
 class StockCompleteIn(BaseModel):

@@ -22,6 +22,8 @@ from app.schemas.registration import (
     PairingOut,
     SnapshotIn,
     SnapshotOut,
+    StockChangesIn,
+    StockChangesOut,
     StockChunkIn,
     StockChunkOut,
     StockCompleteIn,
@@ -86,6 +88,13 @@ async def push_stock_chunk(payload: StockChunkIn, branch: Branch = Depends(branc
     await snapshot_service.begin_stock(branch, payload.snapshotId)
     received = await snapshot_service.add_stock_chunk(branch, payload.snapshotId, payload.rows)
     return StockChunkOut(snapshotId=payload.snapshotId, received=received)
+
+
+@sync_router.post("/stock/changes", response_model=StockChangesOut)
+async def push_stock_changes(payload: StockChangesIn, branch: Branch = Depends(branch_credential)) -> StockChangesOut:
+    """Stock for just the items that moved since the branch's last full push — a sale, a receipt, a transfer."""
+    result = await snapshot_service.apply_stock_changes(branch, payload.rows)
+    return StockChangesOut(**result, serverTime=datetime.now(timezone.utc))
 
 
 @sync_router.post("/stock/complete", response_model=StockCompleteOut)

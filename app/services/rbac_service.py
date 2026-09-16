@@ -29,6 +29,21 @@ async def has_permission(user: User, resource: str, action: str) -> bool:
     return bool(perm and getattr(perm, field))
 
 
+# What stock cost the company is buying-side information: the people who receive it, value it or own the
+# Item master see it. Floor staff (a Picker) find and move Items without it.
+COST_VIEWERS = (
+    ("warehouse.items.manage", "W"), ("warehouse.dashboard", "R"), ("warehouse.receiving", "R"),
+    ("executive.stock", "R"), ("executive.dashboard", "R"),
+)
+
+
+async def can_see_costs(user: User) -> bool:
+    for resource, action in COST_VIEWERS:
+        if await has_permission(user, resource, action):
+            return True
+    return False
+
+
 def list_resources() -> list[str]:
     return RESOURCES
 
@@ -92,6 +107,8 @@ async def update_user(user_id: str, data: UserUpdate, caller: User) -> User | No
         user.active = fields["active"]
     if "password" in fields and fields["password"] is not None:
         user.password_hash = hash_password(fields["password"])
+    if "poLimit" in fields:
+        user.po_limit = fields["poLimit"]
 
     await user.save()
     return user

@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from fastapi import HTTPException, status
 
 from app.models import User
@@ -13,7 +15,7 @@ from app.services import rbac_service
 
 
 def _to_summary(u: User) -> UserSummaryOut:
-    return UserSummaryOut(id=str(u.id), name=u.name, email=u.email, roleId=u.role_id, active=u.active)
+    return UserSummaryOut(id=str(u.id), name=u.name, email=u.email, roleId=u.role_id, active=u.active, poLimit=None if u.po_limit is None else format(u.po_limit.quantize(Decimal('0.01')), 'f'))
 
 
 def resources() -> list[str]:
@@ -40,6 +42,8 @@ async def create_user(payload: UserCreate) -> UserSummaryOut:
 
 
 async def update_user(user_id: str, payload: UserUpdate, caller: User) -> UserSummaryOut:
+    if user_id == str(caller.id) and payload.model_dump(exclude_unset=True).get("password"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Change your own password from My account — it needs your current password.")
     try:
         user = await rbac_service.update_user(user_id, payload, caller)
     except rbac_service.RbacError as exc:

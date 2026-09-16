@@ -8,11 +8,14 @@ The KPI list comes from the Executive Dashboard section of the ERP blueprint (St
 1. Executive Dashboard"). Everything the blueprint asks for that has no data behind it in this
 MVP is returned in `notBuilt` rather than silently dropped or faked.
 """
+from datetime import date
 from decimal import Decimal
 
 from fastapi import HTTPException, status
 
 from app.schemas.executive import (
+    Crumb,
+    DetailSection,
     ChartOut,
     ChartPoint,
     KpiDelta,
@@ -62,6 +65,10 @@ def _delta(now: Decimal, before: Decimal, label: str, higher_is_better: bool = T
     return KpiDelta(value=change, percent=percent, direction=direction, good=good, label=f"vs {label}")
 
 
+def _money_pct(part: Decimal | None, whole: Decimal | None) -> Decimal:
+    return ex._money(Decimal(part) / Decimal(whole) * 100) if part is not None and whole else D0
+
+
 def _period_out(p: ex.Period) -> PeriodOut:
     return PeriodOut(id=p.id, label=p.label, start=p.start, end=p.end, compareLabel=p.compare_label)
 
@@ -73,7 +80,6 @@ def _prev(p: ex.Period) -> ex.Period:
 # What the blueprint asks for that this MVP has no data for. Each says what module would supply
 # it, so the gap reads as sequencing rather than omission.
 NOT_BUILT = [
-    NotBuiltOut(label="Net Profit", needs="Finance module — operating expenses, payroll and overheads are not recorded anywhere yet, so only Gross Profit is real."),
     NotBuiltOut(label="Online Orders", needs="Ecommerce module."),
     NotBuiltOut(label="Delivery Status", needs="Delivery / dispatch-to-customer module."),
     NotBuiltOut(label="AI Recommendations", needs="AI engine."),
@@ -137,10 +143,24 @@ async def list_kpis(period_id: str, *, include_charted: bool = False) -> KpiList
             sub=f"{t.invoices} invoice(s)", delta=_delta(t.net_sales, b.net_sales, p.compare_label))
 
     add(id="gross-profit", label="Gross Profit", group="Sales",
-        hint="Net sales minus the cost of what was sold. Operating expenses are not included — that needs the Finance module.",
+        hint="Net sales minus the cost of what was sold. Expenses come off in Net Profit, from the books.",
         value=now.gross_profit, display=money(now.gross_profit), unit="PKR",
         sub=f"{pct(now.margin_percent)} margin",
         delta=_delta(now.gross_profit, before.gross_profit, period.compare_label))
+
+    # Net profit comes from the books — head office's and every branch's that has synced — not from the snapshot.
+    from app.services import accounts_reports_service as books
+
+    company, _ = await books.resolve_books("ALL")
+    statement = await books.income_statement(company, True, period.start, period.end)
+    earlier = await books.income_statement(company, True, prev.start, prev.end)
+    net_profit = Decimal(statement["netProfit"])
+    expenses = Decimal(statement["operatingExpenses"]) + Decimal(statement["financialExpenses"])
+    add(id="net-profit", label="Net Profit", group="Sales",
+        hint="From the books: net sales, less the cost of what was sold, less every expense posted — head office and every branch whose books have synced.",
+        value=net_profit, display=money(net_profit), unit="PKR", source="books", asOf=None,
+        sub=f"{money(expenses)} expenses", delta=_delta(net_profit, Decimal(earlier["netProfit"]), period.compare_label),
+        severity="bad" if net_profit < D0 else None, ctaLabel="See what's behind it")
 
     add(id="avg-basket", label="Average Basket", group="Sales",
         hint="Net sales divided by the number of invoices — what a typical customer spends per visit.",
@@ -303,16 +323,20 @@ async def list_kpis(period_id: str, *, include_charted: bool = False) -> KpiList
         sub=f"{money(cashiers[0]['netSales'])} · {cashiers[0]['invoices']} invoice(s)" if cashiers else "no sales in this period")
 
     staffing = await ex.staffing(period)
-    latest_staff = staffing[0]["staffOnDuty"] if staffing else 0
+    latest = staffing[0] if staffing else None
+    # What the branch says it put on the counters, when it says anything; otherwise the old measure,
+    # which can only see people who rang something.
+    latest_staff = (latest["onDuty"] if latest and latest["onDuty"] is not None else (latest["traded"] if latest else 0)) or 0
     # Sits with Sales rather than in a Performance group of its own. Once Top Products, Top
     # Categories, Top Brands, Best Cashier and Branch Comparison became charts, Performance held
     # exactly one tile — and a group heading over a single card is furniture, not structure. Staff
     # on Duty belongs next to Customer Count and Bills Per Hour anyway: they are all "what did the
     # trading day look like".
     add(id="staffing", label="Staff on Duty", group="Sales",
-        hint="How many people actually rang a sale, per branch per day. Measured from trading, not from a roster — nothing records who was scheduled.",
+        hint="How many people were on a counter, per branch per day — and how many of them rang a sale.",
         value=Decimal(latest_staff), display=num(latest_staff), unit="count",
-        sub=f"on {staffing[0]['day']}" if staffing else "no trading days in this period")
+        sub=(f"on {latest['day']} · {num(latest['traded'])} rang a sale" if latest and latest["onDuty"] is not None
+             else f"rang a sale on {latest['day']}" if latest else "no trading days in this period"))
 
     comparison = await ex.branch_comparison(period)
     reporting = [b for b in comparison if b["reporting"]]
@@ -386,13 +410,36 @@ def _cols(*specs) -> list[TableColumn]:
     out = []
     for spec in specs:
         k, l, a, f = spec[:4]
+        param = spec[5] if len(spec) > 5 else None
+        many = param if isinstance(param, dict) else None
         out.append(TableColumn(
             key=k, label=l, align=a, format=f,
             linkTo=spec[4] if len(spec) > 4 else None,
-            linkParam=spec[5] if len(spec) > 5 else None,
+            linkParam=None if many else param,
             linkValueKey=spec[6] if len(spec) > 6 else None,
+            linkParams=many,
         ))
     return out
+
+
+# One person's sales of one item: the link needs both.
+PERSON_ITEM = {"name": "person", "sku": "sku"}
+
+_NO_PERSON_ITEMS = ("No branch has sent who-sold-what for this period yet. It arrives with the branch's next report "
+                    "once the branch server is on the current version.")
+
+
+def _section(title: str, columns: list[TableColumn], rows: list[dict], empty: str, subtitle: str | None = None,
+             action: tuple[str, str, dict] | None = None) -> DetailSection:
+    return DetailSection(
+        title=title, subtitle=subtitle, columns=columns, rows=rows, emptyText=empty,
+        actionLabel=action[0] if action else None, actionKpi=action[1] if action else None,
+        actionFocus=action[2] if action else {},
+    )
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 async def _build_charts(period: ex.Period) -> list[ChartOut]:
@@ -458,7 +505,7 @@ async def _build_charts(period: ex.Period) -> list[ChartOut]:
         link_to="product-detail", link_param="sku", link_key="sku",
         cta_kpi="top-products", cta_label="See all 100",
         empty="No sales in this period.",
-        note="Click a bar for that product's day-by-day trend.",
+        note="Click a bar for who sold it and its day-by-day trend.",
     ))
     charts.append(bars(
         "chart-top-categories", "Top categories", await ex.top_by(period, "category", limit=10),
@@ -491,7 +538,7 @@ async def _build_charts(period: ex.Period) -> list[ChartOut]:
         link_to="cashier-detail", link_param="name",
         cta_kpi="best-cashier", cta_label="See every salesperson",
         empty="Nobody has rung a sale in this period.",
-        note="Ranked by net sales rung. Click a bar for that person's days, drawer variance and hours.",
+        note="Ranked by net sales rung. Click a bar for everything that person sold, their days and their till closes.",
     ))
 
     # ── how the catalog is shaped ───────────────────────────────────────────
@@ -575,7 +622,7 @@ def _headline(kpi_id: str, label: str, group: str, hint: str, display: str, unit
 
 # Second-level views, reached by clicking a row rather than a tile.
 FOCUSED = {
-    "category-detail", "brand-detail", "product-detail", "cashier-detail",
+    "category-detail", "brand-detail", "product-detail", "cashier-detail", "cashier-product-detail",
     "branch-detail", "day-detail", "supplier-detail", "godown-stock", "credit-customers",
     "abc-class", "xyz-class", "dead-stock-band", "movement-band",
 }
@@ -686,19 +733,25 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
             **base,
             seriesLabel="Invoices by day",
             series=[SeriesPoint(day=d["day"], value=Decimal(d["invoices"])) for d in reversed(days)],
-            columns=_cols(
-                ("name", "Customer", "left", "text"), ("code", "Code", "left", "mono"),
-                ("tier", "Tier", "left", "text"),
-                ("creditLimit", "Credit limit", "right", "money"),
-                ("creditBalance", "Owed now", "right", "money"),
-                ("headroom", "Headroom", "right", "money"),
-                ("usedPercent", "Limit used", "right", "percent"),
-            ),
-            rows=rows,
-            emptyText="No customers are on credit terms.",
+            # The accounts sit in a section rather than the main table so they carry an onward link:
+            # Credit Customers ranks the same people by what they owe, and this is the only way in.
+            sections=[_section(
+                "Credit accounts",
+                _cols(
+                    ("name", "Customer", "left", "text"), ("code", "Code", "left", "mono"),
+                    ("tier", "Tier", "left", "text"),
+                    ("creditLimit", "Credit limit", "right", "money"),
+                    ("creditBalance", "Owed now", "right", "money"),
+                    ("headroom", "Headroom", "right", "money"),
+                    ("usedPercent", "Limit used", "right", "percent"),
+                ),
+                rows,
+                "No customers are on credit terms.",
+                action=("See what they owe", "credit-customers", {}),
+            )],
             notes=[
                 f"{now.invoices} invoices were rung in this period; {now.named_customers} were attached to a named Party. The rest were walk-in, which the till does not identify.",
-                "The table is the accounts that carry credit — the customers whose behaviour actually costs money if it changes.",
+                "Credit accounts lists the customers who carry credit — the ones whose behaviour actually costs money if it changes.",
             ],
         )
 
@@ -994,8 +1047,13 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
     # ── performance ──────────────────────────────────────────────────────────
     if kpi_id == "top-products":
         rows = await ex.top_products(period, limit=100)
+        sellers = await ex.top_sellers(period)
         for r in rows:
             r["marginPercent"] = (r["grossProfit"] / r["netSales"] * 100) if r["netSales"] else D0
+            top = sellers.get(r["sku"])
+            r["person"] = top["name"] if top else None
+            r["personShare"] = top["share"] if top else None
+            r["people"] = top["people"] if top else None
         return KpiDetailOut(
             **base,
             columns=_cols(
@@ -1007,11 +1065,15 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
                 ("netSales", "Net sales", "right", "money"),
                 ("grossProfit", "Gross profit", "right", "money"),
                 ("marginPercent", "Margin", "right", "percent"),
+                ("person", "Sold most by", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                ("personShare", "Their share", "right", "percent"),
+                ("people", "Sold by", "right", "number"),
             ),
             rows=rows,
             emptyText="No sales in this period.",
             notes=[
-                "Top 100 by net sales. Click an item for its day-by-day trend, or a category or brand to see its whole group.",
+                "Top 100 by net sales. Click an item for who sold it and its day-by-day trend, or a category or brand to see its whole group.",
+                "Sold most by is the person with the largest share of the item's net sales; Sold by counts everyone who sold it. Click the name for that person's sales of that item.",
                 "Taxonomy comes from the branch catalog's own department / category / brand fields; anything unrecorded groups as Unclassified rather than being dropped.",
             ],
         )
@@ -1046,16 +1108,23 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
             **base,
             columns=_cols(
                 ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                ("branches", "Branch", "left", "mono"),
                 ("invoices", "Invoices", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
+                ("share", "Share", "right", "percent"),
                 ("avgBasket", "Avg basket", "right", "money"),
+                ("distinctItems", "Items", "right", "number"),
+                ("qty", "Units", "right", "number"),
+                ("grossProfit", "Gross profit", "right", "money"),
+                ("marginPercent", "Margin", "right", "percent"),
                 ("days", "Days worked", "right", "number"),
             ),
             rows=rows,
             emptyText="No sales rung in this period.",
             notes=[
                 "Ranked by net sales rung. Average basket sits alongside because volume and value reward different behaviour — the top seller and the best upseller are often not the same person.",
-                "Click a cashier for their day-by-day record and their till closes.",
+                "Click a person for everything they sold, item by item and category by category, with their days, till closes, discounts and returns.",
+                "Items, units and gross profit come from the lines on their bills; net sales and share come from the bill totals.",
                 "This MVP has no salesperson separate from the cashier, so this is the only sales attribution available.",
             ],
         )
@@ -1084,21 +1153,47 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
 
     if kpi_id == "staffing":
         rows = await ex.staffing(period)
+        spells = await ex.duty_people(period)
+        known = any(r["onDuty"] is not None for r in rows)
+        notes = [
+            "On the floor is who a branch put on a counter — its own record, kept when a manager assigns "
+            "somebody or a cashier opens a till there. Rang a sale is measured from the bills.",
+            "Someone on a counter who rang nothing is not idle by itself: they may have been packing, "
+            "restocking or covering a queue. It is the gap worth asking about, not an answer.",
+            "This is not attendance. A rota, biometric clock-in and payroll belong to the HR module, which is not built.",
+        ]
+        if not known:
+            notes.insert(0, "No branch has reported counter duty for this period yet, so only what was rung is known. "
+                            "A branch reports duty once it is on the version with the Counter Board.")
         return KpiDetailOut(
             **base,
             columns=_cols(
                 ("day", "Day", "left", "date", "day-detail", "day"),
                 ("branch", "Branch", "left", "text"),
-                ("staffOnDuty", "Staff on duty", "right", "number"),
+                ("onDuty", "On the floor", "right", "number"),
+                ("traded", "Rang a sale", "right", "number"),
+                ("onDutyNoSale", "On, no sale", "right", "number"),
+                ("hours", "Hours on counters", "right", "number"),
+                ("counters", "Counters used", "right", "number"),
                 ("invoices", "Invoices", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
             ),
             rows=rows,
             emptyText="No branch traded in this period.",
-            notes=[
-                "Counted as distinct people who rang at least one sale that day.",
-                "This is not attendance. A rota, biometric clock-in and payroll belong to the HR module, which is not built.",
-            ],
+            sections=[_section(
+                "Who was on which counter",
+                _cols(
+                    ("day", "Day", "left", "date", "day-detail", "day"),
+                    ("name", "Person", "left", "text", "cashier-detail", "name"),
+                    ("counter", "Counter", "left", "text"),
+                    ("branch", "Branch", "left", "mono"),
+                    ("hours", "Hours", "right", "number"),
+                    ("spells", "Spells", "right", "number"),
+                ),
+                spells,
+                "No branch has reported who stood at which counter yet.",
+            )],
+            notes=notes,
         )
 
     # ── supply ───────────────────────────────────────────────────────────────
@@ -1225,6 +1320,11 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
             ],
         )
 
+    if kpi_id == "net-profit":
+        return KpiDetailOut(**base, notes=[
+            "Net profit is worked out from the posted vouchers of head office and every branch whose books have reached head office.",
+            "Open Accounts → Income Statement and choose Whole company for every line behind it, or one branch for that branch alone.",
+        ])
     return KpiDetailOut(**base, notes=["No detailed breakdown has been built for this KPI yet."])
 
 
@@ -1257,18 +1357,26 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
         attr = "category" if kpi_id == "category-detail" else "brand"
         name = focus.get("name", "")
         rows = await ex.products_where(period, attr, name, limit=200)
+        sellers = await ex.top_sellers(period)
+        for r in rows:
+            top = sellers.get(r["sku"])
+            r["person"] = top["name"] if top else None
+            r["personShare"] = top["share"] if top else None
+        people = await ex.people_where(period, attr, name)
         total = sum((r["netSales"] for r in rows), D0)
         profit = sum((r["grossProfit"] for r in rows), D0)
         head = _headline(
             kpi_id, name or f"(no {attr})", "Performance",
-            f"Every item in the {attr} “{name}”, ranked by net sales.",
-            money(total), "PKR", f"{len(rows)} item(s) · {money(profit)} gross profit", total, as_of=as_of)
+            f"Every item in the {attr} “{name}”, ranked by net sales, and who sells it.",
+            money(total), "PKR", f"{len(rows)} item(s) · {money(profit)} gross profit · sold by {len(people)} person(s)",
+            total, as_of=as_of)
         return KpiDetailOut(
             id=kpi_id, label=name or f"(no {attr})", group="Performance",
             hint=head.hint, focusLabel=name,
             parentKpi="top-categories" if attr == "category" else "top-brands",
             parentLabel="Top Categories" if attr == "category" else "Top Brands",
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
+            tableTitle="Items",
             columns=_cols(
                 ("name", "Item", "left", "text", "product-detail", "sku", "sku"),
                 ("sku", "Code", "left", "mono"),
@@ -1278,20 +1386,86 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
                 ("netSales", "Net sales", "right", "money"),
                 ("grossProfit", "Gross profit", "right", "money"),
                 ("marginPercent", "Margin", "right", "percent"),
+                ("person", "Sold most by", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                ("personShare", "Their share", "right", "percent"),
             ),
             rows=rows,
             emptyText=f"Nothing in this {attr} sold during the period.",
-            notes=[f"Click an item for its own day-by-day trend."],
+            sections=[_section(
+                f"Who sells this {attr}",
+                _cols(
+                    ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                    ("items", "Items", "right", "number"),
+                    ("qty", "Units", "right", "number"),
+                    ("netSales", "Net sales", "right", "money"),
+                    ("share", f"Of the {attr}", "right", "percent"),
+                    ("invoices", "Bills", "right", "number"),
+                    ("grossProfit", "Gross profit", "right", "money"),
+                    ("marginPercent", "Margin", "right", "percent"),
+                ),
+                people,
+                _NO_PERSON_ITEMS if rows else f"Nothing in this {attr} sold during the period.",
+            )],
+            notes=[
+                "Click an item for who sold it and its day-by-day trend; click a name for everything that person sold.",
+                f"Bills counts each bill once per item, so a bill carrying two items of this {attr} is counted twice.",
+            ],
         )
 
     if kpi_id == "product-detail":
         sku = focus.get("sku", "")
         days, totals = await ex.product_days(period, sku)
+        people = await ex.product_people(period, sku)
+        sold_by = await ex.product_day_people(period, sku)
+        for d in days:
+            d["soldBy"] = sold_by.get(d["day"])
+            d["marginPercent"] = _money_pct(d["grossProfit"], d["netSales"])
+        branches = await ex.product_branches(period, sku)
+        people_net = sum((p["netSales"] for p in people), D0)
+        lead = people[0] if people else None
+        sub = f"{num(totals['qty'])} sold · {pct(totals['marginPercent'])} margin"
+        if people:
+            sub += f" · sold by {len(people)} person(s)"
         head = _headline(
             kpi_id, totals["name"], "Performance",
-            f"How {totals['name']} sold, day by day.",
-            money(totals["netSales"]), "PKR",
-            f"{num(totals['qty'])} sold · {pct(totals['marginPercent'])} margin", totals["netSales"], as_of=as_of)
+            f"Who sold {totals['name']}, how much each, and how it sold day by day.",
+            money(totals["netSales"]), "PKR", sub, totals["netSales"], as_of=as_of)
+        notes = [
+            f"Category {totals['category'] or 'Unclassified'} · brand {totals['brand'] or 'Unclassified'}.",
+            "The person is whoever rang the bill. Click a name for that person's sales of this item, day by day.",
+        ]
+        if lead:
+            notes.append(f"{lead['name']} sold the most: {num(lead['qty'])} of {num(totals['qty'])} units, "
+                         f"{pct(lead['share'])} of the value.")
+        if people and abs(people_net - totals["netSales"]) >= Decimal("1"):
+            notes.append(f"The people add up to {money(people_net)} against the item's {money(totals['netSales'])}: "
+                         "a branch that has not yet sent who-sold-what is missing from the people.")
+        notes.append("Only days on which it actually sold appear — a gap is a day with no sale, not missing data.")
+        sections = [_section(
+            "Day by day",
+            _cols(
+                ("day", "Day", "left", "date", "day-detail", "day"),
+                ("qty", "Qty sold", "right", "number"),
+                ("netSales", "Net sales", "right", "money"),
+                ("grossProfit", "Gross profit", "right", "money"),
+                ("marginPercent", "Margin", "right", "percent"),
+                ("soldBy", "Sold by (units each)", "left", "text"),
+            ),
+            list(reversed(days)),
+            "This item did not sell during the period.",
+        )]
+        if len(branches) > 1:
+            sections.append(_section(
+                "By branch",
+                _cols(
+                    ("code", "Branch", "left", "text", "branch-detail", "code"),
+                    ("qty", "Qty sold", "right", "number"),
+                    ("netSales", "Net sales", "right", "money"),
+                    ("grossProfit", "Gross profit", "right", "money"),
+                    ("marginPercent", "Margin", "right", "percent"),
+                ),
+                branches, "No branch sold it.",
+            ))
         return KpiDetailOut(
             id=kpi_id, label=totals["name"], group="Performance", hint=head.hint,
             focusLabel=f"{totals['name']} ({sku})",
@@ -1299,18 +1473,23 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
             seriesLabel="Net sales by day",
             series=[SeriesPoint(day=d["day"], value=d["netSales"]) for d in days],
+            tableTitle="Who sold it",
             columns=_cols(
-                ("day", "Day", "left", "date", "day-detail", "day"),
+                ("name", "Salesperson", "left", "text", "cashier-product-detail", PERSON_ITEM),
                 ("qty", "Qty sold", "right", "number"),
+                ("qtyShare", "Of units", "right", "percent"),
                 ("netSales", "Net sales", "right", "money"),
+                ("share", "Of value", "right", "percent"),
+                ("invoices", "Bills", "right", "number"),
+                ("days", "Days", "right", "number"),
                 ("grossProfit", "Gross profit", "right", "money"),
+                ("marginPercent", "Margin", "right", "percent"),
+                ("branches", "Branch", "left", "mono"),
             ),
-            rows=list(reversed(days)),
-            emptyText="This item did not sell during the period.",
-            notes=[
-                f"Category {totals['category'] or 'Unclassified'} · brand {totals['brand'] or 'Unclassified'}.",
-                "Only days on which it actually sold appear — a gap is a day with no sale, not missing data.",
-            ],
+            rows=[{**p, "person": p["name"]} for p in people],
+            emptyText=_NO_PERSON_ITEMS if days else "This item did not sell during the period.",
+            sections=sections,
+            notes=notes,
         )
 
     if kpi_id == "cashier-detail":
@@ -1318,46 +1497,221 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
         days, totals = await ex.cashier_days(period, name)
         closes = await ex.till_closes(period, cashier=name)
         variance = sum((c["variance"] for c in closes), D0)
+        items = await ex.person_products(period, name)
+        categories = await ex.person_categories(period, name)
+        rung = await ex.overrides_rung(period, name)
+        approved = await ex.discount_overrides(period, approver=name)
+        returns = await ex.returns_handled(period, name)
+        ranking = await ex.cashier_ranking(period, limit=1000)
+        place = next((i for i, r in enumerate(ranking, 1) if r["name"] == name), None)
+        me = ranking[place - 1] if place else None
+        item_net = sum((i["netSales"] for i in items), D0)
+        item_profit = sum((i["grossProfit"] for i in items), D0)
+        units = sum((i["qty"] for i in items), D0)
+        sub = f"{totals['invoices']} invoice(s) over {totals['days']} day(s)"
+        if items:
+            sub += f" · {len(items)} item(s), {num(units)} unit(s) · {money(item_profit)} gross profit"
         head = _headline(
-            kpi_id, name, "Performance", f"{name}'s trading, day by day.",
-            money(totals["netSales"]), "PKR",
-            f"{totals['invoices']} invoice(s) over {totals['days']} day(s)", totals["netSales"], as_of=as_of)
+            kpi_id, name, "Performance", f"Everything {name} sold in the period: item by item, category by category, and day by day.",
+            money(totals["netSales"]), "PKR", sub, totals["netSales"], as_of=as_of)
+        notes = []
+        if me:
+            notes.append(f"{_ordinal(place)} of {len(ranking)} by net sales rung, {pct(me['share'])} of everything rung in the period. "
+                         f"Average basket {money(totals['avgBasket'])} across {totals['invoices']} invoice(s).")
+        if items:
+            best = items[0]
+            notes.append(f"Biggest item: {best['name']}, {num(best['qty'])} unit(s) for {money(best['netSales'])} "
+                         f"({pct(best['shareOfPerson'])} of their item sales). Margin on everything they sold {pct(_money_pct(item_profit, item_net))}.")
+            notes.append("Of their sales is the item's part of this person's sales; Of item's sales is this person's part of that item's sales across everyone.")
+        notes.append(f"{len(closes)} till close(s) in this period, net variance {money(variance)}."
+                     if closes else "No till closes recorded against this person in the period.")
+        notes.append("Net sales in the headline are bill totals; the item figures are the lines on those bills, so the two can differ by bill-level rounding.")
+        sections = [
+            _section(
+                "Day by day",
+                _cols(
+                    ("day", "Day", "left", "date", "day-detail", "day"),
+                    ("invoices", "Invoices", "right", "number"),
+                    ("netSales", "Net sales", "right", "money"),
+                    ("avgBasket", "Avg basket", "right", "money"),
+                    ("items", "Items", "right", "number"),
+                    ("qty", "Units", "right", "number"),
+                    ("grossProfit", "Gross profit", "right", "money"),
+                ),
+                list(reversed(days)), "No sales rung by this person in the period.",
+            ),
+            _section(
+                "By category",
+                _cols(
+                    ("name", "Category", "left", "text", "category-detail", "name"),
+                    ("items", "Items", "right", "number"),
+                    ("qty", "Units", "right", "number"),
+                    ("netSales", "Net sales", "right", "money"),
+                    ("share", "Of their sales", "right", "percent"),
+                    ("grossProfit", "Gross profit", "right", "money"),
+                    ("marginPercent", "Margin", "right", "percent"),
+                ),
+                categories, _NO_PERSON_ITEMS if days else "No sales rung by this person in the period.",
+            ),
+            _section(
+                "Till closes",
+                _cols(
+                    ("sessionNumber", "Session", "left", "mono"),
+                    ("day", "Day", "left", "date", "day-detail", "day"),
+                    ("openedAt", "Opened", "left", "datetime"),
+                    ("closedAt", "Closed", "left", "datetime"),
+                    ("openingFloat", "Float", "right", "money"),
+                    ("netCash", "Expected cash", "right", "money"),
+                    ("countedCash", "Counted", "right", "money"),
+                    ("variance", "Variance", "right", "money"),
+                ),
+                closes, "No till closed by this person in the period.",
+            ),
+            _section(
+                "Discounts on their bills",
+                _cols(
+                    ("invoiceNumber", "Invoice", "left", "mono"),
+                    ("at", "When", "left", "datetime"),
+                    ("approvedBy", "Approved by", "left", "text", "cashier-detail", "name"),
+                    ("gross", "Gross", "right", "money"),
+                    ("discTotal", "Discount", "right", "money"),
+                    ("discPercent", "Discount %", "right", "percent"),
+                ),
+                rung, "No manager-approved discounts on this person's bills in the period.",
+            ),
+        ]
+        if approved:
+            sections.append(_section(
+                "Discounts they approved",
+                _cols(
+                    ("invoiceNumber", "Invoice", "left", "mono"),
+                    ("at", "When", "left", "datetime"),
+                    ("cashier", "Rung by", "left", "text", "cashier-detail", "name"),
+                    ("gross", "Gross", "right", "money"),
+                    ("discTotal", "Discount", "right", "money"),
+                    ("discPercent", "Discount %", "right", "percent"),
+                ),
+                approved, "None.",
+            ))
+        sections.append(_section(
+            "Returns they took",
+            _cols(
+                ("at", "When", "left", "datetime"),
+                ("againstInvoice", "Against invoice", "left", "mono"),
+                ("productName", "Item", "left", "text", "product-detail", "sku", "productSku"),
+                ("qty", "Qty", "right", "number"),
+                ("refundTotal", "Refund", "right", "money"),
+            ),
+            returns, "No returns taken by this person in the period.",
+        ))
         return KpiDetailOut(
             id=kpi_id, label=name, group="Performance", hint=head.hint, focusLabel=name,
             parentKpi="best-cashier", parentLabel="Best Salesperson",
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
             seriesLabel="Net sales by day",
             series=[SeriesPoint(day=d["day"], value=d["netSales"]) for d in days],
+            tableTitle="What they sold",
+            columns=_cols(
+                ("name", "Item", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                ("sku", "Code", "left", "mono"),
+                ("category", "Category", "left", "text", "category-detail", "name"),
+                ("qty", "Qty sold", "right", "number"),
+                ("netSales", "Net sales", "right", "money"),
+                ("shareOfPerson", "Of their sales", "right", "percent"),
+                ("shareOfItem", "Of item's sales", "right", "percent"),
+                ("invoices", "Bills", "right", "number"),
+                ("days", "Days", "right", "number"),
+                ("grossProfit", "Gross profit", "right", "money"),
+                ("marginPercent", "Margin", "right", "percent"),
+            ),
+            rows=items,
+            emptyText=_NO_PERSON_ITEMS if days else "No sales rung by this person in the period.",
+            sections=sections,
+            notes=notes,
+        )
+
+    if kpi_id == "cashier-product-detail":
+        name = focus.get("name", "")
+        sku = focus.get("sku", "")
+        days, t = await ex.person_product_days(period, name, sku)
+        people = await ex.product_people(period, sku)
+        label = f"{t['name']} by {name}"
+        head = _headline(
+            kpi_id, label, "Performance", f"How much of {t['name']} {name} sold, day by day, and how that compares with everyone else who sold it.",
+            money(t["netSales"]), "PKR",
+            f"{num(t['qty'])} sold over {t['invoices']} bill(s) on {t['days']} day(s) · {pct(t['shareOfItem'])} of the item's sales",
+            t["netSales"], as_of=as_of)
+        for d in days:
+            d["marginPercent"] = _money_pct(d["grossProfit"], d["netSales"])
+        place = next((i for i, p in enumerate(people, 1) if p["name"] == name), None)
+        notes = [
+            f"{name} sold {num(t['qty'])} of the {num(sum((p['qty'] for p in people), D0))} unit(s) everyone sold "
+            f"({pct(t['qtyShareOfItem'])} of units, {pct(t['shareOfItem'])} of value)"
+            + (f", {_ordinal(place)} of {len(people)} people who sold it." if place else "."),
+            f"This item is {pct(t['shareOfPerson'])} of {name}'s item sales in the period. "
+            f"Gross profit {money(t['grossProfit'])} at {pct(t['marginPercent'])} margin.",
+            f"Category {t['category'] or 'Unclassified'} · brand {t['brand'] or 'Unclassified'}.",
+        ]
+        return KpiDetailOut(
+            id=kpi_id, label=label, group="Performance", hint=head.hint,
+            focusLabel=f"{t['name']} ({sku}) sold by {name}",
+            parentKpi="cashier-detail", parentLabel=name,
+            trail=[Crumb(label="Best Salesperson", kpi="best-cashier"),
+                   Crumb(label=name, kpi="cashier-detail", focus={"name": name})],
+            headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
+            seriesLabel="Net sales by day",
+            series=[SeriesPoint(day=d["day"], value=d["netSales"]) for d in days],
+            tableTitle="Day by day",
             columns=_cols(
                 ("day", "Day", "left", "date", "day-detail", "day"),
-                ("invoices", "Invoices", "right", "number"),
+                ("invoices", "Bills", "right", "number"),
+                ("qty", "Qty sold", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
-                ("avgBasket", "Avg basket", "right", "money"),
+                ("grossProfit", "Gross profit", "right", "money"),
+                ("marginPercent", "Margin", "right", "percent"),
             ),
             rows=list(reversed(days)),
-            emptyText="No sales rung by this person in the period.",
-            notes=[
-                f"Average basket {money(totals['avgBasket'])} across {totals['invoices']} invoice(s).",
-                f"{len(closes)} till close(s) in this period, net variance {money(variance)}."
-                if closes else "No till closes recorded against this person in the period.",
-            ],
+            emptyText=f"{name} did not sell this item during the period.",
+            sections=[_section(
+                "Everyone who sold it",
+                _cols(
+                    ("name", "Salesperson", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                    ("qty", "Qty sold", "right", "number"),
+                    ("qtyShare", "Of units", "right", "percent"),
+                    ("netSales", "Net sales", "right", "money"),
+                    ("share", "Of value", "right", "percent"),
+                    ("invoices", "Bills", "right", "number"),
+                    ("days", "Days", "right", "number"),
+                ),
+                [{**p, "person": p["name"]} for p in people], _NO_PERSON_ITEMS,
+                action=(f"Open {t['name']}", "product-detail", {"sku": sku}),
+            )],
+            notes=notes,
         )
 
     if kpi_id == "branch-detail":
-        code = focus.get("code", "")
-        branch = await ex.Branch.get_or_none(code=code.upper())
-        if not branch:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, f"No branch with code {code}")
-        totals = await ex.totals_for(period, str(branch.id))
-        rows = await ex.daily_breakdown(period, str(branch.id))
+        code = (focus.get("code", "") or "").upper()
+        branch = await ex.branch_by_code(code)
+        # A code nobody recognizes reads as a branch that has reported nothing, the way every other
+        # focused view degrades. A 404 here loses the page and the breadcrumb back up with it.
+        name = branch.name if branch else (code or "Unknown branch")
+        totals = await ex.totals_for(period, str(branch.id)) if branch else ex.Totals()
+        rows = await ex.daily_breakdown(period, str(branch.id)) if branch else []
+        notes = [
+            f"Registered {branch.code} · {branch.city or 'city not set'} · status {branch.status}.",
+            "Last reported " + (branch.last_seen_at.strftime("%d %b %Y %H:%M") if branch.last_seen_at else "never") + ".",
+        ] if branch else [
+            "Nothing is registered under this code, so there are no figures to work out.",
+            "Branch Comparison, above, lists every branch head office knows about.",
+        ]
         head = _headline(
-            kpi_id, branch.name, "Performance", f"{branch.name}'s own trading, day by day.",
+            kpi_id, name, "Performance", f"{name}'s own trading, day by day.",
             money(totals.net_sales), "PKR",
             f"{totals.invoices} invoice(s) · {money(totals.gross_profit)} gross profit",
             totals.net_sales, as_of=as_of)
         return KpiDetailOut(
-            id=kpi_id, label=branch.name, group="Performance", hint=head.hint,
-            focusLabel=f"{branch.name} ({branch.code})",
+            id=kpi_id, label=name, group="Performance", hint=head.hint,
+            focusLabel=f"{branch.name} ({branch.code})" if branch else name,
             parentKpi="branch-comparison", parentLabel="Branch Comparison",
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
             seriesLabel="Net sales by day",
@@ -1372,11 +1726,9 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
                 ("tillVariance", "Till variance", "right", "money"),
             ),
             rows=rows,
-            emptyText=f"{branch.name} has not reported any trading in this period.",
-            notes=[
-                f"Registered {branch.code} · {branch.city or 'city not set'} · status {branch.status}.",
-                "Last reported " + (branch.last_seen_at.strftime("%d %b %Y %H:%M") if branch.last_seen_at else "never") + ".",
-            ],
+            emptyText=f"{name} has not reported any trading in this period." if branch
+                      else f"No branch is registered with the code {name}.",
+            notes=notes,
         )
 
     if kpi_id == "day-detail":
@@ -1389,6 +1741,13 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
             kpi_id, day, "Sales", f"Everything that happened on {day}.",
             money(t.net_sales), "PKR", f"{t.invoices} invoice(s)", t.net_sales, as_of=as_of)
         tender_line = ", ".join(f"{x['name']} {money(x['amount'])}" for x in detail["tenders"]) or "nothing tendered"
+        the_day = date.fromisoformat(day)
+        sellers = await ex.top_sellers(ex.Period("day", day, the_day, the_day, the_day, the_day, "the day before"))
+        for r in detail["products"]:
+            top = sellers.get(r["sku"])
+            r["person"] = top["name"] if top else None
+            r["personShare"] = top["share"] if top else None
+        on_day = await ex.people_on_day(day)
         cashier_line = ", ".join(f"{c['name']} ({c['invoices']})" for c in detail["cashiers"]) or "nobody"
         return KpiDetailOut(
             id=kpi_id, label=day, group="Sales", hint=head.hint, focusLabel=day,
@@ -1404,9 +1763,25 @@ async def _focused(kpi_id: str, period: ex.Period, focus: dict, as_of) -> KpiDet
                 ("qty", "Qty sold", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
                 ("grossProfit", "Gross profit", "right", "money"),
+                ("person", "Sold most by", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                ("personShare", "Their share", "right", "percent"),
             ),
             rows=detail["products"],
             emptyText="Nothing sold on this day.",
+            tableTitle="What sold",
+            sections=[_section(
+                "Who was on",
+                _cols(
+                    ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                    ("invoices", "Invoices", "right", "number"),
+                    ("billTotal", "Net sales", "right", "money"),
+                    ("avgBasket", "Avg basket", "right", "money"),
+                    ("items", "Items", "right", "number"),
+                    ("qty", "Units", "right", "number"),
+                    ("grossProfit", "Gross profit", "right", "money"),
+                ),
+                on_day, "Nobody rang a sale on this day.",
+            )],
             notes=[
                 f"On duty: {cashier_line}.",
                 f"Paid by: {tender_line}.",

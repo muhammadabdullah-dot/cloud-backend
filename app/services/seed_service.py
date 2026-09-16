@@ -11,6 +11,7 @@ ROLES = [
     ("picker", "Picker / Packer", "/warehouse/picking"),
     ("executive", "Owner / Executive", "/executive/dashboard"),
     ("system-admin", "System Admin", "/admin"),
+    ("accountant", "Accountant", "/accounts/dashboard"),
 ]
 
 USERS = [
@@ -100,8 +101,20 @@ async def sync_role_resource_grants() -> None:
         if excluded:
             await RoleDefaultPermission.filter(role_id=role_id, resource__in=list(excluded)).delete()
 
+    # Only resources new to a role since the last startup go out to its people. Re-adding the whole
+    # template every time quietly undid every screen a System Admin took away from someone.
+    new_for_role: dict[str, set[str]] = {}
+    for role in await Role.all():
+        template = resources_for_role(role.id)
+        # The first startup that keeps track hands out the whole template once more — exactly what every
+        # earlier startup did — so resources added in the same release still reach existing people.
+        new_for_role[role.id] = template if role.rolled_out_resources is None else template - set(role.rolled_out_resources)
+        if role.rolled_out_resources != sorted(template):
+            role.rolled_out_resources = sorted(template)
+            await role.save(update_fields=["rolled_out_resources"])
+
     for user in await User.all():
-        template_resources = resources_for_role(user.role_id)
+        template_resources = new_for_role.get(user.role_id, set())
         granted = set(await UserPermission.filter(user=user).values_list("resource", flat=True))
         for resource in template_resources - granted:
             await UserPermission.create(
@@ -110,3 +123,13 @@ async def sync_role_resource_grants() -> None:
         excluded = excluded_resources_for_role(user.role_id)
         if excluded:
             await UserPermission.filter(user=user, resource__in=list(excluded)).delete()
+
+
+async def ensure_roles() -> int:
+    """Roles added after the first start (the Accountant) exist on every database, not only new ones."""
+    made = 0
+    for role_id, name, landing in ROLES:
+        if not await Role.exists(id=role_id):
+            await Role.create(id=role_id, name=name, landing=landing)
+            made += 1
+    return made

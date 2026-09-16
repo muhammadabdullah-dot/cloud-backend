@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
 
+from app.core import logs
 from app.core.pairing import (
     hash_sync_secret,
     is_pairing_expired,
@@ -141,6 +142,10 @@ async def claim(code: str, pairing_key: str, sync_url: str | None, claimed_from:
         if sync_url:
             branch.sync_url = sync_url
         await branch.save()
+        # A branch set up after members already exist starts with all of them, their points and the rules.
+        from app.services import loyalty_service
+
+        await loyalty_service.seed_branch(branch)
 
     return branch, secret
 
@@ -204,7 +209,7 @@ async def ingest(branch: Branch, events: list[dict]) -> tuple[SyncRun, list[str]
             rejected += 1
             continue
         try:
-            await SyncInboxEvent.create(
+            stored = await SyncInboxEvent.create(
                 branch=branch,
                 event_id=event_id,
                 aggregate_type=str(raw.get("aggregateType") or "unknown")[:60],
@@ -216,6 +221,10 @@ async def ingest(branch: Branch, events: list[dict]) -> tuple[SyncRun, list[str]
             )
             accepted += 1
             acknowledged.append(event_id)
+            # Projected straight away so a receipt or a staff change takes effect at head office on the
+            # same push. A projection failure is recorded on the event and never un-acknowledges it.
+            from app.services import projector
+            await projector.project(branch, stored)
         except IntegrityError:
             # The unique_together did its job. This event is already stored — which, from the
             # branch's point of view, is a success: it is on the Cloud.
@@ -223,8 +232,12 @@ async def ingest(branch: Branch, events: list[dict]) -> tuple[SyncRun, list[str]
             acknowledged.append(event_id)
         except Exception as exc:  # noqa: BLE001 — one bad event must not fail the batch
             rejected += 1
-            note = f"{type(exc).__name__} on event {event_id}"
-            print(f"  sync: rejected event from {branch.code}: {note}", flush=True)
+            # The branch will offer this event again every tick and be refused every time, so the
+            # reason is the only thing that ends that loop. A print ends with the console window.
+            logs.log.error(
+                "sync: rejected event %s (%s) from %s", event_id, raw.get("aggregateType"), branch.code,
+                exc_info=exc,
+            )
 
     run = await SyncRun.create(
         branch=branch,
