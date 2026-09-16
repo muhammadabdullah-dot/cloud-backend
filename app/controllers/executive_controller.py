@@ -387,7 +387,7 @@ async def list_kpis(period_id: str, *, include_charted: bool = False) -> KpiList
     branches = await ex.Branch.all()
     never = [b for b in branches if b.status == "active" and not b.last_seen_at]
     add(id="sync-health", label="Sync Health", group="Health",
-        hint="Which branches have reported, and how recently. Live push is not built yet — snapshots are imported.",
+        hint="Which branches have reported, and how recently. A branch sends its own figures — events every couple of minutes, its whole picture every two hours.",
         value=Decimal(len(branches) - len(never)), display=f"{len(branches) - len(never)}/{len(branches)}", unit="text",
         sub=f"{len(never)} never reported" if never else "all branches reporting",
         severity="watch" if never else "good", source=LIVE, asOf=None)
@@ -482,7 +482,7 @@ async def _build_charts(period: ex.Period) -> list[ChartOut]:
         busiest = max(hours, key=lambda h: h["netSales"])["hour"]
         charts.append(ChartOut(
             id="sales-by-hour", title="Sales through the day",
-            subtitle="Average per trading hour across the period",
+            subtitle="Total taken in each hour of the day, across the period",
             kind="bar-v", unit="PKR",
             points=[
                 ChartPoint(
@@ -1315,7 +1315,9 @@ async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None =
             ),
             rows=rows,
             notes=[
-                "Branch push is not built yet. Snapshots are imported by hand, so 'last reported' is when that import ran.",
+                "'Last reported' is when that branch last reached head office. A branch pushes its events every couple of "
+                "minutes and its whole picture every two hours, and keeps trading meanwhile — silence here means the link is "
+                "down or the branch server is off, not that the shop has stopped.",
                 "The godown is not listed — it is this same Cloud service, so it is always current.",
             ],
         )

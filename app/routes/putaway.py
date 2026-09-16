@@ -2,10 +2,11 @@
 from datetime import datetime
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.middlewares.auth import require_any_permission, require_permission
+from app.services.rbac_service import has_permission
 from app.models import Bin, Transfer, User
 from app.schemas.types import Qty
 from app.services import putaway_service
@@ -166,7 +167,14 @@ async def set_home_bin(product_id: str, payload: HomeBinIn, user: User = Depends
 
 @router.post("/moves", response_model=MoveResultOut)
 async def move_stock(payload: MoveIn, user: User = Depends(_move)) -> MoveResultOut:
-    """Move stock from one bin to another."""
+    """Move stock from one bin to another.
+
+    Moving stock is floor work; deciding where an Item *lives* is not. `makeHome` therefore needs the same
+    access as setting a home bin directly — otherwise the tick box on the move window would be a way around
+    that guard."""
+    if payload.makeHome and not (await has_permission(user, "warehouse.bins.manage", "W")
+                                 or await has_permission(user, "warehouse.items.manage", "W")):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Moving stock is one thing; changing where an Item lives is another. Ask a Warehouse Manager.")
     try:
         move, warning = await putaway_service.move(user, payload.productId, payload.fromBinId, payload.toBinId, payload.qty, payload.note, payload.makeHome)
     except putaway_service.PutAwayError as exc:
