@@ -117,7 +117,7 @@ async def _add_bins(rack: Rack, levels: range, positions: range, capacity: int, 
 async def create_rack(data: dict) -> tuple[Rack, int]:
     code = (data.get("code") or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9][A-Z0-9-]{0,9}", code):
-        raise RackError("A rack code is 1 to 10 letters, numbers or dashes — e.g. A, C2, COLD-1.")
+        raise RackError("A rack code is 1 to 10 letters, numbers or dashes, for example A, C2 or COLD-1.")
     if await Rack.exists(code=code) or await Bin.exists(rack=code):
         raise RackError(f"There's already a rack {code}.")
     levels, positions = int(data.get("levels") or 1), int(data.get("positions") or 1)
@@ -158,7 +158,7 @@ async def update_rack(rack_id: str, data: dict) -> tuple[Rack, int]:
     levels = int(data.get("levels") or rack.levels)
     positions = int(data.get("positions") or rack.positions)
     if levels < rack.levels or positions < rack.positions:
-        raise RackError("A rack can grow but not shrink — its bins have history. Switch off the bins you don't need instead.")
+        raise RackError("A rack can grow but not shrink, because its bins have history. Switch off the bins you don't need instead.")
     _check_size(levels, positions)
     if levels != rack.levels or positions != rack.positions:
         sample = await Bin.filter(rack=rack.code).order_by("level", "position").first()

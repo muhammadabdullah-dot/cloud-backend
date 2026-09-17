@@ -13,13 +13,22 @@ from app.core import logs
 from app.models import Branch, SyncInboxEvent
 from app.services import loyalty_service, staff_sync_service, transfer_sync_service
 
-PROJECTED = ("Staff", "Transfer", "Member", "LoyaltyEntry", "LoyaltySettings", "Activity", "AccChart", "AccVoucher", "AccSettings")
+PROJECTED = (
+    "Staff", "Transfer", "Member", "LoyaltyEntry", "LoyaltySettings", "Activity", "AccChart", "AccVoucher", "AccSettings",
+    "Supplier", "SupplierList",
+)
 
 
 def _mirror_error():
     from app.services.accounts_mirror_service import MirrorError
 
     return MirrorError
+
+
+def _supplier_error():
+    from app.services.supplier_sync_service import SupplierSyncError
+
+    return SupplierSyncError
 
 
 async def project(branch: Branch, event: SyncInboxEvent) -> None:
@@ -50,13 +59,24 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
                 await accounts_mirror_service.apply_settings(branch, event.payload or {})
             elif event.aggregate_type == "LoyaltySettings":
                 await loyalty_service.apply_settings(branch, (event.payload or {}).get("settings") or {})
+            elif event.aggregate_type == "Supplier":
+                from app.services import supplier_sync_service
+
+                await supplier_sync_service.apply_from_branch(branch, event.payload or {})
+            elif event.aggregate_type == "SupplierList":
+                from app.services import supplier_sync_service
+
+                await supplier_sync_service.send_list(branch)
             else:
                 payload = dict(event.payload or {})
                 payload.setdefault("transferId", event.aggregate_id)
                 await transfer_sync_service.project(branch, payload)
         event.status = "applied"
         event.apply_error = None
-    except (staff_sync_service.StaffError, transfer_sync_service.TransferSyncError, loyalty_service.LoyaltyError, _mirror_error()) as exc:
+    except (
+        staff_sync_service.StaffError, transfer_sync_service.TransferSyncError, loyalty_service.LoyaltyError, _mirror_error(),
+        _supplier_error(),
+    ) as exc:
         event.status = "failed"
         event.apply_error = exc.message
         logs.log.warning("sync: %s event %s from %s not applied: %s", event.aggregate_type, event.id, branch.code, exc.message)

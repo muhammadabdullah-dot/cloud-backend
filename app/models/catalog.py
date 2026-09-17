@@ -140,11 +140,37 @@ class ProductAttachment(models.Model):
 
 
 class Supplier(models.Model):
+    """The company's supplier list. Head office adds and changes suppliers here and every branch gets them; a supplier
+    a branch adds comes up and joins the list (services/supplier_sync_service.py). Never deleted: GRNs, orders and
+    the supplier's ledger account point at it. One no longer bought from is switched off."""
+
     id = fields.CharField(max_length=60, pk=True)
     code = fields.CharField(max_length=40, unique=True)
     name = fields.CharField(max_length=180)
     contact_person = fields.CharField(max_length=120, null=True)
     phone = fields.CharField(max_length=40, null=True)
+    phone2 = fields.CharField(max_length=30, null=True)
+    email = fields.CharField(max_length=180, null=True)
+    address = fields.CharField(max_length=255, null=True)
+    city = fields.CharField(max_length=80, null=True)
+    ntn = fields.CharField(max_length=40, null=True)
+    s_tax_reg_no = fields.CharField(max_length=40, null=True)
+    cnic = fields.CharField(max_length=40, null=True)
+    # Payment terms: days to pay this supplier's invoice.
+    due_days = fields.IntField(default=0)
+    # The discount this supplier usually gives, in percent.
+    discount_percent = fields.DecimalField(max_digits=5, decimal_places=2, default=0)
+    remarks = fields.CharField(max_length=255, null=True)
+    active = fields.BooleanField(default=True)
+    # The identity every branch knows this supplier by; branches keep their own ids and codes.
+    company_id = fields.CharField(max_length=40, null=True, unique=True)
+    # "HO", or the code of the branch that first added it.
+    origin = fields.CharField(max_length=20, default="HO")
+    # Goes up by one with every change, so a branch applies a change once and never an older one over a newer.
+    rev = fields.IntField(default=1)
+    created_at = fields.DatetimeField(null=True)
+    updated_at = fields.DatetimeField(null=True)
+    updated_by = fields.CharField(max_length=180, null=True)
 
     class Meta:
         table = "suppliers"

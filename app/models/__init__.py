@@ -21,6 +21,7 @@ from app.models.executive import (
     BranchProductStat,
     BranchStockAlert,
 )
+from app.models.fixed_assets import DepreciationRun, DepreciationRunLine, FixedAsset
 from app.models.executive_detail import (
     BranchCreditCustomer,
     BranchDiscountOverride,
@@ -31,13 +32,16 @@ from app.models.executive_detail import (
     BranchTillClose,
 )
 from app.models.loyalty import LoyaltyEntry, LoyaltySettings, Member
+from app.models.masters import ItemListEntry, OfficeSetting
 from app.models.notice import Notice, NoticeRead
 from app.models.permission import UserPermission
 from app.models.purchasing import PurchaseOrder, PurchaseOrderLine
+from app.models.requisition_detail import RequisitionDetail, RequisitionLine
 from app.models.role import Role, RoleDefaultPermission
 from app.models.sequence import Counter, next_value
 from app.models.stock_snapshot import BranchProductStock, BranchSnapshotRun
 from app.models.sync import SyncInboxEvent, SyncRun
+from app.models.supplier_links import SupplierBranchLink, SupplierQuestion
 from app.models.user import User
 from app.models.warehouse import (
     GRN,
@@ -52,6 +56,10 @@ from app.models.warehouse import (
 )
 
 __all__ = [
+    "ItemListEntry",
+    "OfficeSetting",
+    "RequisitionDetail",
+    "RequisitionLine",
     "HEAD_OFFICE_BOOK",
     "Account",
     "AccountCategory",
@@ -61,6 +69,9 @@ __all__ = [
     "AccountType",
     "Voucher",
     "VoucherLine",
+    "FixedAsset",
+    "DepreciationRun",
+    "DepreciationRunLine",
     "Notice",
     "NoticeRead",
     "PurchaseOrder",
@@ -107,6 +118,8 @@ __all__ = [
     "StockMovement",
     "BinMove",
     "Supplier",
+    "SupplierBranchLink",
+    "SupplierQuestion",
     "SyncInboxEvent",
     "SyncRun",
     "Transfer",

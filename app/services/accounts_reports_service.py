@@ -124,11 +124,13 @@ def _merge(chart: dict[str, dict], sums: dict[str, tuple[Decimal, Decimal]], tog
         row = out.get(key)
         if row is None:
             merged = key.startswith(("key:", "code:"))
-            row = out[key] = {**meta, "name": _label(meta, together, merged), "books": [meta["book"]], "dr": ZERO, "cr": ZERO}
+            row = out[key] = {**meta, "name": _label(meta, together, merged), "books": [meta["book"]], "dr": ZERO, "cr": ZERO, "parts": []}
             if together and merged:
                 row["accountId"] = meta["accountId"] if counts[key] == 1 else None
         elif meta["book"] not in row["books"]:
             row["books"].append(meta["book"])
+        if dr or cr:
+            row["parts"].append({"book": meta["book"], "accountId": account_id})
         row["dr"] += dr
         row["cr"] += cr
     return out
@@ -147,13 +149,22 @@ def _split(value: Decimal) -> tuple[str, str]:
     return (_s(value), "0.00") if value >= 0 else ("0.00", _s(-value))
 
 
-async def trial_balance(books: list[str], together: bool, start: date | None, end: date, group_code: str | None = None, include_zero: bool = False) -> dict:
+def codes(value: str | None) -> set[str]:
+    """A filter that names one group or category, or several separated by commas ("1102,1103")."""
+    return {c.strip() for c in (value or "").split(",") if c.strip()}
+
+
+async def trial_balance(books: list[str], together: bool, start: date | None, end: date, group_code: str | None = None, include_zero: bool = False,
+                        category_code: str | None = None) -> dict:
     chart = await chart_map(books)
     opening = _merge(chart, await _sums(books, before=start) if start else {}, together)
     period = _merge(chart, await _sums(books, start=start, end=end), together)
+    groups_wanted, categories_wanted = codes(group_code), codes(category_code)
     rows = []
     for key, p in period.items():
-        if group_code and p["groupCode"] != group_code:
+        if groups_wanted and p["groupCode"] not in groups_wanted:
+            continue
+        if categories_wanted and p["categoryCode"] not in categories_wanted:
             continue
         o = opening.get(key, {"dr": ZERO, "cr": ZERO})
         o_dr, o_cr, p_dr, p_cr = o["dr"], o["cr"], p["dr"], p["cr"]
@@ -164,6 +175,8 @@ async def trial_balance(books: list[str], together: bool, start: date | None, en
         open_dr, open_cr = _split(open_bal)
         close_dr, close_cr = _split(close_bal)
         meta = {k: v for k, v in p.items() if k not in ("dr", "cr")}
+        # A book whose account has only an opening balance is still a book the line opens.
+        meta["parts"] = list({part["accountId"]: part for part in [*opening.get(key, {}).get("parts", []), *p["parts"]]}.values())
         rows.append({**meta, "opening": _s(open_bal), "debit": _s(p_dr), "credit": _s(p_cr), "closing": _s(close_bal),
                      "openingDr": open_dr, "openingCr": open_cr, "closingDr": close_dr, "closingCr": close_cr,
                      "totalDebit": _s(o_dr + p_dr), "totalCredit": _s(o_cr + p_cr)})
@@ -224,13 +237,15 @@ async def ledger(account_id: str, start: date | None, end: date, include_pdc: bo
     for r in rows:
         debit, credit = money(_d(r["debit"])), money(_d(r["credit"]))
         running += debit - credit
-        contra = [chart.get(a, {}).get("name", "?") for a, d, c in others.get(str(r["voucher_id"]), [])
-                  if a != str(account_id) and ((c > 0) if debit > 0 else (d > 0))]
+        contra_ids = list(dict.fromkeys(a for a, d, c in others.get(str(r["voucher_id"]), [])
+                                        if a != str(account_id) and ((c > 0) if debit > 0 else (d > 0))))
+        contra = [chart.get(a, {}).get("name", "?") for a in contra_ids]
         description = r["description"] if r["description"] and r["description"] != "__header__" else r["vdesc"]
         entries.append({
             "voucherId": str(r["voucher_id"]), "number": r["number"], "vtype": r["vtype"], "date": str(r["date"])[:10],
             "description": description, "referenceNo": r["reference_no"] or r["vref"], "chequeNo": r["cheque_no"], "auto": bool(r["auto"]),
-            "debit": _s(debit), "credit": _s(credit), "balance": _s(running), "against": ", ".join(dict.fromkeys(contra))[:200] if contra else None,
+            "debit": _s(debit), "credit": _s(credit), "balance": _s(running), "against": ", ".join(contra)[:200] if contra else None,
+            "againstAccounts": [{"accountId": a, "name": chart.get(a, {}).get("name", "?")} for a in contra_ids[:8]],
         })
     total_dr = sum((Decimal(e["debit"]) for e in entries), ZERO)
     total_cr = sum((Decimal(e["credit"]) for e in entries), ZERO)
@@ -254,17 +269,20 @@ async def income_statement(books: list[str], together: bool, start: date, end: d
         amount = (meta["cr"] - meta["dr"]) if key in ("sales", "other") else (meta["dr"] - meta["cr"])
         section = sections[key]
         group = section["groups"].setdefault(f"{meta['groupCode']}|{meta['groupName']}", {"code": meta["groupCode"], "name": meta["groupName"], "accounts": [], "amount": ZERO})
-        group["accounts"].append({"accountId": meta["accountId"], "code": meta["code"], "name": meta["name"], "amount": _s(amount)})
+        group["accounts"].append({"accountId": meta["accountId"], "code": meta["code"], "name": meta["name"], "amount": _s(amount), "parts": meta["parts"]})
         group["amount"] += amount
         section["amount"] += amount
         system_key = meta.get("systemKey") or ""
         for prefix, field in (("sales.dept.", "sales"), ("cogs.dept.", "cost")):
             if system_key.startswith(prefix):
-                dept = departments.setdefault(system_key[len(prefix):], {"name": meta["name"].split(" - ", 1)[-1], "sales": ZERO, "cost": ZERO})
+                dept = departments.setdefault(system_key[len(prefix):], _department(meta["name"].split(" - ", 1)[-1]))
                 dept[field] += amount
+                dept[f"{field}AccountId"], dept[f"{field}Parts"] = meta["accountId"], meta["parts"]
         if system_key in ("sales.general", "cogs.general"):
-            dept = departments.setdefault("", {"name": "GENERAL", "sales": ZERO, "cost": ZERO})
-            dept["sales" if system_key == "sales.general" else "cost"] += amount
+            dept = departments.setdefault("", _department("GENERAL"))
+            field = "sales" if system_key == "sales.general" else "cost"
+            dept[field] += amount
+            dept[f"{field}AccountId"], dept[f"{field}Parts"] = meta["accountId"], meta["parts"]
     net_sales, cost = sections["sales"]["amount"], sections["cost"]["amount"]
     gross = net_sales - cost
     net = gross + sections["other"]["amount"] - sections["operating"]["amount"] - sections["financial"]["amount"]
@@ -277,9 +295,19 @@ async def income_statement(books: list[str], together: bool, start: date, end: d
         "grossMargin": _s(gross / net_sales * 100) if net_sales else "0.00", "otherIncome": _s(sections["other"]["amount"]),
         "operatingExpenses": _s(sections["operating"]["amount"]), "financialExpenses": _s(sections["financial"]["amount"]),
         "netProfit": _s(net), "netMargin": _s(net / net_sales * 100) if net_sales else "0.00",
-        "departments": [{"name": d["name"], "sales": _s(d["sales"]), "cost": _s(d["cost"]), "gross": _s(d["sales"] - d["cost"])}
+        "departments": [{"name": d["name"], "sales": _s(d["sales"]), "cost": _s(d["cost"]), "gross": _s(d["sales"] - d["cost"]),
+                         "salesAccountId": d["salesAccountId"], "costAccountId": d["costAccountId"], "salesParts": d["salesParts"], "costParts": d["costParts"]}
                         for d in sorted(departments.values(), key=lambda d: -d["sales"])],
     }
+
+
+def _department(name: str) -> dict:
+    return {"name": name, "sales": ZERO, "cost": ZERO, "salesAccountId": None, "costAccountId": None, "salesParts": [], "costParts": []}
+
+
+async def first_posted_day(books: list[str]) -> date | None:
+    row = await Voucher.filter(book__in=books, status="posted").order_by("date").first()
+    return row.date if row else None
 
 
 def fiscal_year_start(day: date, start_month: int) -> date:
@@ -314,7 +342,7 @@ async def balance_sheet(books: list[str], together: bool, as_of: date, fiscal_st
             side, amount = sides["2"], -amount
         category = side["categories"].setdefault(meta["categoryCode"], {"code": meta["categoryCode"], "name": meta["categoryName"], "groups": {}, "amount": ZERO})
         group = category["groups"].setdefault(f"{meta['groupCode']}|{meta['groupName']}", {"code": meta["groupCode"], "name": meta["groupName"], "accounts": [], "amount": ZERO})
-        group["accounts"].append({"accountId": meta["accountId"], "code": meta["code"], "name": meta["name"], "amount": _s(amount)})
+        group["accounts"].append({"accountId": meta["accountId"], "code": meta["code"], "name": meta["name"], "amount": _s(amount), "parts": meta["parts"]})
         group["amount"] += amount
         category["amount"] += amount
         side["amount"] += amount
@@ -340,7 +368,10 @@ async def balance_sheet(books: list[str], together: bool, as_of: date, fiscal_st
     return {"books": books, "together": together, "asOf": as_of.isoformat(), "fiscalYearStart": fy_start.isoformat(),
             "assets": shape(sides["1"]), "liabilities": shape(sides["2"]), "equity": shape(sides["3"]),
             "totalAssets": _s(assets), "totalLiabilitiesAndEquity": _s(liabilities + equity["amount"]),
-            "difference": _s(assets - liabilities - equity["amount"]), "currentYearProfit": _s(current), "profitBroughtForward": _s(brought_forward)}
+            "difference": _s(assets - liabilities - equity["amount"]), "currentYearProfit": _s(current), "profitBroughtForward": _s(brought_forward),
+            # What the two profit lines add up, so each opens the income statement for its own days.
+            "broughtForwardFrom": (first.isoformat() if (first := await first_posted_day(books)) and first < fy_start else None),
+            "broughtForwardTo": (fy_start - timedelta(days=1)).isoformat()}
 
 
 async def day_book(books: list[str], start: date, end: date, vtype: str | None, limit: int, offset: int) -> dict:
@@ -365,10 +396,10 @@ async def day_book(books: list[str], start: date, end: date, vtype: str | None, 
 BUCKETS = (("current", 0, 30), ("d31_60", 31, 60), ("d61_90", 61, 90), ("d91_120", 91, 120), ("over120", 121, 10 ** 6))
 
 
-async def ageing(books: list[str], kind: str, as_of: date) -> dict:
+async def ageing(books: list[str], kind: str, as_of: date, account_ids: list[str] | None = None) -> dict:
     if kind not in ("customer", "supplier"):
         raise ValueError("Ageing is for customers or suppliers.")
-    accounts = await Account.filter(book__in=books, kind=kind)
+    accounts = await (Account.filter(book__in=books, kind=kind, id__in=account_ids) if account_ids is not None else Account.filter(book__in=books, kind=kind))
     ids = [str(a.id) for a in accounts]
     lines: dict[str, list[tuple[date, Decimal, Decimal]]] = {}
     for chunk_start in range(0, len(ids), 400):
@@ -420,6 +451,30 @@ async def ageing(books: list[str], kind: str, as_of: date) -> dict:
             totals[k] += v
     rows.sort(key=lambda r: -Decimal(r["balance"]))
     return {"asOf": as_of.isoformat(), "kind": kind, "books": books, "rows": rows, "totals": {k: _s(v) for k, v in totals.items()}}
+
+
+async def statement(account_id: str, start: date | None, end: date) -> dict:
+    """What a customer or supplier is sent: who they are, what they owed at the start, every entry with the balance after
+    it, what is owed at the end and how old it is. The same figures as the ledger, read from their side."""
+    from app.models import Supplier
+
+    account = await Account.get_or_none(id=account_id)
+    if not account:
+        raise ValueError("That account doesn't exist.")
+    if account.kind not in ("customer", "supplier"):
+        raise ValueError("A statement of account is for a customer or a supplier.")
+    book = await ledger(account_id, start, end)
+    party = await Supplier.get_or_none(id=account.party_ref) if account.kind == "supplier" and account.party_ref else None
+    address = ", ".join(p for p in (getattr(party, "address", None), getattr(party, "city", None)) if p)
+    ages = await ageing([account.book], account.kind, end, [str(account.id)])
+    return {
+        **book,
+        "kind": account.kind,
+        "party": {"name": account.name, "code": getattr(party, "code", None) or account.code, "phone": getattr(party, "phone", None),
+                  "address": address or None, "ntn": getattr(party, "ntn", None), "dueDays": getattr(party, "due_days", None)},
+        "owedSide": "debit" if account.kind == "customer" else "credit",
+        "ageing": ages["rows"][0] if ages["rows"] else None,
+    }
 
 
 async def book_summary(book: str, today: date) -> dict:
@@ -486,7 +541,11 @@ async def dashboard(book: str | None) -> dict:
         "checks": {
             "trialBalanceDifference": _s(sum(bal.values(), ZERO)), "stockInBooks": _s(stock), "stockInTransit": _s(transit),
             "godownStockAtCost": _s(godown_value), "interofficeDifference": _s(interoffice) if together else None,
+            "stockAccountId": None if together else next((k for k, m in chart.items() if m["systemKey"] == "stock.main"), None),
+            "transitAccountId": None if together else next((k for k, m in chart.items() if m["systemKey"] == "stock.transit"), None),
+            "interofficeAccountIds": [k for k, m in chart.items() if m["kind"] == "interoffice"],
         },
+        "problemSources": [await vouchers_service.problem_source(p) for p in (head.posting_problems or [])[:20]],
         "drafts": await Voucher.filter(book__in=books, status="draft").count(),
         "bookSummaries": summaries,
         "settings": {"booksStart": head.books_start.isoformat() if head.books_start else None, "lockedUntil": head.locked_until.isoformat() if head.locked_until else None,

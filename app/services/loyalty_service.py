@@ -201,6 +201,57 @@ async def update_settings(data: dict, user: User) -> LoyaltySettings:
     return s
 
 
+def _phone(raw: str | None) -> str:
+    """The same local form a branch keeps (branch server members_service.normalize_phone): +92 300 1234567 and
+    3001234567 are both 03001234567."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("0092"):
+        digits = digits[4:]
+    if digits.startswith("92") and len(digits) == 12:
+        digits = "0" + digits[2:]
+    if len(digits) == 10 and digits.startswith("3"):
+        digits = "0" + digits
+    if not 10 <= len(digits) <= 13:
+        raise LoyaltyError("Enter the mobile number as 11 digits, like 0300 1234567.")
+    return digits
+
+
+async def update_member(code: str, data: dict, user: User) -> Member:
+    """Head office corrects a member's name or mobile number, or switches the member off (or back on). Every branch
+    takes the change at its next check; a later change made at a branch still wins, as with every member change."""
+    member = await Member.get_or_none(code=(code or "").strip().upper())
+    if not member:
+        raise LoyaltyError("No member with that code.", 404)
+    changed = False
+    if data.get("name") is not None:
+        name = re.sub(r"\s+", " ", str(data["name"]).strip())
+        if not name:
+            raise LoyaltyError("Type the member's name.")
+        if len(name) > 120:
+            raise LoyaltyError("A name can be at most 120 characters.")
+        changed |= name != member.name
+        member.name = name
+    if data.get("phone") is not None:
+        phone = _phone(data["phone"])
+        if phone != member.phone:
+            # Every branch keeps one member per mobile number and would refuse the change.
+            clash = await Member.filter(phone=phone).exclude(id=member.id).first()
+            if clash:
+                raise LoyaltyError(f"{phone} is already member {clash.code} ({clash.name}).")
+            member.phone = phone
+            changed = True
+    if data.get("active") is not None and bool(data["active"]) != member.active:
+        member.active = bool(data["active"])
+        changed = True
+    if not changed:
+        return member
+    member.updated_at = datetime.now(timezone.utc)
+    await member.save()
+    for branch in await _other_branches(None):
+        await downstream_service.enqueue(str(branch.id), "member.upsert", {"member": member_payload(member)})
+    return member
+
+
 async def search(q: str | None, branch_code: str | None, limit: int, offset: int) -> tuple[list[Member], int]:
     qs = Member.all()
     if branch_code:

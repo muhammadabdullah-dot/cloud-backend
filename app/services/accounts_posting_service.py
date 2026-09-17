@@ -57,7 +57,7 @@ class Run:
             return
         self.counts[outcome] += 1
         if outcome == "locked":
-            self.problems.append(f"{source} changed after its month was closed — the closed books keep the old figures.")
+            self.problems.append(f"{source} changed after its month was closed. The closed books keep the old figures.")
 
     async def drop(self, source: str) -> None:
         async with in_transaction():
@@ -209,4 +209,4 @@ async def opening_suggestion() -> dict:
                       "debit": format(max(opening, ZERO), "f"), "credit": format(max(-opening, ZERO), "f"),
                       "description": "Godown stock at cost on the books' start (so the books agree with today's godown stock)"})
     return {"booksStart": settings.books_start.isoformat(), "date": (settings.books_start - timedelta(days=1)).isoformat(), "lines": lines,
-            "note": "Cash, bank balances, supplier dues from before, fixed assets, loans and capital aren't in head office's records — add them."}
+            "note": "Cash, bank balances, supplier dues from before, fixed assets, loans and capital aren't in head office's records, so add them."}

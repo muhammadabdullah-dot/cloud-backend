@@ -125,7 +125,7 @@ async def list_products(q: str | None, limit: int, offset: int) -> ProductListOu
 
 async def list_suppliers() -> list[SupplierOut]:
     return [
-        SupplierOut(id=str(s.id), code=s.code, name=s.name, contactPerson=s.contact_person, phone=s.phone)
+        SupplierOut(id=str(s.id), code=s.code, name=s.name, contactPerson=s.contact_person, phone=s.phone, active=s.active, dueDays=s.due_days)
         for s in await warehouse_service.list_suppliers()
     ]
 

@@ -114,7 +114,7 @@ def cell_int(row: dict, key: str, default: int = 0) -> int:
     try:
         return int(float(value.replace(",", "")))
     except ValueError:
-        raise ValueError(f"{key} must be a whole number — this row has {value!r}") from None
+        raise ValueError(f"{key} must be a whole number, but this row has {value!r}") from None
 
 
 def cell_decimal(row: dict, key: str) -> Decimal | None:
@@ -124,7 +124,7 @@ def cell_decimal(row: dict, key: str) -> Decimal | None:
     try:
         return Decimal(value.replace(",", ""))
     except InvalidOperation:
-        raise ValueError(f"{key} must be a number — this row has {value!r}") from None
+        raise ValueError(f"{key} must be a number, but this row has {value!r}") from None
 
 
 def row_error(exc: Exception) -> str:

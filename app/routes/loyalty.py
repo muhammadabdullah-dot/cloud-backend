@@ -71,6 +71,13 @@ class SettingsIn(BaseModel):
     maxRedeemPercent: Decimal | None = Field(default=None, gt=0, le=100)
 
 
+class MemberIn(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    phone: str | None = Field(default=None, max_length=30)
+    # False switches the member off: no points earned or used at any branch. The history stays.
+    active: bool | None = None
+
+
 def _member(m: Member) -> MemberOut:
     return MemberOut(
         code=m.code, name=m.name, phone=m.phone, joinedVia=m.joined_via, joinedMethod=m.joined_method,
@@ -104,6 +111,15 @@ async def member(code: str, user: User = Depends(_read)) -> MemberDetailOut:
         entries=[EntryOut(id=str(e.id), kind=e.kind, points=e.points, invoiceNumber=e.invoice_number, branchCode=e.branch_code,
                           note=e.note, by=e.by_name, at=e.at) for e in entries],
     )
+
+
+@router.patch("/members/{code}", response_model=MemberOut)
+async def update_member(code: str, payload: MemberIn, user: User = Depends(_write)) -> MemberOut:
+    """Correct a member's name or mobile number, or switch the member off or back on. Every branch gets the change."""
+    try:
+        return _member(await loyalty_service.update_member(code, payload.model_dump(exclude_unset=True), user))
+    except loyalty_service.LoyaltyError as exc:
+        raise HTTPException(exc.status, exc.message)
 
 
 @router.get("/settings", response_model=SettingsOut)

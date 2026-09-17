@@ -126,6 +126,7 @@ async def list_orders(status: str | None = None, q: str | None = None, limit: in
 async def my_limit(user: User = Depends(_read)) -> MyLimitOut:
     from app.services.rbac_service import has_permission
 
+    await purchasing_service.use_saved_limits()
     limit = purchasing_service.po_limit_of(user)
     return MyLimitOut(limit=purchasing_service.money(limit), canApprove=await has_permission(user, "warehouse.purchase-orders.approve", "X"))
 

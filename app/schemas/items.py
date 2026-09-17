@@ -200,3 +200,5 @@ class ItemFacetsOut(BaseModel):
     units: list[str]
     packUnits: list[str]
     variants: list[str]
+    # Switched-on GST rates from Item Lists, written the short way (0, 18).
+    taxRates: list[str] = []

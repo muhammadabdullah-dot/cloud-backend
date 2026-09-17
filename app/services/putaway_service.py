@@ -52,7 +52,7 @@ async def bin_usage() -> dict[str, Decimal]:
 
 def capacity_warning(bin_: Bin, used: Decimal, adding: Decimal) -> str | None:
     if bin_.capacity_units and used + adding > bin_.capacity_units:
-        return f"{bin_.label} will hold {(used + adding).normalize():f} units — over its capacity of {bin_.capacity_units}."
+        return f"{bin_.label} will hold {(used + adding).normalize():f} units, which is over its capacity of {bin_.capacity_units}."
     return None
 
 
@@ -96,7 +96,7 @@ async def _move(user: User | None, product: Product, from_bin: Bin, to_bin: Bin,
     if not to_bin.active:
         raise PutAwayError(f"{to_bin.label} is switched off and takes no new stock.")
     if qty > held:
-        raise PutAwayError(f"{from_bin.label} holds {held.normalize():f} of {product.name} — can't move {qty.normalize():f}.")
+        raise PutAwayError(f"{from_bin.label} holds {held.normalize():f} of {product.name}, not enough to move {qty.normalize():f}.")
     seq = await next_value("bin_move", 1)
     number = f"MV-{seq:05d}"
     for bin_, signed in ((from_bin, -qty), (to_bin, qty)):

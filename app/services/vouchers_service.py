@@ -12,12 +12,14 @@ closed. They are never edited or reversed by hand; the record they came from is 
 """
 import hashlib
 import json
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from tortoise.transactions import atomic
 
 from app.models import HEAD_OFFICE_BOOK, Account, AccountsSettings, User, Voucher, VoucherLine, next_value
+from app.services import accounts_areas
 from app.services.accounts_chart_service import money
 from app.services.accounts_reports_service import shop_day
 
@@ -72,7 +74,7 @@ async def _number(vtype: str) -> str:
 
 # ── what a voucher looks like outside ───────────────────────────────────────────────────────────
 
-async def voucher_out(voucher: Voucher, with_lines: bool = True) -> dict:
+async def voucher_out(voucher: Voucher, with_lines: bool = True, with_source: bool = False) -> dict:
     out = {
         "id": str(voucher.id), "book": voucher.book, "mirrored": voucher.mirrored, "number": voucher.number, "vtype": voucher.vtype, "typeLabel": TYPE_LABELS.get(voucher.vtype, voucher.vtype),
         "date": voucher.date.isoformat(), "status": voucher.status, "auto": voucher.auto, "source": voucher.source,
@@ -102,7 +104,57 @@ async def voucher_out(voucher: Voucher, with_lines: bool = True) -> dict:
         if voucher.reversed:
             reversal = await Voucher.filter(reversal_of_id=str(voucher.id)).first()
             out["reversedBy"] = reversal.number if reversal else None
+            out["reversedById"] = str(reversal.id) if reversal else None
+        if with_source and voucher.source:
+            out["sourceInfo"] = await source_info(voucher.source, voucher.book)
     return out
+
+
+# ── the record an automatic voucher came from ─────────────────────────────────────────────────────
+
+SOURCE_PATTERN = re.compile(r"^(grn|stock-corrections|transfer-out-received|transfer-out-settled|transfer-out|transfer-relay):([0-9A-Za-z-]+)")
+
+
+async def source_info(source: str | None, book: str = HEAD_OFFICE_BOOK) -> dict | None:
+    """What a screen needs to open the record behind an automatic voucher. Head office holds no branch records, so a
+    voucher a branch posted only says what it came from and where."""
+    if not source:
+        return None
+    if book != HEAD_OFFICE_BOOK:
+        from app.models import Branch
+
+        branch = await Branch.get_or_none(code=book)
+        own = source.split(":", 1)[1] if source.startswith(f"{book}:") else source
+        return {"kind": "branch", "book": book, "branchName": branch.name if branch else book, "text": own}
+    match = SOURCE_PATTERN.match(source)
+    if not match:
+        return None
+    prefix, key = match.group(1), match.group(2)
+    from app.models import GRN, Transfer
+
+    async def one(model, **lookup):
+        try:
+            return await model.get_or_none(**lookup)
+        except (ValueError, TypeError):
+            return None
+
+    if prefix == "stock-corrections":
+        return {"kind": "stock-corrections", "day": key}
+    if prefix == "grn":
+        grn = await one(GRN, id=key)
+        return {"kind": "grn", "grnId": key, "number": grn.grn_number if grn else None, "missing": grn is None}
+    transfer = await one(Transfer, id=key)
+    return {"kind": "transfer", "transferId": key, "number": transfer.transfer_number if transfer else None, "missing": transfer is None}
+
+
+async def problem_source(text: str) -> dict:
+    """A posting problem names the record it is about at its start ("grn:<id>: debits and credits differ ...")."""
+    match = SOURCE_PATTERN.match(text or "")
+    if not match:
+        return {"text": text, "source": None, "info": None, "voucherId": None}
+    source = match.group(0)
+    voucher = await Voucher.get_or_none(source=source, book=HEAD_OFFICE_BOOK)
+    return {"text": text, "source": source, "info": await source_info(source), "voucherId": str(voucher.id) if voucher else None}
 
 
 async def emit(voucher: Voucher) -> None:
@@ -126,7 +178,10 @@ def _parse_date(value) -> date:
         raise VoucherError("That date isn't valid.") from exc
 
 
-async def _build(vtype: str, payload: dict) -> tuple[Account | None, list[tuple[Account, Decimal, Decimal, str | None, str | None]]]:
+async def _build(
+    vtype: str, payload: dict, access: accounts_areas.Access | None = None,
+) -> tuple[Account | None, list[tuple[Account, Decimal, Decimal, str | None, str | None]]]:
+    """The voucher's lines as they'll be written. With `access`, every account on it must be one the person may use."""
     if vtype not in MANUAL_TYPES:
         raise VoucherError("Pick a voucher type: cash or bank payment or receipt, journal, contra or opening balances.")
     header = None
@@ -138,6 +193,7 @@ async def _build(vtype: str, payload: dict) -> tuple[Account | None, list[tuple[
         if header.kind not in HEADER_KINDS[vtype]:
             raise VoucherError(f"{header.name} isn't a {'cash' if vtype in ('CPV', 'CRV') else 'bank'} account.")
     rows = []
+    used: list[tuple[int | None, Account]] = [(None, header)] if header else []
     for index, line in enumerate(payload.get("lines") or []):
         account_id = line.get("accountId")
         account = await Account.get_or_none(id=account_id, book=HEAD_OFFICE_BOOK) if account_id else None
@@ -157,12 +213,13 @@ async def _build(vtype: str, payload: dict) -> tuple[Account | None, list[tuple[
         if header and str(account.id) == str(header.id):
             raise VoucherError(f"Line {index + 1}: {account.name} is already the voucher's own account.")
         if vtype in PAYING_TYPES and credit > ZERO:
-            raise VoucherError(f"Line {index + 1}: a payment voucher lists what was paid — amounts go on the debit side.")
+            raise VoucherError(f"Line {index + 1}: a payment voucher lists what was paid, so amounts go on the debit side.")
         if vtype in RECEIVING_TYPES and debit > ZERO:
-            raise VoucherError(f"Line {index + 1}: a receipt voucher lists what was received — amounts go on the credit side.")
+            raise VoucherError(f"Line {index + 1}: a receipt voucher lists what was received, so amounts go on the credit side.")
         if vtype == "CV" and account.kind not in MONEY_KINDS:
             raise VoucherError(f"Line {index + 1}: a contra only moves money between cash, bank and wallet accounts.")
         rows.append((account, debit, credit, (line.get("description") or "").strip()[:255] or None, (line.get("referenceNo") or "").strip()[:60] or None))
+        used.append((index + 1, account))
     if not rows:
         raise VoucherError("Add at least one line.")
     total_dr = sum((r[1] for r in rows), ZERO)
@@ -177,9 +234,19 @@ async def _build(vtype: str, payload: dict) -> tuple[Account | None, list[tuple[
         equity = await Resolver().key("equity.opening")
         diff = total_dr - total_cr
         rows.append((equity, ZERO if diff > 0 else -diff, diff if diff > 0 else ZERO, "Balancing figure", None))
+        used.append((None, equity))
     elif total_dr != total_cr:
         raise VoucherError(f"Debits (Rs {total_dr:,.2f}) and credits (Rs {total_cr:,.2f}) must agree.")
+    if access is not None:
+        await accounts_areas.check_use(access, used)
     return header, rows
+
+
+async def check_seen(access: accounts_areas.Access | None, voucher: Voucher, doing: str) -> None:
+    """Changing, posting, cancelling or reversing a voucher needs every account on it within the person's areas."""
+    if access is not None:
+        ids = await VoucherLine.filter(voucher=voucher).values_list("account_id", flat=True)
+        await accounts_areas.check_lines(access, voucher.number, [str(i) for i in ids], doing)
 
 
 async def _write_lines(voucher: Voucher, rows) -> None:
@@ -198,11 +265,11 @@ def _header_fields(voucher: Voucher, payload: dict) -> None:
 
 
 @atomic()
-async def create_draft(user: User, payload: dict) -> Voucher:
+async def create_draft(user: User, payload: dict, access: accounts_areas.Access | None = None) -> Voucher:
     vtype = (payload.get("vtype") or "").upper()
     day = _parse_date(payload.get("date") or shop_day())
     check_open(await settings(), day)
-    header, rows = await _build(vtype, payload)
+    header, rows = await _build(vtype, payload, access)
     voucher = Voucher(book=HEAD_OFFICE_BOOK, number=await _number(vtype), vtype=vtype, date=day, status="draft", header_account=header,
                       created_by=user, created_by_name=user.name)
     _header_fields(voucher, payload)
@@ -213,15 +280,16 @@ async def create_draft(user: User, payload: dict) -> Voucher:
 
 
 @atomic()
-async def update_draft(user: User, voucher_id: str, payload: dict) -> Voucher:
+async def update_draft(user: User, voucher_id: str, payload: dict, access: accounts_areas.Access | None = None) -> Voucher:
     voucher = await Voucher.get_or_none(id=voucher_id, book=HEAD_OFFICE_BOOK)
     if not voucher or voucher.auto:
         raise VoucherError("That voucher doesn't exist.")
     if voucher.status != "draft":
-        raise VoucherError(f"{voucher.number} is {voucher.status} — only drafts can be changed.")
+        raise VoucherError(f"{voucher.number} is {voucher.status}. Only drafts can be changed.")
+    await check_seen(access, voucher, "change")
     day = _parse_date(payload.get("date") or voucher.date)
     check_open(await settings(), day)
-    header, rows = await _build(voucher.vtype, payload)
+    header, rows = await _build(voucher.vtype, payload, access)
     voucher.date = day
     voucher.header_account = header
     _header_fields(voucher, payload)
@@ -249,12 +317,13 @@ async def _check_limits(voucher: Voucher) -> None:
 
 
 @atomic()
-async def post(user: User, voucher_id: str) -> Voucher:
+async def post(user: User, voucher_id: str, access: accounts_areas.Access | None = None) -> Voucher:
     voucher = await Voucher.get_or_none(id=voucher_id, book=HEAD_OFFICE_BOOK)
     if not voucher or voucher.auto:
         raise VoucherError("That voucher doesn't exist.")
     if voucher.status != "draft":
         raise VoucherError(f"{voucher.number} is already {voucher.status}.")
+    await check_seen(access, voucher, "post")
     check_open(await settings(), voucher.date)
     lines = await VoucherLine.filter(voucher=voucher)
     if not lines:
@@ -274,12 +343,13 @@ async def post(user: User, voucher_id: str) -> Voucher:
 
 
 @atomic()
-async def cancel_draft(user: User, voucher_id: str, reason: str | None) -> Voucher:
+async def cancel_draft(user: User, voucher_id: str, reason: str | None, access: accounts_areas.Access | None = None) -> Voucher:
     voucher = await Voucher.get_or_none(id=voucher_id, book=HEAD_OFFICE_BOOK)
     if not voucher or voucher.auto:
         raise VoucherError("That voucher doesn't exist.")
     if voucher.status != "draft":
         raise VoucherError("Only a draft can be cancelled. A posted voucher is reversed.")
+    await check_seen(access, voucher, "cancel")
     voucher.status = "cancelled"
     voucher.cancelled_by_name = user.name
     voucher.cancelled_at = _now()
@@ -289,7 +359,7 @@ async def cancel_draft(user: User, voucher_id: str, reason: str | None) -> Vouch
 
 
 @atomic()
-async def reverse(user: User, voucher_id: str, day, reason: str) -> Voucher:
+async def reverse(user: User, voucher_id: str, day, reason: str, access: accounts_areas.Access | None = None) -> Voucher:
     voucher = await Voucher.get_or_none(id=voucher_id, book=HEAD_OFFICE_BOOK)
     if not voucher:
         raise VoucherError("That voucher doesn't exist.")
@@ -301,6 +371,7 @@ async def reverse(user: User, voucher_id: str, day, reason: str) -> Voucher:
         raise VoucherError(f"{voucher.number} was already reversed.")
     if voucher.reversal_of_id:
         raise VoucherError("This is itself a reversal. Post a new voucher instead.")
+    await check_seen(access, voucher, "reverse")
     if not (reason or "").strip() or len(reason.strip()) < 5:
         raise VoucherError("Say why it's being reversed.")
     day = _parse_date(day or shop_day())
@@ -335,13 +406,14 @@ async def get(voucher_id: str) -> Voucher:
 
 async def list_vouchers(
     books: list[str], vtype: str | None, status: str | None, auto: bool | None, from_day: date | None, to_day: date | None,
-    q: str | None, account_id: str | None, limit: int, offset: int,
+    q: str | None, account_id: str | None, limit: int, offset: int, access: accounts_areas.Access | None = None,
+    account_kind: str | None = None,
 ) -> tuple[list[dict], int]:
     qs = Voucher.filter(book__in=books)
     if vtype:
         qs = qs.filter(vtype__in=[t.strip().upper() for t in vtype.split(",") if t.strip()])
     if status:
-        qs = qs.filter(status=status)
+        qs = qs.filter(status__in=[s.strip() for s in status.split(",") if s.strip()])
     if auto is not None:
         qs = qs.filter(auto=auto)
     if from_day:
@@ -356,6 +428,18 @@ async def list_vouchers(
     if account_id:
         ids = await VoucherLine.filter(account_id=account_id).distinct().values_list("voucher_id", flat=True)
         qs = qs.filter(id__in=list(ids))
+    if account_kind:
+        # Month by Month's "paid to suppliers" and "collected from customers": vouchers that touch a party of that kind.
+        from tortoise.expressions import Subquery
+
+        kinds = [k.strip() for k in account_kind.split(",") if k.strip()]
+        qs = qs.filter(id__in=Subquery(VoucherLine.filter(account__kind__in=kinds).values("voucher_id")))
+    hidden = await accounts_areas.unreadable_account_ids(access) if access is not None else []
+    if hidden:
+        # Only vouchers whose every line the person can see.
+        from tortoise.expressions import Subquery
+
+        qs = qs.exclude(id__in=Subquery(VoucherLine.filter(account_id__in=hidden).values("voucher_id")))
     total = await qs.count()
     rows = await qs.order_by("-date", "-created_at").offset(offset).limit(limit)
     return [await voucher_out(v, with_lines=False) for v in rows], total

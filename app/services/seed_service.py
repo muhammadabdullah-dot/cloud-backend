@@ -133,3 +133,77 @@ async def ensure_roles() -> int:
             await Role.create(id=role_id, name=name, landing=landing)
             made += 1
     return made
+
+
+async def split_the_books_access() -> int:
+    """Once: the accounts ticks there were become a tick per screen and action, and per area of accounts
+    (core/abilities.py LEGACY_ACCOUNTS says what each old tick stands for), for every head office user and role, so
+    nobody gains or loses anything. "See the books" itself goes; every branch's books stays as it is.
+
+    The branch role access head office keeps, and its copy of every branch account, get the branch's version of the
+    same (BRANCH_LEGACY_ACCOUNTS), so sending either to a branch never takes the books away from anyone. Runs before
+    the startup backfill, and counts the new names as already handed out to each role, so the backfill doesn't give a
+    full set of accounts ticks to someone whose access was deliberately narrower."""
+    from app.core.abilities import BRANCH_LEGACY_ACCOUNTS, LEGACY_ACCOUNTS, RETIRED_RESOURCES, translate_legacy, translate_legacy_resources
+    from app.models import BranchRoleTemplate, BranchStaff, Counter
+
+    if await Counter.exists(id="rollout:accounts-split"):
+        return 0
+    fields = {"R": "can_read", "W": "can_write", "X": "can_execute"}
+
+    async def rewrite(rows, make) -> bool:
+        before = {row.resource: {a for a, f in fields.items() if getattr(row, f)} for row in rows}
+        after = translate_legacy(before)
+        by_resource = {row.resource: row for row in rows}
+        touched = False
+        for resource, actions in after.items():
+            row = by_resource.get(resource)
+            if row is None:
+                await make(resource, actions)
+                touched = True
+            elif before.get(resource, set()) != actions:
+                # Merged, never narrowed: `after` holds everything a row had.
+                for action, field in fields.items():
+                    setattr(row, field, action in actions)
+                await row.save()
+                touched = True
+        for resource in RETIRED_RESOURCES:
+            if resource in by_resource:
+                await by_resource[resource].delete()
+                touched = True
+        return touched
+
+    changed = 0
+    for user in await User.all():
+        async def make_user_row(resource, actions, user=user):
+            await UserPermission.create(user=user, resource=resource, can_read="R" in actions, can_write="W" in actions,
+                                        can_execute="X" in actions, granted_by=None)
+        if await rewrite(await UserPermission.filter(user=user), make_user_row):
+            changed += 1
+
+    new_names = {target for targets in LEGACY_ACCOUNTS.values() for target, _ in targets}
+    for role in await Role.all():
+        async def make_role_row(resource, actions, role=role):
+            await RoleDefaultPermission.create(role=role, resource=resource, can_read="R" in actions, can_write="W" in actions,
+                                               can_execute="X" in actions)
+        await rewrite(await RoleDefaultPermission.filter(role=role), make_role_row)
+        if role.rolled_out_resources is not None:
+            role.rolled_out_resources = sorted((set(role.rolled_out_resources) - RETIRED_RESOURCES) | (resources_for_role(role.id) & new_names))
+            await role.save(update_fields=["rolled_out_resources"])
+
+    for template in await BranchRoleTemplate.all():
+        resources = translate_legacy_resources(template.resources or [], BRANCH_LEGACY_ACCOUNTS)
+        if resources != set(template.resources or []):
+            template.resources = sorted(resources)
+            await template.save()
+    for staff in await BranchStaff.all():
+        held: dict[str, set[str]] = {}
+        for grant in staff.permissions or []:
+            held.setdefault(grant.get("resource") or "", set()).update(grant.get("actions") or [])
+        after = translate_legacy(held, BRANCH_LEGACY_ACCOUNTS)
+        if after != held:
+            # Not a change anyone made, so the revision stays: the branch sends its own copy of the same change.
+            staff.permissions = [{"resource": r, "actions": sorted(a)} for r, a in sorted(after.items())]
+            await staff.save(update_fields=["permissions", "updated_at"])
+    await Counter.create(id="rollout:accounts-split", value=1)
+    return changed

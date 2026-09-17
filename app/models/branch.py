@@ -80,4 +80,4 @@ class Branch(models.Model):
         ordering = ["name"]
 
     def __str__(self) -> str:
-        return f"{self.code} — {self.name}"
+        return f"{self.code}: {self.name}"

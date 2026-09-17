@@ -10,6 +10,7 @@ Down: every change made here raises the revision and goes to each branch the per
 import secrets
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from tortoise.transactions import atomic
 
@@ -34,12 +35,33 @@ def _norm_permissions(perms) -> list[dict]:
     return sorted(out, key=lambda p: p["resource"])
 
 
+def _limit(value) -> Decimal | None:
+    try:
+        return None if value is None or value == "" else Decimal(str(value))
+    except InvalidOperation:
+        return None
+
+
 def payload(staff: BranchStaff) -> dict:
-    return {
+    body = {
         "id": staff.id, "name": staff.name, "email": staff.email, "roleId": staff.role_id, "active": staff.active,
         "passwordHash": staff.password_hash, "permissions": _norm_permissions(staff.permissions), "rev": staff.rev,
         "lastChangedAt": staff.last_changed_at, "lastChangedBy": staff.last_changed_by,
     }
+    # Only what head office knows: a branch keeps its own title and limit for someone head office hasn't heard them for.
+    if staff.title is not None:
+        body["title"] = staff.title
+    if staff.discount_limit is not None:
+        body["discountLimit"] = format(staff.discount_limit, "f")
+    return body
+
+
+def _take_details(staff: BranchStaff, incoming: dict) -> None:
+    """The job title and discount limit a branch reported."""
+    if "title" in incoming:
+        staff.title = incoming.get("title") or ""
+    if _limit(incoming.get("discountLimit")) is not None:
+        staff.discount_limit = _limit(incoming.get("discountLimit"))
 
 
 def _same(staff: BranchStaff, incoming: dict) -> bool:
@@ -48,6 +70,8 @@ def _same(staff: BranchStaff, incoming: dict) -> bool:
         and staff.role_id == incoming.get("roleId") and bool(staff.active) == bool(incoming.get("active"))
         and staff.password_hash == incoming.get("passwordHash")
         and _norm_permissions(staff.permissions) == _norm_permissions(incoming.get("permissions"))
+        and ("title" not in incoming or (staff.title or "") == (incoming.get("title") or ""))
+        and (_limit(incoming.get("discountLimit")) is None or staff.discount_limit == _limit(incoming.get("discountLimit")))
     )
 
 
@@ -79,6 +103,7 @@ async def apply_from_branch(branch: Branch, user: dict) -> str:
             role_id=user.get("roleId") or "", active=bool(user.get("active", True)), password_hash=user["passwordHash"],
             permissions=_norm_permissions(user.get("permissions")), rev=incoming_rev,
             last_changed_at="branch", last_changed_by=changed_by,
+            title=user.get("title"), discount_limit=_limit(user.get("discountLimit")),
         )
         await BranchStaffAssignment.get_or_create(staff=staff, branch=branch)
         return "created"
@@ -93,6 +118,12 @@ async def apply_from_branch(branch: Branch, user: dict) -> str:
             await downstream_service.enqueue(str(branch.id), "staff.remove", {"userId": staff.id, "rev": staff.rev})
         return "not-assigned"
 
+    # Accounts recorded before head office kept titles and limits pick them up from the next report, whoever is ahead.
+    if (staff.title is None and user.get("title") is not None) or (staff.discount_limit is None and _limit(user.get("discountLimit")) is not None):
+        staff.title = user.get("title") if staff.title is None else staff.title
+        staff.discount_limit = _limit(user.get("discountLimit")) if staff.discount_limit is None else staff.discount_limit
+        await staff.save(update_fields=["title", "discount_limit", "updated_at"])
+
     if _same(staff, user):
         if incoming_rev > staff.rev:
             staff.rev = incoming_rev
@@ -106,6 +137,7 @@ async def apply_from_branch(branch: Branch, user: dict) -> str:
         staff.active = bool(user.get("active", staff.active))
         staff.password_hash = user.get("passwordHash") or staff.password_hash
         staff.permissions = _norm_permissions(user.get("permissions"))
+        _take_details(staff, user)
         staff.rev = incoming_rev
         staff.last_changed_at = "branch"
         staff.last_changed_by = changed_by
@@ -139,12 +171,20 @@ async def list_staff(branch_id: str | None = None, q: str | None = None) -> list
     return out
 
 
+def _roles_of(stored) -> list[dict]:
+    """A manifest's roles. Since branches send their access screen's wording too, `roles` holds both:
+    {"roles": [...], "abilities": {...}}; before that it was the list of roles alone."""
+    if isinstance(stored, dict):
+        return list(stored.get("roles") or [])
+    return list(stored or [])
+
+
 async def manifest() -> tuple[list[str], list[dict]]:
     """The grantable resources and the roles, from the most recently reported branch manifest."""
     latest = await BranchManifest.all().order_by("-updated_at").first()
     if not latest:
         return [], []
-    roles = latest.roles or []
+    roles = _roles_of(latest.roles)
     templates = {t.role_id: t for t in await BranchRoleTemplate.all()}
     merged = []
     for role in roles:
@@ -199,6 +239,7 @@ async def create(admin: User, data: dict) -> BranchStaff:
         id=str(uuid.uuid4()), name=data["name"].strip(), email=email, role_id=role_id, active=True,
         password_hash=hash_password(data["password"]), permissions=_norm_permissions(permissions), rev=1,
         last_changed_at="cloud", last_changed_by=admin.name,
+        title=(data.get("title") or "").strip() or None, discount_limit=_limit(data.get("discountLimit")),
     )
     for branch_id in branch_ids:
         await BranchStaffAssignment.create(staff=staff, branch_id=branch_id)
@@ -221,6 +262,10 @@ async def update(admin: User, staff_id: str, data: dict) -> BranchStaff:
         staff.name = data["name"].strip()
     if data.get("active") is not None:
         staff.active = bool(data["active"])
+    if "title" in data:
+        staff.title = (data["title"] or "").strip()
+    if _limit(data.get("discountLimit")) is not None:
+        staff.discount_limit = _limit(data["discountLimit"])
     if data.get("password"):
         staff.password_hash = hash_password(data["password"])
     role_changed = data.get("roleId") is not None and data["roleId"] != staff.role_id
@@ -294,10 +339,31 @@ async def save_manifest(branch: Branch, resources: list[str], roles: list[dict])
     existing = await BranchManifest.get_or_none(branch=branch)
     if existing:
         existing.resources = resources
-        existing.roles = roles
+        # The wording the branch sent last stays until it sends new wording (just after this, at its start).
+        abilities = existing.roles.get("abilities") if isinstance(existing.roles, dict) else None
+        existing.roles = {"roles": roles, "abilities": abilities} if abilities else roles
         await existing.save()
     else:
         await BranchManifest.create(branch=branch, resources=resources, roles=roles)
+
+
+async def save_branch_abilities(branch: Branch, catalog: dict) -> None:
+    """The branch's access screen in its own words (groups, labels, hints), sent at its start after its manifest."""
+    existing = await BranchManifest.get_or_none(branch=branch)
+    if existing is None:
+        # Words without the list they describe would only be a manifest with nothing in it; the branch sends both again.
+        return
+    clean = {"groups": list(catalog.get("groups") or []), "presets": list(catalog.get("presets") or [])}
+    existing.roles = {"roles": _roles_of(existing.roles), "abilities": clean}
+    await existing.save()
+
+
+async def branch_abilities() -> dict:
+    """The wording from the most recently reported branch that sent any. Empty until a branch on this version starts."""
+    for row in await BranchManifest.all().order_by("-updated_at"):
+        if isinstance(row.roles, dict) and row.roles.get("abilities"):
+            return row.roles["abilities"]
+    return {"groups": [], "presets": []}
 
 
 def now() -> datetime:

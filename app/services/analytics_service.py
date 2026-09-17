@@ -18,28 +18,35 @@ an item is flagged.
 
 **On honesty with thin data.** XYZ needs a demand *series*. Given a fortnight of trading, almost
 every line is statistically erratic, and reporting that as "these items have unpredictable demand"
-would be reading noise as a finding. So the coverage figures travel with the result, the minimum
-window is enforced rather than assumed, and the caller is told plainly when there is not enough
-history to say anything. A classification that quietly degrades into nonsense as data thins is
-worse than one that refuses.
+would be reading noise as a finding. So demand is counted in buckets sized to the period (days, weeks
+or months), an Item needs eight of them before it gets a class at all, and short of that it is said to
+be too new to tell. A classification that quietly degrades into nonsense as data thins is worse than
+one that refuses.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from tortoise import Tortoise
 
 from app.models import Branch, BranchSnapshotRun
+from app.services.executive_service import months_back
 
 D0 = Decimal("0")
 
-# Pareto, in the form nearly every ERP and textbook uses: A carries to 80% of cumulative value,
-# B to 95%, C the remainder. Fixed rather than configurable — a threshold somebody can tune is a
-# threshold nobody can compare across periods.
+# Pareto, in the form nearly every ERP and textbook uses, with the cut read from the top: walking the
+# Items from the largest down, an Item is A while the Items above it carry less than 80% of the total,
+# B while they carry less than 95%, and C after that. Reading the share BEFORE the Item means the Item
+# that crosses 80% is still A (it is the one that got the total there), and the largest Item is always
+# A however big it is. Fixed rather than configurable: a threshold somebody can tune is a threshold
+# nobody can compare across periods. The branch's own analysis uses the same rule.
 ABC_A_CUT = Decimal("0.80")
 ABC_B_CUT = Decimal("0.95")
+
+# What an Item can be ranked by. Money in, money kept, or how much of it went out of the door.
+BASES = {"sales": "Sales value", "profit": "Gross profit", "units": "Units"}
 
 # Coefficient of variation bands. 0.5 and 1.0 are the conventional cuts: below half, demand is
 # steady enough to plan on; above one, the standard deviation exceeds the mean and "average demand"
@@ -47,8 +54,10 @@ ABC_B_CUT = Decimal("0.95")
 XYZ_X_CUT = Decimal("0.5")
 XYZ_Y_CUT = Decimal("1.0")
 
-# Below this many trading days, a coefficient of variation is arithmetic rather than information.
-MIN_DAYS_FOR_XYZ = 14
+# Fewer buckets than this and a coefficient of variation is arithmetic rather than information, so
+# the Item is "too new to tell" instead of being called erratic on the strength of a handful of points.
+MIN_BUCKETS = 8
+TOO_NEW = "new"
 
 # Dead-stock tiers, in days since the item last sold. 90 and 180 map to a quarter and a half year,
 # which is how buying decisions are actually discussed.
@@ -78,6 +87,8 @@ class Coverage:
     classified: int
     unrated: int
     reason: str | None = None
+    # XYZ only: what one point of demand is (day, week or month).
+    bucket: str | None = None
 
 
 # ── which stock rows are current ───────────────────────────────────────────────────────────────
@@ -111,17 +122,38 @@ async def _stock_filter() -> tuple[str, list]:
 
 # ── ABC ────────────────────────────────────────────────────────────────────────────────────────
 
-async def abc(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage]:
-    """Rank every product that sold in the window by net sales, then cut the cumulative curve.
+def basis_of(value: str | None) -> str:
+    return value if value in BASES else "sales"
 
-    Value, not volume. A pharmacy line selling four boxes a week at Rs 3,000 matters more than a
-    sweet selling four hundred at Rs 5, and a ranking by units would say the opposite.
-    """
-    where = ["ps.day >= ?", "ps.day <= ?"]
-    params: list = [str(start), str(end)]
+
+def abc_class(share_before: Decimal) -> str:
+    """The class of an Item, given the share of the total carried by every Item ranked above it."""
+    if share_before < ABC_A_CUT:
+        return "A"
+    if share_before < ABC_B_CUT:
+        return "B"
+    return "C"
+
+
+def _scope(where: list[str], params: list, branch_code: str | None) -> None:
     if branch_code:
         where.append("b.code = ?")
         params.append(branch_code.upper())
+
+
+async def abc(start, end, branch_code: str | None = None, basis: str = "sales") -> tuple[list[dict], Coverage]:
+    """Rank every Item that sold in the window by the chosen basis, then cut the running total.
+
+    Value by default, not volume. A pharmacy line selling four boxes a week at Rs 3,000 matters more than
+    a sweet selling four hundred at Rs 5, and a ranking by units would say the opposite. Units and gross
+    profit are there for the questions they answer: shelf space, and what the business actually keeps.
+    An Item that earned nothing on the basis (sold at cost or below, on gross profit) is ranked last and
+    is C: it carries none of the total.
+    """
+    basis = basis_of(basis)
+    where = ["ps.day >= ?", "ps.day <= ?"]
+    params: list = [str(start), str(end)]
+    _scope(where, params, branch_code)
 
     rows = await _q(f"""
         SELECT ps.product_sku AS sku, MAX(ps.product_name) AS name,
@@ -134,124 +166,343 @@ async def abc(start, end, branch_code: str | None = None) -> tuple[list[dict], C
         JOIN branches b ON b.id = ps.branch_id
         WHERE {' AND '.join(where)}
         GROUP BY ps.product_sku
-        HAVING SUM(CAST(ps.net_sales AS REAL)) > 0
-        ORDER BY net_sales DESC
+        HAVING SUM(CAST(ps.qty AS REAL)) > 0 OR SUM(CAST(ps.net_sales AS REAL)) > 0
     """, *params)
 
     days = await _trading_days(start, end, branch_code)
-    total = sum(_d(r["net_sales"]) for r in rows)
-    if total <= 0:
+    if not rows:
         return [], Coverage(days, 0, 0, 0, "Nothing sold in this period.")
+
+    cents, grams = Decimal("0.01"), Decimal("0.001")
+    items = []
+    for r in rows:
+        # REAL sums carry float dust; rounding first keeps an Item sitting exactly on a cut from wobbling.
+        net = _d(r["net_sales"]).quantize(cents)
+        profit = (net - _d(r["cogs"])).quantize(cents)
+        qty = _d(r["qty"]).quantize(grams)
+        value = {"sales": net, "profit": profit, "units": qty}[basis]
+        items.append((value, net, profit, qty, r))
+    items.sort(key=lambda i: (-i[0], i[4]["sku"]))
+    total = sum((max(i[0], D0) for i in items), D0)
 
     out: list[dict] = []
     running = D0
-    for rank, r in enumerate(rows, start=1):
-        value = _d(r["net_sales"])
-        running += value
-        share = running / total
-        klass = "A" if share <= ABC_A_CUT else ("B" if share <= ABC_B_CUT else "C")
-        margin = value - _d(r["cogs"])
+    for rank, (value, net, profit, qty, r) in enumerate(items, start=1):
+        before = running / total if total > 0 else Decimal(1)
+        running += max(value, D0)
+        klass = abc_class(before) if value > 0 else "C"
         out.append({
             "rank": rank, "sku": r["sku"], "name": r["name"],
             "category": r["category"], "brand": r["brand"], "department": r["department"],
-            "netSales": str(value.quantize(Decimal("0.01"))),
-            "grossProfit": str(margin.quantize(Decimal("0.01"))),
-            "marginPct": float(margin / value * 100) if value else 0.0,
-            "qty": str(_d(r["qty"])),
+            "netSales": str(net), "grossProfit": str(profit),
+            "marginPct": float(profit / net * 100) if net else 0.0,
+            "qty": str(qty),
             "sellingDays": r["selling_days"],
-            "sharePct": float(value / total * 100),
-            "cumulativePct": float(share * 100),
+            "basisValue": str(value),
+            "sharePct": float(max(value, D0) / total * 100) if total > 0 else 0.0,
+            "beforePct": float(before * 100) if total > 0 else 100.0,
+            "cumulativePct": float(running / total * 100) if total > 0 else 100.0,
             "abcClass": klass,
         })
-    return out, Coverage(days, len(out), len(out), 0)
+    reason = None if total > 0 else f"No Item had any {BASES[basis].lower()} in this period, so nothing can be ranked on it."
+    return out, Coverage(days, len(out), len(out), 0, reason)
 
 
 # ── XYZ ────────────────────────────────────────────────────────────────────────────────────────
 
-async def xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage]:
-    """Classify each product by how predictable its daily demand is.
+def bucket_kind(start: date, end: date) -> str:
+    """What one point of demand is. Daily for up to a month; weekly up to 26 weeks, which is six months
+    (184 days is the longest any six calendar months can be, so "Last 6 months" always counts in weeks);
+    monthly beyond. Daily demand over a year is mostly zeros, and one monthly point for a fortnight is none."""
+    days = (end - start).days + 1
+    if days <= 31:
+        return "day"
+    if days <= 184:
+        return "week"
+    return "month"
 
-    The coefficient of variation is computed over **every trading day in the window, including the
-    days a product sold nothing**. That is the whole point: an item that sells forty units on one
-    day of the month and nothing on the other thirty is the definition of erratic, and averaging
-    only its selling days would hide exactly that and report it as perfectly steady.
+
+def bucket_index(day: date, end: date, kind: str) -> int:
+    """Which bucket a day falls in, counting back from the last day of the period (0 = the latest).
+
+    Buckets are counted back from the end so the latest one is always whole: a week is the 7 days ending
+    on the period's last day, the 7 before that, and so on; a month runs from the day after that date a
+    month earlier (17 Aug to 16 Sep). Calendar weeks and months would leave a half-finished last bucket
+    that looks like a slump.
     """
+    if kind == "day":
+        return (end - day).days
+    if kind == "week":
+        return (end - day).days // 7
+    k = (end.year - day.year) * 12 + end.month - day.month
+    return k - 1 if day > months_back(end, k) else k
+
+
+def xyz_class(buckets: list[Decimal]) -> tuple[str, Decimal | None]:
+    """X, Y or Z from a demand series (zeros included), or too new to tell. Returns the class and the CV."""
+    n = len(buckets)
+    if n < MIN_BUCKETS:
+        return TOO_NEW, None
+    mean = sum(buckets, D0) / n
+    if mean <= 0:
+        return TOO_NEW, None
+    # Population variance across every bucket. The empty buckets add nothing to the sum but everything
+    # to the count, which is the correct treatment: not selling is part of the pattern.
+    variance = sum(((x - mean) ** 2 for x in buckets), D0) / n
+    cv = variance.sqrt() / mean
+    return ("X" if cv <= XYZ_X_CUT else "Y" if cv <= XYZ_Y_CUT else "Z"), cv
+
+
+def _day(v) -> date:
+    return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
+
+
+async def xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage]:
+    """Classify each Item by how steadily it sells.
+
+    Demand is summed into buckets (see `bucket_kind`), counted from the later of the period's first day
+    and the Item's first sale in the data, and **every bucket counts, including the ones where it sold
+    nothing**. That is the whole point: an Item that sells forty units in one week of the quarter and
+    nothing in the other twelve is the definition of erratic, and averaging only its selling weeks would
+    call it perfectly steady. Starting from the first sale stops an Item launched last month from being
+    called erratic for all the months before it existed.
+    """
+    start, end = _day(start), _day(end)
+    kind = bucket_kind(start, end)
     days = await _trading_days(start, end, branch_code)
-    if days < MIN_DAYS_FOR_XYZ:
-        return [], Coverage(
-            days, 0, 0, 0,
-            f"XYZ needs at least {MIN_DAYS_FOR_XYZ} trading days to mean anything; this period has {days}.",
-        )
 
     where = ["ps.day >= ?", "ps.day <= ?"]
     params: list = [str(start), str(end)]
-    if branch_code:
-        where.append("b.code = ?")
-        params.append(branch_code.upper())
-
-    # Sum of demand and sum of demand-squared per product, over its selling days. The zero days are
-    # folded in afterwards in Python, because they are absences — there is no row to aggregate.
-    rows = await _q(f"""
-        SELECT ps.product_sku AS sku, MAX(ps.product_name) AS name,
-               MAX(ps.category) AS category, MAX(ps.brand) AS brand,
-               SUM(CAST(ps.qty AS REAL))                        AS total_qty,
-               SUM(CAST(ps.qty AS REAL) * CAST(ps.qty AS REAL)) AS sum_sq,
-               SUM(CAST(ps.net_sales AS REAL))                  AS net_sales,
-               COUNT(DISTINCT ps.day)                           AS selling_days
+    _scope(where, params, branch_code)
+    daily = await _q(f"""
+        SELECT ps.product_sku AS sku, ps.day AS day,
+               MAX(ps.product_name) AS name, MAX(ps.category) AS category, MAX(ps.brand) AS brand,
+               SUM(CAST(ps.qty AS REAL)) AS qty, SUM(CAST(ps.net_sales AS REAL)) AS net_sales
         FROM branch_product_stats ps
         JOIN branches b ON b.id = ps.branch_id
         WHERE {' AND '.join(where)}
-        GROUP BY ps.product_sku
-        HAVING SUM(CAST(ps.qty AS REAL)) > 0
+        GROUP BY ps.product_sku, ps.day
     """, *params)
+    if not daily:
+        return [], Coverage(days, 0, 0, 0, "Nothing sold in this period.", kind)
 
-    n = Decimal(days)
+    # The first day each Item sold anywhere in the data (or at this branch), not just in the window.
+    first_where = ["ps.day <= ?", "CAST(ps.qty AS REAL) > 0"]
+    first_params: list = [str(end)]
+    _scope(first_where, first_params, branch_code)
+    first_sale = {r["sku"]: _day(r["first_day"]) for r in await _q(f"""
+        SELECT ps.product_sku AS sku, MIN(ps.day) AS first_day
+        FROM branch_product_stats ps
+        JOIN branches b ON b.id = ps.branch_id
+        WHERE {' AND '.join(first_where)}
+        GROUP BY ps.product_sku
+    """, *first_params)}
+
+    items: dict[str, dict] = {}
+    for r in daily:
+        item = items.setdefault(r["sku"], {"sku": r["sku"], "name": r["name"], "category": r["category"],
+                                           "brand": r["brand"], "qty": D0, "net": D0, "days": 0, "points": {}})
+        qty = _d(r["qty"])
+        item["qty"] += qty
+        item["net"] += _d(r["net_sales"])
+        if qty > 0:
+            item["days"] += 1
+            i = bucket_index(_day(r["day"]), end, kind)
+            item["points"][i] = item["points"].get(i, D0) + qty
+
     out: list[dict] = []
-    for r in rows:
-        total = _d(r["total_qty"])
-        sum_sq = _d(r["sum_sq"])
-        mean = total / n
-        if mean <= 0:
+    for item in items.values():
+        if item["qty"] <= 0:
             continue
-        # Population variance across all trading days: E[x²] − (E[x])². The zero days contribute
-        # nothing to either sum but everything to the denominator, which is the correct treatment.
-        variance = (sum_sq / n) - (mean * mean)
-        if variance < 0:
-            variance = D0  # floating-point dust on a near-constant series
-        cv = variance.sqrt() / mean
-        klass = "X" if cv <= XYZ_X_CUT else ("Y" if cv <= XYZ_Y_CUT else "Z")
+        since = max(start, first_sale.get(item["sku"], start))
+        n = bucket_index(since, end, kind) + 1
+        series = [item["points"].get(i, D0) for i in range(n)]
+        klass, cv = xyz_class(series)
+        sold_in = sum(1 for x in series if x > 0)
         out.append({
-            "sku": r["sku"], "name": r["name"], "category": r["category"], "brand": r["brand"],
-            "netSales": str(_d(r["net_sales"]).quantize(Decimal("0.01"))),
-            "totalQty": str(total), "sellingDays": r["selling_days"],
-            "coveragePct": float(Decimal(r["selling_days"]) / n * 100),
-            "avgDaily": float(mean),
-            "cv": float(cv),
+            "sku": item["sku"], "name": item["name"], "category": item["category"], "brand": item["brand"],
+            "netSales": str(item["net"].quantize(Decimal("0.01"))),
+            "totalQty": str(item["qty"].quantize(Decimal("0.001")).normalize()),
+            "sellingDays": item["days"],
+            "since": since.isoformat(),
+            "bucket": kind,
+            "buckets": n,
+            "bucketsSold": sold_in,
+            "coveragePct": float(Decimal(sold_in) / n * 100) if n else 0.0,
+            "avgPerBucket": float(item["qty"] / n) if n else 0.0,
+            "cv": float(cv) if cv is not None else None,
             "xyzClass": klass,
         })
-    out.sort(key=lambda r: r["cv"])
-    return out, Coverage(days, len(out), len(out), 0)
+    out.sort(key=lambda r: (r["cv"] is None, r["cv"] if r["cv"] is not None else 0, r["name"] or ""))
+    new = sum(1 for r in out if r["xyzClass"] == TOO_NEW)
+    return out, Coverage(days, len(out), len(out) - new, new, None, kind)
 
 
-async def combined(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage, Coverage]:
-    """The 9-box: every product carrying both its value class and its predictability class.
+# ── the 9 boxes ────────────────────────────────────────────────────────────────────────────────
 
-    AX is the line to never run out of. CZ is the line to stop carrying. The interesting cells are
-    the corners nobody expects — AZ, an item you depend on and cannot forecast.
+XYZ_COLUMNS = ("X", "Y", "Z", TOO_NEW)
+
+# One line a buyer can act on, per box. AX is the line never to run out of; CZ is the line to question.
+ADVICE = {
+    "AX": "Your steady best sellers. Never let these run out, and reorder on a fixed routine.",
+    "AY": "Big earners with ups and downs. Keep extra stock ahead of the busy spells.",
+    "AZ": "Big earners that sell in bursts. Watch them closely and order little and often.",
+    "AN": "Big earners too new to judge for steadiness. Keep them in stock and look again later.",
+    "BX": "Steady middle sellers. Reorder on a routine and keep stock lean.",
+    "BY": "Middle sellers that go up and down. Check their stock every week or two.",
+    "BZ": "Middle sellers with patchy demand. Order when needed rather than holding a lot.",
+    "BN": "Middle sellers too new to judge. See how they settle before changing orders.",
+    "CX": "Small but steady. Keep a little on the shelf and reorder on a routine.",
+    "CY": "Small sellers that go up and down. Keep stock low and ask if they earn their space.",
+    "CZ": "Small and unpredictable. Order only when asked for, or think about dropping them.",
+    "CN": "Small sellers too new to judge. Give them time before deciding on them.",
+}
+
+
+def cell_code(abc_klass: str, xyz_klass: str | None) -> str:
+    return f"{abc_klass}{'N' if xyz_klass in (None, TOO_NEW) else xyz_klass}"
+
+
+async def combined(start, end, branch_code: str | None = None, basis: str = "sales") -> tuple[list[dict], Coverage, Coverage]:
+    """Every Item carrying both its value class and its steadiness class, and the box they put it in.
+
+    AX is the line to never run out of. CZ is the line to question. The interesting boxes are the corners
+    nobody expects: AZ, an Item you depend on and cannot forecast.
     """
-    abc_rows, abc_cov = await abc(start, end, branch_code)
+    abc_rows, abc_cov = await abc(start, end, branch_code, basis)
     xyz_rows, xyz_cov = await xyz(start, end, branch_code)
+    return merge_classes(abc_rows, xyz_rows), abc_cov, xyz_cov
+
+
+def merge_classes(abc_rows: list[dict], xyz_rows: list[dict]) -> list[dict]:
+    """ABC rows with their XYZ reading alongside. An Item with no units to measure (a sale with value and
+    no quantity) has no steadiness reading, and sits with the ones too new to tell."""
     xyz_by_sku = {r["sku"]: r for r in xyz_rows}
     merged = []
     for r in abc_rows:
         x = xyz_by_sku.get(r["sku"])
+        klass = x["xyzClass"] if x else TOO_NEW
         merged.append({
             **r,
-            "xyzClass": x["xyzClass"] if x else None,
+            "xyzClass": klass,
             "cv": x["cv"] if x else None,
-            "cell": f"{r['abcClass']}{x['xyzClass']}" if x else None,
+            "bucket": x["bucket"] if x else None,
+            "buckets": x["buckets"] if x else 0,
+            "bucketsSold": x["bucketsSold"] if x else 0,
+            "cell": cell_code(r["abcClass"], klass),
         })
-    return merged, abc_cov, xyz_cov
+    return merged
+
+
+def matrix_cells(rows: list[dict]) -> list[dict]:
+    """The 9 boxes plus a "too new to tell" column, in reading order, with every box present even when
+    empty: a missing box and an empty one look the same on a grid, and they are not the same fact."""
+    total_sales = sum((Decimal(r["netSales"]) for r in rows), D0)
+    total_basis = sum((max(Decimal(r["basisValue"]), D0) for r in rows), D0)
+    cells = []
+    for a in ("A", "B", "C"):
+        for x in XYZ_COLUMNS:
+            code = cell_code(a, x)
+            members = [r for r in rows if r["cell"] == code]
+            sales = sum((Decimal(r["netSales"]) for r in members), D0)
+            basis = sum((max(Decimal(r["basisValue"]), D0) for r in members), D0)
+            cells.append({
+                "cell": code, "abc": a, "xyz": x, "items": len(members),
+                "netSales": str(sales.quantize(Decimal("0.01"))),
+                "salesPct": float(sales / total_sales * 100) if total_sales else 0.0,
+                "basisPct": float(basis / total_basis * 100) if total_basis else 0.0,
+                "advice": ADVICE[code],
+            })
+    return cells
+
+
+# ── sold least ─────────────────────────────────────────────────────────────────────────────────
+
+async def sold_least(start, end, branch_code: str | None = None, basis: str = "sales",
+                     limit: int = 500) -> dict:
+    """The bottom of the list, which a ranking by best seller never shows.
+
+    Two lists, because they are two different problems. Items that sold, but least (fewest units, or
+    least value or profit on the chosen basis): the slow lines. And Items with stock on the shelf that did
+    not sell at all in the period, biggest money first: those never appear in a sales figure, so they
+    are invisible to every other view that starts from sales.
+    """
+    basis = basis_of(basis)
+    rows, _, _ = await combined(start, end, branch_code, basis)
+
+    clause, params = await _stock_filter()
+    where = [clause, "CAST(s.qty AS REAL) > 0"]
+    _scope(where, params, branch_code)
+    stock = {r["sku"]: r for r in await _q(f"""
+        SELECT s.product_sku AS sku, MAX(s.product_name) AS name, MAX(s.category) AS category, MAX(s.brand) AS brand,
+               SUM(CAST(s.qty AS REAL)) AS qty,
+               SUM(CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)) AS value_cost,
+               SUM(CAST(s.qty AS REAL) * CAST(s.price AS REAL)) AS value_retail,
+               MAX(s.last_sold_at) AS last_sold_at,
+               GROUP_CONCAT(DISTINCT b.code) AS branches
+        FROM branch_product_stock s
+        JOIN branches b ON b.id = s.branch_id
+        WHERE {' AND '.join(where)}
+        GROUP BY s.product_sku
+    """, *params)}
+
+    cents = Decimal("0.01")
+
+    def on_hand(sku: str) -> dict:
+        st = stock.get(sku)
+        return {
+            "onHand": str(_d(st["qty"]).quantize(Decimal("0.001")).normalize()) if st else "0",
+            "valueCost": str(_d(st["value_cost"]).quantize(cents)) if st else "0.00",
+            "valueRetail": str(_d(st["value_retail"]).quantize(cents)) if st else "0.00",
+            "lastSoldAt": st["last_sold_at"] if st else None,
+            "branches": ", ".join(sorted((st["branches"] or "").split(","))) if st else "",
+        }
+
+    sold = [{**r, **on_hand(r["sku"])} for r in rows]
+    sold.sort(key=lambda r: (Decimal(r["basisValue"]), -Decimal(r["valueCost"]), r["name"] or ""))
+
+    sold_skus = {r["sku"] for r in rows}
+    unsold = []
+    for sku, st in stock.items():
+        if sku in sold_skus:
+            continue
+        unsold.append({
+            "sku": sku, "name": st["name"], "category": st["category"], "brand": st["brand"],
+            "qty": "0", "netSales": "0.00", "grossProfit": "0.00", **on_hand(sku),
+        })
+    unsold.sort(key=lambda r: (-Decimal(r["valueCost"]), r["name"] or ""))
+
+    return {
+        "sold": sold[:limit], "soldCount": len(sold),
+        "unsold": unsold[:limit], "unsoldCount": len(unsold),
+        "unsoldValue": str(sum((Decimal(r["valueCost"]) for r in unsold), D0).quantize(cents)),
+        "unsoldRetail": str(sum((Decimal(r["valueRetail"]) for r in unsold), D0).quantize(cents)),
+    }
+
+
+async def unsold_on_shelf(start, end, branch_code: str | None = None) -> tuple[int, Decimal]:
+    """Just the count and cost of Items holding stock that did not sell in the period, in SQL, for the tile."""
+    clause, params = await _stock_filter()
+    where = [clause, "CAST(s.qty AS REAL) > 0", "sold.sku IS NULL"]
+    _scope(where, params, branch_code)
+    # What sold, gathered once and joined, rather than looked up again for each of tens of thousands of
+    # stock rows. At one branch it is that branch's sales; for the company, a sale anywhere counts.
+    same_branch = "AND sold.branch_id = s.branch_id" if branch_code else ""
+    rows = await _q(f"""
+        WITH sold AS (
+            SELECT DISTINCT product_sku AS sku, {'branch_id' if branch_code else 'NULL'} AS branch_id
+            FROM branch_product_stats
+            WHERE day >= ? AND day <= ? AND CAST(qty AS REAL) > 0
+        )
+        SELECT COUNT(DISTINCT s.product_sku) AS items,
+               SUM(CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)) AS value_cost
+        FROM branch_product_stock s
+        JOIN branches b ON b.id = s.branch_id
+        LEFT JOIN sold ON sold.sku = s.product_sku {same_branch}
+        WHERE {' AND '.join(where)}
+    """, str(start), str(end), *params)
+    r = rows[0] if rows else {}
+    return int(r.get("items") or 0), _d(r.get("value_cost")).quantize(Decimal("0.01"))
 
 
 # ── dead / slow stock ──────────────────────────────────────────────────────────────────────────

@@ -37,6 +37,9 @@ class SupplierOut(BaseModel):
     name: str
     contactPerson: str | None = None
     phone: str | None = None
+    # A switched-off supplier stays for the documents that name it; pickers offer only the active ones.
+    active: bool = True
+    dueDays: int = 0
 
 
 class BinOut(BaseModel):

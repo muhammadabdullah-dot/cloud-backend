@@ -16,6 +16,7 @@ rows that explain it.
 """
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -66,6 +67,14 @@ def business_today() -> date:
 
 
 # ── periods ─────────────────────────────────────────────────────────────────
+class ExecutiveError(Exception):
+    """Something a person asked for that can't be answered as asked, said so they can fix it."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 @dataclass(frozen=True)
 class Period:
     id: str
@@ -77,8 +86,41 @@ class Period:
     prev_end: date
     compare_label: str
 
+    @property
+    def days(self) -> int:
+        return (self.end - self.start).days + 1
 
-def resolve_period(period_id: str, today: date | None = None) -> Period:
+
+def months_back(d: date, n: int) -> date:
+    """The same day n months earlier, pulled back to that month's last day when it is shorter."""
+    y, m = divmod(d.month - 1 - n, 12)
+    year, month = d.year + y, m + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+def _before(start: date, end: date) -> tuple[date, date]:
+    """The window of the same length ending the day before `start`."""
+    length = end - start
+    prev_end = start - timedelta(days=1)
+    return prev_end - length, prev_end
+
+
+def date_range_label(start: date, end: date) -> str:
+    """Dates the way people say them (1 Aug to 15 Sep 2026), with the year once when both ends share it."""
+    if start == end:
+        return f"{start.day} {start:%b %Y}"
+    left = f"{start.day} {start:%b}" if start.year == end.year else f"{start.day} {start:%b %Y}"
+    return f"{left} to {end.day} {end:%b %Y}"
+
+
+def parse_day(value: str | None, which: str) -> date:
+    try:
+        return date.fromisoformat((value or "").strip())
+    except ValueError:
+        raise ExecutiveError(f"The {which} date isn't a date this can read. Pick it from the calendar.") from None
+
+
+def resolve_period(period_id: str, today: date | None = None, start: str | None = None, end: str | None = None) -> Period:
     t = today or business_today()
     if period_id == "today":
         return Period("today", "Today", t, t, t - timedelta(days=1), t - timedelta(days=1), "yesterday")
@@ -86,24 +128,56 @@ def resolve_period(period_id: str, today: date | None = None) -> Period:
         y = t - timedelta(days=1)
         return Period("yesterday", "Yesterday", y, y, y - timedelta(days=1), y - timedelta(days=1), "the day before")
     if period_id == "7d":
-        start = t - timedelta(days=6)
-        return Period("7d", "Last 7 days", start, t, start - timedelta(days=7), start - timedelta(days=1), "the previous 7 days")
+        start_d = t - timedelta(days=6)
+        return Period("7d", "Last 7 days", start_d, t, start_d - timedelta(days=7), start_d - timedelta(days=1), "the previous 7 days")
     if period_id == "30d":
-        start = t - timedelta(days=29)
-        return Period("30d", "Last 30 days", start, t, start - timedelta(days=30), start - timedelta(days=1), "the previous 30 days")
+        start_d = t - timedelta(days=29)
+        return Period("30d", "Last 30 days", start_d, t, start_d - timedelta(days=30), start_d - timedelta(days=1), "the previous 30 days")
+    if period_id == "month":
+        first = t.replace(day=1)
+        prev_first = months_back(first, 1)
+        # The same stretch of last month: 1 to 16 Sep against 1 to 16 Aug, cut at the month's end.
+        prev_last = first - timedelta(days=1)
+        return Period("month", "This month", first, t, prev_first, min(prev_first + (t - first), prev_last), "the same days last month")
+    if period_id == "last-month":
+        last = t.replace(day=1) - timedelta(days=1)
+        first = last.replace(day=1)
+        before_last = first - timedelta(days=1)
+        return Period("last-month", "Last month", first, last, before_last.replace(day=1), before_last, "the month before")
+    if period_id in ("3m", "6m", "12m"):
+        n = int(period_id[:-1])
+        start_d = months_back(t, n) + timedelta(days=1)
+        prev_start, prev_end = _before(start_d, t)
+        return Period(period_id, f"Last {n} months", start_d, t, prev_start, prev_end, f"the {n} months before")
     if period_id == "ytd":
-        start = date(t.year, 1, 1)
+        start_d = date(t.year, 1, 1)
         # 29 February has no counterpart in the previous year, so the comparison window ends on the
         # 28th. Without this the whole Executive module is a 500 for that one day of the year, because
         # every endpoint here resolves a period before it does anything else.
         prev_day = 28 if (t.month, t.day) == (2, 29) else t.day
-        return Period("ytd", "This year", start, t, date(t.year - 1, 1, 1), date(t.year - 1, t.month, prev_day), "the same period last year")
+        return Period("ytd", "Year to date", start_d, t, date(t.year - 1, 1, 1), date(t.year - 1, t.month, prev_day), "the same period last year")
     if period_id == "all":
-        return Period("all", "All time", date(2000, 1, 1), t, date(2000, 1, 1), date(2000, 1, 1), "—")
+        return Period("all", "All time", date(2000, 1, 1), t, date(2000, 1, 1), date(2000, 1, 1), "-")
+    if period_id == "custom":
+        if not start or not end:
+            raise ExecutiveError("Choose both a first and a last day for your own dates.")
+        first, last = parse_day(start, "first"), parse_day(end, "last")
+        if first > last:
+            raise ExecutiveError("The first day comes after the last day. Swap them round and try again.")
+        prev_start, prev_end = _before(first, last)
+        n = (last - first).days + 1
+        return Period("custom", date_range_label(first, last), first, last, prev_start, prev_end,
+                      "the day before" if n == 1 else f"the {n} days before")
     return resolve_period("30d", t)
 
 
-PERIOD_IDS = ["today", "yesterday", "7d", "30d", "ytd", "all"]
+# In the order the period picker offers them. "custom" is not listed: it has no fixed dates to show.
+PERIOD_IDS = ["today", "yesterday", "7d", "30d", "month", "last-month", "3m", "6m", "12m", "ytd", "all"]
+
+
+def _in(qs, branch_id: str | None):
+    """One branch's rows, or every branch's. Every fold below takes the branch the same way."""
+    return qs.filter(branch_id=branch_id) if branch_id else qs
 
 
 # ── snapshot folds ──────────────────────────────────────────────────────────
@@ -156,10 +230,7 @@ _SUM_FIELDS = (
 
 
 async def totals_for(period: Period, branch_id: str | None = None) -> Totals:
-    qs = BranchDailyStat.filter(day__gte=period.start, day__lte=period.end)
-    if branch_id:
-        qs = qs.filter(branch_id=branch_id)
-    rows = await qs
+    rows = await _in(BranchDailyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
 
     t = Totals(days=len({r.day for r in rows}))
     for r in rows:
@@ -177,21 +248,22 @@ async def totals_for(period: Period, branch_id: str | None = None) -> Totals:
     return t
 
 
-async def latest_stock_value() -> Decimal:
+async def latest_stock_value(branch_id: str | None = None) -> Decimal:
     """Branch stock is a right-now figure carried only on each branch's most recent reported day,
     so summing a date range would multiply it by the number of days in the range."""
     total = D0
-    for branch in await Branch.all():
+    for branch in await (Branch.filter(id=branch_id) if branch_id else Branch.all()):
         row = await BranchDailyStat.filter(branch=branch).order_by("-day").first()
         if row:
             total += row.stock_value or D0
     return total
 
 
-async def snapshot_as_of() -> datetime | None:
+async def snapshot_as_of(branch_id: str | None = None) -> datetime | None:
     """The oldest last-seen across reporting branches — the dashboard is only as fresh as its
-    stalest contributor, and claiming the freshest would overstate it."""
-    seen = [b.last_seen_at for b in await Branch.all() if b.last_seen_at]
+    stalest contributor, and claiming the freshest would overstate it. One branch is as fresh as itself."""
+    branches = await (Branch.filter(id=branch_id) if branch_id else Branch.all())
+    seen = [b.last_seen_at for b in branches if b.last_seen_at]
     return min(seen) if seen else None
 
 
@@ -291,8 +363,8 @@ async def supplier_performance() -> list[dict]:
 
 
 # ── breakdowns ──────────────────────────────────────────────────────────────
-async def top_products(period: Period, limit: int = 20) -> list[dict]:
-    rows = await BranchProductStat.filter(day__gte=period.start, day__lte=period.end)
+async def top_products(period: Period, limit: int = 20, branch_id: str | None = None) -> list[dict]:
+    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     agg: dict[str, dict] = {}
     for r in rows:
         row = agg.setdefault(r.product_sku, {
@@ -307,9 +379,9 @@ async def top_products(period: Period, limit: int = 20) -> list[dict]:
     return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
 
 
-async def top_by(period: Period, attr: str, limit: int = 15) -> list[dict]:
+async def top_by(period: Period, attr: str, limit: int = 15, branch_id: str | None = None) -> list[dict]:
     """Top categories / departments / brands — the same fold, grouped by a different column."""
-    rows = await BranchProductStat.filter(day__gte=period.start, day__lte=period.end)
+    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     agg: dict[str, dict] = {}
     for r in rows:
         key = getattr(r, attr) or "Unclassified"
@@ -327,8 +399,9 @@ async def top_by(period: Period, attr: str, limit: int = 15) -> list[dict]:
     return sorted(out, key=lambda r: r["netSales"], reverse=True)[:limit]
 
 
-async def cashier_ranking(period: Period, limit: int = 20) -> list[dict]:
-    rows = await BranchCashierStat.filter(day__gte=period.start, day__lte=period.end)
+async def cashier_ranking(period: Period, limit: int = 20, branch_id: str | None = None) -> list[dict]:
+    # Scoped to a branch, the people are that branch's people: their bills there and nowhere else.
+    rows = await _in(BranchCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     branches = await _branch_codes()
     agg: dict[str, dict] = {}
     for r in rows:
@@ -341,7 +414,7 @@ async def cashier_ranking(period: Period, limit: int = 20) -> list[dict]:
         row["days"] += 1
         row["branchSet"].add(branches.get(str(r.branch_id), "?"))
     # What each person's bills were made of, where the branch sends it: items, units, and the profit on them.
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id):
         row = agg.get(r.cashier_name)
         if row is None:
             continue
@@ -360,10 +433,10 @@ async def cashier_ranking(period: Period, limit: int = 20) -> list[dict]:
     return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
 
 
-async def duty_by_day(period: Period) -> dict[tuple[str, date], dict]:
+async def duty_by_day(period: Period, branch_id: str | None = None) -> dict[tuple[str, date], dict]:
     """Per branch-day: how many people were put on a counter, and for how long."""
     out: dict[tuple[str, date], dict] = {}
-    for r in await BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end):
+    for r in await _in(BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end), branch_id):
         row = out.setdefault((str(r.branch_id), r.day), {"people": set(), "minutes": 0, "counters": set()})
         row["people"].add(r.cashier_name)
         row["minutes"] += r.minutes
@@ -372,9 +445,9 @@ async def duty_by_day(period: Period) -> dict[tuple[str, date], dict]:
     return out
 
 
-async def duty_people(period: Period, day_iso: str | None = None) -> list[dict]:
+async def duty_people(period: Period, day_iso: str | None = None, branch_id: str | None = None) -> list[dict]:
     """Every spell on a counter in the period — who, where, how long."""
-    qs = BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end)
+    qs = _in(BranchStaffDuty.filter(day__gte=period.start, day__lte=period.end), branch_id)
     if day_iso:
         try:
             qs = qs.filter(day=date.fromisoformat(day_iso))
@@ -385,7 +458,7 @@ async def duty_people(period: Period, day_iso: str | None = None) -> list[dict]:
     for r in await qs:
         key = (r.day, r.cashier_name, r.counter_name)
         row = rows.setdefault(key, {
-            "day": r.day.isoformat(), "name": r.cashier_name, "counter": r.counter_name or "—",
+            "day": r.day.isoformat(), "name": r.cashier_name, "counter": r.counter_name or "-",
             "branch": branches.get(str(r.branch_id), "?"), "spells": 0, "minutes": 0,
         })
         row["spells"] += r.spells
@@ -395,7 +468,7 @@ async def duty_people(period: Period, day_iso: str | None = None) -> list[dict]:
     return sorted(rows.values(), key=lambda r: (r["day"], -r["minutes"]), reverse=True)
 
 
-async def staffing(period: Period) -> list[dict]:
+async def staffing(period: Period, branch_id: str | None = None) -> list[dict]:
     """Per branch per day: how many people were put on a counter, how long they stood there, and how
     many of them actually rang a sale.
 
@@ -404,9 +477,9 @@ async def staffing(period: Period) -> list[dict]:
     sold nothing can be counted at all. A branch that has not set counters up reports no duty, and the
     column says so rather than guessing.
     """
-    rows = await BranchDailyStat.filter(day__gte=period.start, day__lte=period.end)
+    rows = await _in(BranchDailyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     branches = {str(b.id): b for b in await Branch.all()}
-    duty = await duty_by_day(period)
+    duty = await duty_by_day(period, branch_id)
     out = []
     for r in rows:
         b = branches.get(str(r.branch_id))
@@ -453,22 +526,22 @@ async def branch_comparison(period: Period) -> list[dict]:
     return sorted(out, key=lambda r: r["netSales"], reverse=True)
 
 
-async def daily_series(period: Period, field_name: str = "net_sales") -> list[dict]:
-    rows = await BranchDailyStat.filter(day__gte=period.start, day__lte=period.end)
+async def daily_series(period: Period, field_name: str = "net_sales", branch_id: str | None = None) -> list[dict]:
+    rows = await _in(BranchDailyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     agg: dict[date, Decimal] = {}
     for r in rows:
         agg[r.day] = agg.get(r.day, D0) + (getattr(r, field_name) or D0)
     return [{"day": d.isoformat(), "value": v} for d, v in sorted(agg.items())]
 
 
-async def stock_alerts(kind: str | None = None, limit: int = 200) -> tuple[list[dict], dict[str, int]]:
-    qs = BranchStockAlert.all()
+async def stock_alerts(kind: str | None = None, limit: int = 200, branch_id: str | None = None) -> tuple[list[dict], dict[str, int]]:
+    qs = _in(BranchStockAlert.all(), branch_id)
     if kind:
         qs = qs.filter(kind=kind)
     rows = await qs.limit(limit)
     branches = {str(b.id): b for b in await Branch.all()}
     totals: dict[str, int] = {}
-    for r in await BranchStockAlert.all():
+    for r in await _in(BranchStockAlert.all(), branch_id):
         totals[r.kind] = max(totals.get(r.kind, 0), r.total_of_kind)
     items = [{
         "branch": branches[str(r.branch_id)].name if str(r.branch_id) in branches else None,
@@ -516,14 +589,14 @@ def _clamp(v: float) -> int:
     return int(max(0, min(100, round(v))))
 
 
-async def business_health(period: Period) -> Health:
+async def business_health(period: Period, branch_id: str | None = None) -> Health:
     """A transparent composite, not a black box — every component and its weight is returned so
     the drill-down can show exactly how the number was reached. Nothing here is predictive or
     AI-derived; those need the AI engine, which does not exist.
     """
-    now = await totals_for(period)
+    now = await totals_for(period, branch_id)
     prev = await totals_for(Period(period.id, period.label, period.prev_start, period.prev_end,
-                                   period.prev_start, period.prev_end, period.compare_label))
+                                   period.prev_start, period.prev_end, period.compare_label), branch_id)
 
     components: list[HealthComponent] = []
 
@@ -567,7 +640,7 @@ async def business_health(period: Period) -> Health:
         f"{wh['disputesOpen']} open dispute(s), {wh['pendingRequisitions']} requisition(s) waiting"))
 
     # Reporting: branches that have actually reported at all.
-    branches = await Branch.all()
+    branches = await (Branch.filter(id=branch_id) if branch_id else Branch.all())
     active = [b for b in branches if b.status == "active"]
     reporting = [b for b in active if b.last_seen_at]
     ratio = (len(reporting) / len(active)) if active else 1
@@ -590,7 +663,7 @@ async def live_alerts() -> list[dict]:
         if t.dispute_open:
             out.append({
                 "severity": "high", "kind": "dispute", "source": "live",
-                "title": f"{t.transfer_number} — short-receipt dispute",
+                "title": f"{t.transfer_number}: short-receipt dispute",
                 "detail": t.dispute_note or "Received less than dispatched.",
             })
     if wh["pendingRequisitions"]:
@@ -676,10 +749,10 @@ async def daily_breakdown(period: Period, branch_id: str | None = None) -> list[
     return sorted(out, key=lambda r: r["day"], reverse=True)
 
 
-async def hourly_profile(period: Period) -> list[dict]:
+async def hourly_profile(period: Period, branch_id: str | None = None) -> list[dict]:
     """Invoices and sales by hour of the local trading day. This is what bills-per-hour is
     actually about — where the queue forms, and therefore where staff need to be."""
-    rows = await BranchHourlyStat.filter(day__gte=period.start, day__lte=period.end)
+    rows = await _in(BranchHourlyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     agg: dict[int, dict] = {}
     days: dict[int, set] = {}
     for r in rows:
@@ -699,8 +772,8 @@ async def hourly_profile(period: Period) -> list[dict]:
     return out
 
 
-async def till_closes(period: Period, cashier: str | None = None) -> list[dict]:
-    qs = BranchTillClose.filter(day__gte=period.start, day__lte=period.end)
+async def till_closes(period: Period, cashier: str | None = None, branch_id: str | None = None) -> list[dict]:
+    qs = _in(BranchTillClose.filter(day__gte=period.start, day__lte=period.end), branch_id)
     if cashier:
         qs = qs.filter(cashier_name=cashier)
     return [{
@@ -710,10 +783,10 @@ async def till_closes(period: Period, cashier: str | None = None) -> list[dict]:
     } for r in await qs.order_by("-closed_at")]
 
 
-async def tender_mix(period: Period) -> list[dict]:
+async def tender_mix(period: Period, branch_id: str | None = None) -> list[dict]:
     """Cash, card and credit have completely different consequences for working capital, so one
     "sales" figure hides the question that actually matters."""
-    rows = await BranchTenderStat.filter(day__gte=period.start, day__lte=period.end)
+    rows = await _in(BranchTenderStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     agg: dict[str, dict] = {}
     for r in rows:
         row = agg.setdefault(r.code, {"code": r.code, "name": r.name, "uses": 0, "amount": D0})
@@ -725,9 +798,9 @@ async def tender_mix(period: Period) -> list[dict]:
     return sorted(agg.values(), key=lambda r: r["amount"], reverse=True)
 
 
-async def discount_overrides(period: Period, approver: str | None = None) -> list[dict]:
+async def discount_overrides(period: Period, approver: str | None = None, branch_id: str | None = None) -> list[dict]:
     """Margin given away on a manager's signature, by name and invoice."""
-    qs = BranchDiscountOverride.filter(day__gte=period.start, day__lte=period.end)
+    qs = _in(BranchDiscountOverride.filter(day__gte=period.start, day__lte=period.end), branch_id)
     if approver:
         qs = qs.filter(approved_by=approver)
     return [{
@@ -738,8 +811,8 @@ async def discount_overrides(period: Period, approver: str | None = None) -> lis
     } for r in await qs.order_by("-at")]
 
 
-async def returns_detail(period: Period) -> list[dict]:
-    qs = BranchReturn.filter(day__gte=period.start, day__lte=period.end)
+async def returns_detail(period: Period, branch_id: str | None = None) -> list[dict]:
+    qs = _in(BranchReturn.filter(day__gte=period.start, day__lte=period.end), branch_id)
     return [{
         "at": r.at, "day": r.day.isoformat(), "againstInvoice": r.against_invoice,
         "cashier": r.cashier_name, "productName": r.product_name, "productSku": r.product_sku,
@@ -747,19 +820,19 @@ async def returns_detail(period: Period) -> list[dict]:
     } for r in await qs.order_by("-at")]
 
 
-async def credit_customers() -> list[dict]:
+async def credit_customers(branch_id: str | None = None) -> list[dict]:
     return [{
         "code": r.code, "name": r.name, "phone": r.phone, "tier": r.tier,
         "creditLimit": r.credit_limit, "creditBalance": r.credit_balance,
         "headroom": (r.credit_limit or D0) - (r.credit_balance or D0),
         "usedPercent": _money(r.credit_balance / r.credit_limit * 100) if r.credit_limit else D0,
-    } for r in await BranchCreditCustomer.all()]
+    } for r in await _in(BranchCreditCustomer.all(), branch_id)]
 
 
 # ── focused views: one category, one product, one cashier, one day, one supplier ──
-async def products_where(period: Period, attr: str, value: str, limit: int = 100) -> list[dict]:
+async def products_where(period: Period, attr: str, value: str, limit: int = 100, branch_id: str | None = None) -> list[dict]:
     """The products inside one category / brand / department — what a Top Categories row opens."""
-    rows = await BranchProductStat.filter(day__gte=period.start, day__lte=period.end)
+    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
     wanted = (value or "").strip().lower()
     agg: dict[str, dict] = {}
     for r in rows:
@@ -779,9 +852,9 @@ async def products_where(period: Period, attr: str, value: str, limit: int = 100
     return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
 
 
-async def product_days(period: Period, sku: str) -> tuple[list[dict], dict]:
+async def product_days(period: Period, sku: str, branch_id: str | None = None) -> tuple[list[dict], dict]:
     """One product, day by day, plus its period totals."""
-    rows = await BranchProductStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku)
+    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku), branch_id)
     days: dict[date, dict] = {}
     totals = {"qty": D0, "netSales": D0, "cogs": D0, "name": sku, "category": None, "brand": None}
     for r in rows:
@@ -802,21 +875,27 @@ async def product_days(period: Period, sku: str) -> tuple[list[dict], dict]:
     return sorted(days.values(), key=lambda r: r["day"]), totals
 
 
-async def cashier_days(period: Period, name: str) -> tuple[list[dict], dict]:
-    rows = await BranchCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name)
+async def cashier_days(period: Period, name: str, branch_id: str | None = None) -> tuple[list[dict], dict]:
+    rows = await _in(BranchCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name), branch_id)
+    # One row per day, even when the same name rang at two branches that day.
+    per_day: dict[date, dict] = {}
+    for r in rows:
+        d = per_day.setdefault(r.day, {"invoices": 0, "netSales": D0})
+        d["invoices"] += r.invoices
+        d["netSales"] += r.net_sales or D0
     days = []
     totals = {"invoices": 0, "netSales": D0, "days": 0}
-    for r in sorted(rows, key=lambda x: x.day):
+    for day, d in sorted(per_day.items()):
         days.append({
-            "day": r.day.isoformat(), "invoices": r.invoices, "netSales": r.net_sales or D0,
-            "avgBasket": _money((r.net_sales or D0) / r.invoices) if r.invoices else D0,
+            "day": day.isoformat(), "invoices": d["invoices"], "netSales": d["netSales"],
+            "avgBasket": _money(d["netSales"] / d["invoices"]) if d["invoices"] else D0,
         })
-        totals["invoices"] += r.invoices
-        totals["netSales"] += r.net_sales or D0
+        totals["invoices"] += d["invoices"]
+        totals["netSales"] += d["netSales"]
         totals["days"] += 1
     totals["avgBasket"] = _money(totals["netSales"] / totals["invoices"]) if totals["invoices"] else D0
     by_day: dict[str, dict] = {}
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name), branch_id):
         d = by_day.setdefault(r.day.isoformat(), {"qty": D0, "itemNet": D0, "cogs": D0, "items": set()})
         d["qty"] += r.qty or D0
         d["itemNet"] += r.net_sales or D0
@@ -830,10 +909,10 @@ async def cashier_days(period: Period, name: str) -> tuple[list[dict], dict]:
     return days, totals
 
 
-async def product_day_people(period: Period, sku: str) -> dict[str, str]:
+async def product_day_people(period: Period, sku: str, branch_id: str | None = None) -> dict[str, str]:
     """For each day an item sold, who sold it and how many: "Hina Malik 12 · Ali Raza 4"."""
     per: dict[str, dict[str, Decimal]] = {}
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku), branch_id):
         people = per.setdefault(r.day.isoformat(), {})
         people[r.cashier_name] = people.get(r.cashier_name, D0) + (r.qty or D0)
     out = {}
@@ -843,7 +922,7 @@ async def product_day_people(period: Period, sku: str) -> dict[str, str]:
     return out
 
 
-async def day_detail(day_iso: str) -> dict:
+async def day_detail(day_iso: str, branch_id: str | None = None) -> dict:
     """Everything about one trading day — what a row in the daily breakdown opens into."""
     try:
         day = date.fromisoformat(day_iso)
@@ -852,12 +931,12 @@ async def day_detail(day_iso: str) -> dict:
     one = Period("day", day_iso, day, day, day, day, "the day before")
     return {
         "day": day_iso,
-        "hours": await hourly_profile(one),
-        "cashiers": await cashier_ranking(one, limit=20),
-        "products": await top_products(one, limit=20),
-        "tenders": await tender_mix(one),
-        "closes": await till_closes(one),
-        "totals": await totals_for(one),
+        "hours": await hourly_profile(one, branch_id),
+        "cashiers": await cashier_ranking(one, limit=20, branch_id=branch_id),
+        "products": await top_products(one, limit=20, branch_id=branch_id),
+        "tenders": await tender_mix(one, branch_id),
+        "closes": await till_closes(one, branch_id=branch_id),
+        "totals": await totals_for(one, branch_id),
     }
 
 
@@ -930,16 +1009,16 @@ def _profit(row: dict) -> dict:
     return row
 
 
-async def person_items_known(period: Period) -> bool:
+async def person_items_known(period: Period, branch_id: str | None = None) -> bool:
     """Whether any branch has sent who-sold-what for this period (an older branch version doesn't)."""
-    return await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end).exists()
+    return await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id).exists()
 
 
-async def product_people(period: Period, sku: str) -> list[dict]:
+async def product_people(period: Period, sku: str, branch_id: str | None = None) -> list[dict]:
     """Everyone who sold one item: how many, for how much, over how many bills, and their share of the item."""
     branches = await _branch_codes()
     agg: dict[str, dict] = {}
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku), branch_id):
         row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "sku": sku, "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0,
                                                "daySet": set(), "branchSet": set()})
         row["invoices"] += r.invoices
@@ -959,27 +1038,28 @@ async def product_people(period: Period, sku: str) -> list[dict]:
     return sorted(agg.values(), key=lambda r: (r["netSales"], r["qty"]), reverse=True)
 
 
-async def product_branches(period: Period, sku: str) -> list[dict]:
-    branches = await _branch_codes()
+async def product_branches(period: Period, sku: str, branch_id: str | None = None) -> list[dict]:
+    branches = {str(b.id): b for b in await Branch.all()}
     agg: dict[str, dict] = {}
-    for r in await BranchProductStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
-        code = branches.get(str(r.branch_id), "?")
-        row = agg.setdefault(code, {"code": code, "qty": D0, "netSales": D0, "cogs": D0})
+    for r in await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku), branch_id):
+        b = branches.get(str(r.branch_id))
+        code = b.code if b else "?"
+        row = agg.setdefault(code, {"code": code, "branch": b.name if b else code, "sku": sku, "qty": D0, "netSales": D0, "cogs": D0})
         row["qty"] += r.qty or D0
         row["netSales"] += r.net_sales or D0
         row["cogs"] += r.cogs or D0
     return sorted((_profit(r) for r in agg.values()), key=lambda r: r["netSales"], reverse=True)
 
 
-async def person_products(period: Period, name: str) -> list[dict]:
+async def person_products(period: Period, name: str, branch_id: str | None = None) -> list[dict]:
     """Everything one person sold: each item with units, value, profit, bills, days, the share of this person's own
     sales it makes up, and the share of that item's sales this person made."""
     info = await _item_info(period)
-    mine = await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name)
+    mine = await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name), branch_id)
     skus = {r.product_sku for r in mine}
     item_totals: dict[str, Decimal] = {}
     if skus:
-        for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)):
+        for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)), branch_id):
             item_totals[r.product_sku] = item_totals.get(r.product_sku, D0) + (r.net_sales or D0)
     agg: dict[str, dict] = {}
     for r in mine:
@@ -1001,9 +1081,9 @@ async def person_products(period: Period, name: str) -> list[dict]:
     return sorted(agg.values(), key=lambda r: (r["netSales"], r["qty"]), reverse=True)
 
 
-async def person_categories(period: Period, name: str) -> list[dict]:
+async def person_categories(period: Period, name: str, branch_id: str | None = None) -> list[dict]:
     agg: dict[str, dict] = {}
-    for item in await person_products(period, name):
+    for item in await person_products(period, name, branch_id):
         row = agg.setdefault(item["category"], {"name": item["category"], "person": name, "items": 0, "qty": D0, "netSales": D0, "cogs": D0})
         row["items"] += 1
         row["qty"] += item["qty"]
@@ -1018,12 +1098,12 @@ async def person_categories(period: Period, name: str) -> list[dict]:
     return sorted(out, key=lambda r: r["netSales"], reverse=True)
 
 
-async def person_product_days(period: Period, name: str, sku: str) -> tuple[list[dict], dict]:
+async def person_product_days(period: Period, name: str, sku: str, branch_id: str | None = None) -> tuple[list[dict], dict]:
     """One person and one item, day by day, with where that sits against the item's and the person's whole period."""
     info = (await _item_info(period)).get(sku, {})
     days: dict[date, dict] = {}
     item_net = item_qty = person_net = D0
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku=sku), branch_id):
         item_net += r.net_sales or D0
         item_qty += r.qty or D0
         if r.cashier_name != name:
@@ -1033,7 +1113,7 @@ async def person_product_days(period: Period, name: str, sku: str) -> tuple[list
         d["qty"] += r.qty or D0
         d["netSales"] += r.net_sales or D0
         d["cogs"] += r.cogs or D0
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, cashier_name=name), branch_id):
         person_net += r.net_sales or D0
     rows = [_profit(d) for d in sorted(days.values(), key=lambda d: d["day"])]
     totals = _profit({
@@ -1048,13 +1128,13 @@ async def person_product_days(period: Period, name: str, sku: str) -> tuple[list
     return rows, totals
 
 
-async def people_where(period: Period, attr: str, value: str) -> list[dict]:
+async def people_where(period: Period, attr: str, value: str, branch_id: str | None = None) -> list[dict]:
     """Who sells a category or a brand, and how much of it each."""
     wanted = (value or "").strip().lower()
     skus = {sku for sku, meta in (await _item_info(period)).items() if meta.get(attr, "Unclassified").strip().lower() == wanted}
     agg: dict[str, dict] = {}
     if skus:
-        for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)):
+        for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end, product_sku__in=list(skus)), branch_id):
             row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
             row["invoices"] += r.invoices
             row["qty"] += r.qty or D0
@@ -1069,10 +1149,10 @@ async def people_where(period: Period, attr: str, value: str) -> list[dict]:
     return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)
 
 
-async def top_sellers(period: Period) -> dict[str, dict]:
+async def top_sellers(period: Period, branch_id: str | None = None) -> dict[str, dict]:
     """For each item, the person who sold the most of it, their share, and how many people sold it at all."""
     per: dict[str, dict[str, Decimal]] = {}
-    for r in await BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end):
+    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id):
         people = per.setdefault(r.product_sku, {})
         people[r.cashier_name] = people.get(r.cashier_name, D0) + (r.net_sales or D0)
     out = {}
@@ -1083,18 +1163,18 @@ async def top_sellers(period: Period) -> dict[str, dict]:
     return out
 
 
-async def people_on_day(day_iso: str) -> list[dict]:
+async def people_on_day(day_iso: str, branch_id: str | None = None) -> list[dict]:
     """Everyone who sold on one day: their bills and takings, and what those bills were made of."""
     try:
         day = date.fromisoformat(day_iso)
     except ValueError:
         return []
     agg: dict[str, dict] = {}
-    for r in await BranchCashierStat.filter(day=day):
+    for r in await _in(BranchCashierStat.filter(day=day), branch_id):
         row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "billTotal": D0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
         row["invoices"] += r.invoices
         row["billTotal"] += r.net_sales or D0
-    for r in await BranchProductCashierStat.filter(day=day):
+    for r in await _in(BranchProductCashierStat.filter(day=day), branch_id):
         row = agg.setdefault(r.cashier_name, {"name": r.cashier_name, "invoices": 0, "billTotal": D0, "qty": D0, "netSales": D0, "cogs": D0, "itemSet": set()})
         row["qty"] += r.qty or D0
         row["netSales"] += r.net_sales or D0
@@ -1107,10 +1187,10 @@ async def people_on_day(day_iso: str) -> list[dict]:
     return sorted(agg.values(), key=lambda r: r["billTotal"], reverse=True)
 
 
-async def returns_handled(period: Period, name: str) -> list[dict]:
-    return [r for r in await returns_detail(period) if r["cashier"] == name]
+async def returns_handled(period: Period, name: str, branch_id: str | None = None) -> list[dict]:
+    return [r for r in await returns_detail(period, branch_id) if r["cashier"] == name]
 
 
-async def overrides_rung(period: Period, name: str) -> list[dict]:
-    return [r for r in await discount_overrides(period) if r["cashier"] == name]
+async def overrides_rung(period: Period, name: str, branch_id: str | None = None) -> list[dict]:
+    return [r for r in await discount_overrides(period, branch_id=branch_id) if r["cashier"] == name]
 

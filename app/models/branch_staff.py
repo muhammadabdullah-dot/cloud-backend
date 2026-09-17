@@ -22,6 +22,10 @@ class BranchStaff(models.Model):
     email = fields.CharField(max_length=180)
     role_id = fields.CharField(max_length=40)
     active = fields.BooleanField(default=True)
+    # What they're called at the branch and the most discount they give on their own, as a branch reported them or head
+    # office set them. None until known, and then left out of what goes down, so a branch keeps its own.
+    title = fields.CharField(max_length=80, null=True)
+    discount_limit = fields.DecimalField(max_digits=5, decimal_places=2, null=True)
     # bcrypt, the same scheme both servers use, so the hash signs the person in wherever it lands.
     password_hash = fields.CharField(max_length=255)
     # [{"resource": "store.billing", "actions": ["R", "W", "X"]}, …]

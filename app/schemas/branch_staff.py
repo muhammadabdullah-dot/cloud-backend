@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,8 @@ class BranchStaffOut(BaseModel):
     email: str
     roleId: str
     active: bool
+    title: str | None = None
+    discountLimit: str | None = None
     permissions: list[PermissionIn]
     rev: int
     lastChangedAt: str
@@ -38,6 +41,8 @@ class BranchStaffCreate(BaseModel):
     roleId: str
     branchIds: list[str] = Field(min_length=1)
     permissions: list[PermissionIn] | None = None
+    title: str | None = Field(default=None, max_length=80)
+    discountLimit: Decimal | None = Field(default=None, ge=0, le=100)
 
 
 class BranchStaffUpdate(BaseModel):
@@ -48,6 +53,8 @@ class BranchStaffUpdate(BaseModel):
     active: bool | None = None
     branchIds: list[str] | None = None
     permissions: list[PermissionIn] | None = None
+    title: str | None = Field(default=None, max_length=80)
+    discountLimit: Decimal | None = Field(default=None, ge=0, le=100)
 
 
 class PasswordResetOut(BaseModel):

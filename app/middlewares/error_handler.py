@@ -49,6 +49,13 @@ def register_error_handlers(app: FastAPI) -> None:
         # A file that can't be read is the person's to fix (wrong type, damaged), not a server fault.
         return JSONResponse(status_code=400, content={"detail": exc.message})
 
+    from app.models.warehouse import StockBelowZero
+
+    @app.exception_handler(StockBelowZero)
+    async def stock_below_zero_handler(request: Request, exc: StockBelowZero) -> JSONResponse:
+        # Stock never goes below zero: the person reads what is there and what was asked.
+        return JSONResponse(status_code=409, content={"detail": exc.message})
+
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
         # The person gets a reference to quote; the log keeps what happened under the same reference.

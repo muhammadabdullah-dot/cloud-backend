@@ -30,6 +30,14 @@ IN_TRANSIT_ESCALATE = timedelta(hours=72)
 READY_TO_SEND = ("acknowledged", "skipped", "overridden", None)
 
 
+async def use_saved_timings() -> None:
+    """The timings above are what the software does until someone saves others in Admin > Company & Settings
+    (office_settings_service puts the saved ones in their place)."""
+    from app.services import office_settings_service
+
+    await office_settings_service.warm()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -95,9 +103,10 @@ SCREEN_RESOURCE = {
     "/warehouse/receiving": "warehouse.receiving",
     "/warehouse/purchase-orders": "warehouse.purchase-orders",
     "/executive/purchase-orders": "warehouse.purchase-orders.approve",
-    "/accounts/dashboard": "accounts.books",
-    "/accounts/vouchers": "accounts.books",
-    "/accounts/settings": "accounts.books",
+    "/warehouse/suppliers": "warehouse.suppliers",
+    "/accounts/dashboard": "accounts.desk",
+    "/accounts/vouchers": "accounts.vouchers",
+    "/accounts/settings": "accounts.settings",
 }
 
 # The same work on the reader's own screen, tried when the one the alert names is out of their reach.
@@ -135,7 +144,7 @@ async def _transfers(can) -> list[dict]:
             since = _aware(t.ack_requested_at or t.requested_at)
             if manage and branch_offline(dest):
                 out.append(_task(
-                    f"transfer:{t.id}:offline", "Shipments", f"{dest.name} is offline — {number} waits for its go-ahead",
+                    f"transfer:{t.id}:offline", "Shipments", f"{dest.name} is offline, so {number} waits for its go-ahead",
                     f"{dest.name} last checked in {_ago(dest.last_pulled_at)}. Wait, or send it without their answer with a written reason.",
                     "/warehouse/transfers", since, timedelta(0),
                 ))
@@ -148,7 +157,7 @@ async def _transfers(can) -> list[dict]:
             if manage:
                 out.append(_task(
                     f"transfer:{t.id}:declined", "Shipments", f"{dest.name} declined {number}",
-                    f"“{t.ack_note or 'No reason given'}” — {t.ack_by_name or dest.name}. Ask again or cancel it.",
+                    f"“{t.ack_note or 'No reason given'}” ({t.ack_by_name or dest.name}). Ask again or cancel it.",
                     "/warehouse/transfers", t.ack_at, APPROVAL_OVERDUE,
                 ))
         elif t.status == "approved" and t.source_branch_id is None and t.ack_status in READY_TO_SEND and dispatch:
@@ -163,7 +172,7 @@ async def _transfers(can) -> list[dict]:
             if manage and waited >= IN_TRANSIT_CHASE or executive and waited >= IN_TRANSIT_ESCALATE:
                 out.append(_task(
                     f"transfer:{t.id}:not-received", "Shipments", f"{dest.name} hasn't received {number}",
-                    f"On its way from {sender} since {_ago(t.dispatched_at)}{f' — held: {t.hold_note}' if t.hold_note else ''}. Chase {dest.name}.",
+                    f"On its way from {sender} since {_ago(t.dispatched_at)}{f' (held: {t.hold_note})' if t.hold_note else ''}. Chase {dest.name}.",
                     "/warehouse/transfers", t.dispatched_at, timedelta(0),
                 ))
     if manage:
@@ -182,7 +191,7 @@ async def _requisitions_and_counts(user: User, can) -> list[dict]:
         if pending:
             out.append(_task(
                 "requisitions:decide", "Shipments", f"{len(pending)} branch request{'' if len(pending) == 1 else 's'} for stock to decide",
-                "Approve to send the stock, or reject.", "/warehouse/requisitions", pending[0].requested_at, APPROVAL_OVERDUE,
+                "Approve to send the stock, or decline with a reason.", "/warehouse/requisitions", pending[0].requested_at, APPROVAL_OVERDUE,
             ))
     if can("warehouse.counts.approve", "X"):
         pending = await CycleCount.filter(status="pending").exclude(counted_by_id=user.id).order_by("at")
@@ -202,7 +211,7 @@ async def _purchasing(user: User, can) -> list[dict]:
         for po in await PurchaseOrder.filter(status="pending_approval").exclude(raised_by_id=user.id).prefetch_related("supplier", "raised_by"):
             if purchasing_service.covers(user, po.total):
                 out.append(_task(
-                    f"po:{po.id}:approve", "Purchasing", f"Approve {po.po_number} to {po.supplier.name} — {purchasing_service.rs(po.total)}",
+                    f"po:{po.id}:approve", "Purchasing", f"Approve {po.po_number} to {po.supplier.name} for {purchasing_service.rs(po.total)}",
                     f"Raised by {po.raised_by.name}{f' · {po.reason}' if po.reason else ''}. Approve or reject it.",
                     "/warehouse/purchase-orders", po.submitted_at or po.raised_at, APPROVAL_OVERDUE,
                 ))
@@ -222,7 +231,7 @@ async def _purchasing(user: User, can) -> list[dict]:
         if low:
             names = ", ".join(r["name"] for r in low[:3]) + (f" and {len(low) - 3} more" if len(low) > 3 else "")
             out.append(_task(
-                "stock:low", "Purchasing", f"{_items(len(low))} running low at the godown", f"{names} — at or below their reorder level with nothing on order.",
+                "stock:low", "Purchasing", f"{_items(len(low))} running low at the godown", f"{names}: at or below their reorder level with nothing on order.",
                 "/warehouse/purchase-orders", _now(), timedelta(hours=1),
             ))
     return out
@@ -236,7 +245,7 @@ async def _accounts(can) -> list[dict]:
         drafts = await Voucher.filter(book=HEAD_OFFICE_BOOK, status="draft", auto=False).order_by("created_at")
         if drafts:
             out.append(_task("vouchers:post", "Accounts", f"{len(drafts)} voucher{'' if len(drafts) == 1 else 's'} waiting to be posted",
-                             "Saved as drafts — they aren't in head office's books until someone posts them.", "/accounts/vouchers?status=draft",
+                             "Saved as drafts, so they aren't in head office's books until someone posts them.", "/accounts/vouchers?status=draft",
                              drafts[0].created_at, APPROVAL_OVERDUE))
     if can("accounts.period", "X"):
         row = await AccountsSettings.get_or_none(book=HEAD_OFFICE_BOOK)
@@ -255,6 +264,7 @@ async def _accounts(can) -> list[dict]:
 
 
 async def tasks_for(user: User, grants: dict[str, set[str]] | None = None) -> list[dict]:
+    await use_saved_timings()
     grants = grants if grants is not None else await grants_of(user)
 
     def can(resource: str, action: str) -> bool:
@@ -279,12 +289,13 @@ async def _low_stock_notice() -> None:
     if low:
         await notify(
             "stock.low", f"{_items(len(low))} running low at the godown",
-            body=", ".join(r["name"] for r in low[:5]) + (" …" if len(low) > 5 else "") + " — at or below reorder level, nothing on order.",
+            body=", ".join(r["name"] for r in low[:5]) + (" …" if len(low) > 5 else "") + ": at or below reorder level, nothing on order.",
             link="/warehouse/purchase-orders", audience_any=[("executive.dashboard", "R"), ("warehouse.purchase-orders", "W")], tone="warning",
         )
 
 
 async def notices_for(user: User, grants: dict[str, set[str]] | None = None) -> list[dict]:
+    await use_saved_timings()
     grants = grants if grants is not None else await grants_of(user)
     rows = await Notice.filter(at__gte=_now() - timedelta(days=NOTICE_DAYS)).order_by("-at").limit(400)
     mine = [n for n in rows if _for(user, grants, n.audience)][:NOTICE_LIMIT]

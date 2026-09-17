@@ -119,8 +119,12 @@ async def list_batches(product_id: str | None, limit: int, offset: int) -> tuple
 async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
     if not payload.lines:
         raise WarehouseError("A GRN needs at least one line")
-    if not await Supplier.exists(id=payload.supplierId):
+    supplier = await Supplier.get_or_none(id=payload.supplierId)
+    if not supplier:
         raise WarehouseError("No such supplier")
+    # Switched off anywhere is switched off everywhere (one company list), and the branch already refuses goods from one.
+    if not getattr(supplier, "active", True):
+        raise WarehouseError(f"{supplier.name} is switched off. Switch it back on under Warehouse, Suppliers to receive from them again.")
     await _active_bin(payload.binId)
     if payload.gstMode not in ("normal", "normal-bonus"):
         raise WarehouseError("GST mode must be 'normal' or 'normal-bonus'")
@@ -213,10 +217,11 @@ async def list_requisitions(status: str | None, limit: int, offset: int) -> tupl
 
 @atomic()
 async def create_requisition(branch_id: str, product_id: str, qty: Decimal) -> Requisition:
-    """A branch asking for stock. No UI reaches this yet on either side — branch-app has no
-    requisition-authoring screen (frontend-baseline.md §4 point 2 flags it as a frontend gap) —
-    but the endpoint is what a branch will call, and it lets the Cloud screens be tested with
-    real data rather than only seeded rows."""
+    """One Item asked for on a branch's behalf. Head office's Requisitions screen records whole requests (several
+    Items, a reason, who sends it) through requisition_service.record_for_branch; this older one-Item form stays for
+    anything still calling it, and makes the same request with one line."""
+    from app.models.requisition_detail import RequisitionDetail, RequisitionLine
+
     if not await Branch.exists(id=branch_id):
         raise WarehouseError("No such branch")
     if not await Product.exists(id=product_id):
@@ -224,46 +229,28 @@ async def create_requisition(branch_id: str, product_id: str, qty: Decimal) -> R
     if qty <= ZERO:
         raise WarehouseError("Requested quantity must be above zero")
     seq = await next_value("requisition", 32)
-    return await Requisition.create(
+    req = await Requisition.create(
         requisition_number=f"REQ-{seq:04d}", branch_id=branch_id, product_id=product_id,
         qty_requested=qty, status="pending", requested_at=datetime.now(timezone.utc),
     )
+    await RequisitionDetail.create(requisition=req, origin="head-office", received_at=req.requested_at)
+    await RequisitionLine.create(requisition=req, product_id=product_id, qty_requested=qty, sort_order=0)
+    return req
 
 
-@atomic()
 async def approve_requisition(user: User, requisition_id: str) -> tuple[Requisition, Transfer]:
-    """The requisition → transfer handoff: approving creates the Transfer, nothing re-typed.
+    """The requisition to transfer handoff: approving creates the Transfer, nothing re-typed. Everything asked for is
+    approved as asked; the Requisitions screen approves with changed quantities (requisition_service.approve).
 
     The Transfer keeps a foreign key back to the requisition, so "why does this transfer exist"
     has an answer in the data rather than only in the sequence of timestamps.
     """
-    req = await Requisition.get_or_none(id=requisition_id)
-    if not req:
-        raise WarehouseError("Requisition not found")
-    if req.status != "pending":
-        raise WarehouseError(f"This requisition is already {req.status}")
+    from app.services import requisition_service
 
-    now = datetime.now(timezone.utc)
-    req.status = "approved"
-    req.decided_by = user
-    req.decided_at = now
-    await req.save()
-
-    seq = await next_value("transfer", 45)
-    branch = await Branch.get(id=req.branch_id)
-    # The branch asked for this stock, so it doesn't have to agree to it again.
-    transfer = await Transfer.create(
-        transfer_number=f"TR-{seq:04d}", branch_id=req.branch_id, requisition=req,
-        status="approved", requested_at=req.requested_at, approved_at=now, dispute_open=False,
-        ack_status="skipped", ack_note=f"{branch.name} asked for it ({req.requisition_number})",
-    )
-    await TransferLine.create(
-        transfer=transfer, product_id=req.product_id, qty_sent=req.qty_requested, qty_received=None,
-    )
-    from app.services import transfer_sync_service
-    await transfer_sync_service.publish(transfer)
-    await transfer.fetch_related("lines")
-    return req, transfer
+    try:
+        return await requisition_service.approve(user, requisition_id)
+    except requisition_service.RequisitionError as exc:
+        raise WarehouseError(exc.message) from exc
 
 
 @atomic()
@@ -309,18 +296,15 @@ async def create_transfer(user: User, branch_id: str, lines: list[tuple[str, Dec
     return transfer
 
 
-@atomic()
-async def reject_requisition(user: User, requisition_id: str) -> Requisition:
-    req = await Requisition.get_or_none(id=requisition_id)
-    if not req:
-        raise WarehouseError("Requisition not found")
-    if req.status != "pending":
-        raise WarehouseError(f"This requisition is already {req.status}")
-    req.status = "rejected"
-    req.decided_by = user
-    req.decided_at = datetime.now(timezone.utc)
-    await req.save()
-    return req
+async def reject_requisition(user: User, requisition_id: str, reason: str | None = None) -> Requisition:
+    """Declining without writing a reason (the Decisions inbox) still tells the branch it was declined, and by whom;
+    the Requisitions screen asks for the reason."""
+    from app.services import requisition_service
+
+    try:
+        return await requisition_service.decline(user, requisition_id, reason or f"Declined by {user.name} at head office")
+    except requisition_service.RequisitionError as exc:
+        raise WarehouseError(exc.message) from exc
 
 
 # ── transfers ───────────────────────────────────────────────────────────────
@@ -359,16 +343,16 @@ async def dispatch_transfer(user: User, transfer_id: str, payload: DispatchReque
     if not transfer:
         raise WarehouseError("Transfer not found")
     if transfer.source_branch_id:
-        raise WarehouseError("This transfer is between two branches — the sending branch dispatches it.")
+        raise WarehouseError("This transfer is between two branches, so the sending branch dispatches it.")
     if transfer.status != "approved":
-        raise WarehouseError(f"Only an approved transfer can be dispatched — this one is {transfer.status}")
+        raise WarehouseError(f"Only an approved transfer can be dispatched. This one is {transfer.status}")
     if transfer.ack_status in ("awaiting", "declined"):
         await transfer.fetch_related("branch")
         if transfer.ack_status == "declined":
             raise WarehouseError(f"{transfer.branch.name} declined {transfer.transfer_number}: {transfer.ack_note or 'no reason given'}. Ask again or cancel it.")
         raise WarehouseError(
-            f"{transfer.branch.name} hasn't agreed to receive {transfer.transfer_number} yet. It's dispatched once they have — "
-            "or, if they stay offline, send it without their answer with a written reason."
+            f"{transfer.branch.name} hasn't agreed to receive {transfer.transfer_number} yet. It's dispatched once they have. "
+            "Or, if they stay offline, send it without their answer with a written reason."
         )
     if not payload.vehicle.strip() or not payload.driver.strip():
         raise WarehouseError("A dispatch needs both a vehicle and a driver")
@@ -418,7 +402,7 @@ async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest) ->
         # arrived that never went onto that branch's shelves.
         raise WarehouseError(f"{transfer.branch.name} receives its transfers in the Branch App. Its receipt comes back here by sync.")
     if transfer.status not in ("dispatched", "in_transit"):
-        raise WarehouseError(f"Only a dispatched transfer can be received — this one is {transfer.status}")
+        raise WarehouseError(f"Only a dispatched transfer can be received. This one is {transfer.status}")
 
     received = {l.productId: l.qtyReceived for l in payload.lines}
     short = False
@@ -438,11 +422,11 @@ async def receive_transfer(transfer_id: str, payload: ReceiveTransferRequest) ->
     transfer.status = "received_short" if short else "received"
     if short:
         transfer.dispute_open = True
-        transfer.dispute_note = payload.note or "Short receipt — quantities received are below what was dispatched."
+        transfer.dispute_note = payload.note or "Short receipt: quantities received are below what was dispatched."
     await transfer.save()
     from app.services import alerts_service
     await alerts_service.notify(
-        "transfer.received", f"{transfer.transfer_number} received for {transfer.branch.name}" + (" — short" if short else ""),
+        "transfer.received", f"{transfer.transfer_number} received for {transfer.branch.name}" + (" (short)" if short else ""),
         body=transfer.dispute_note if short else None, link="/warehouse/transfers", audience_any=MANAGERS + EXECUTIVE,
         subject=("transfer", str(transfer.id)), tone="bad" if short else "good",
     )
@@ -454,7 +438,7 @@ async def _open_transfer(transfer_id: str) -> Transfer:
     if not transfer:
         raise WarehouseError("Transfer not found")
     if transfer.status not in ("approved", "requested"):
-        raise WarehouseError(f"{transfer.transfer_number} has already left — it's {transfer.status.replace('_', ' ')}.")
+        raise WarehouseError(f"{transfer.transfer_number} has already left. It's {transfer.status.replace('_', ' ')}.")
     return transfer
 
 
@@ -470,11 +454,11 @@ async def send_without_answer(user: User, transfer_id: str, reason: str | None) 
     if not alerts_service.branch_offline(transfer.branch):
         hours = int(alerts_service.OFFLINE_AFTER.total_seconds() // 3600)
         raise WarehouseError(
-            f"{transfer.branch.name} is online — it checked in within the last {hours} hours. Wait for their answer, or call them."
+            f"{transfer.branch.name} is online. It checked in within the last {hours} hours. Wait for their answer, or call them."
         )
     reason = (reason or "").strip()
     if len(reason) < 10:
-        raise WarehouseError("Write why it can't wait for the branch — at least a sentence.")
+        raise WarehouseError("Write why it can't wait for the branch, in at least a sentence.")
     now = datetime.now(timezone.utc)
     transfer.ack_status, transfer.override_reason, transfer.override_by_name, transfer.override_at = "overridden", reason[:255], user.name, now
     if transfer.status == "requested":
@@ -509,7 +493,7 @@ async def cancel_transfer(user: User, transfer_id: str, reason: str | None) -> T
 
     transfer = await _open_transfer(transfer_id)
     transfer.status, transfer.cancelled_at = "cancelled", datetime.now(timezone.utc)
-    transfer.notes = ((transfer.notes or "") + (f" — cancelled by {user.name}: {reason.strip()}" if reason and reason.strip() else f" — cancelled by {user.name}"))[:255]
+    transfer.notes = ((transfer.notes or "") + (f" (cancelled by {user.name}: {reason.strip()})" if reason and reason.strip() else f" (cancelled by {user.name})"))[:255]
     await transfer.save()
     await transfer_sync_service.publish(transfer)
     await alerts_service.notify(
@@ -570,6 +554,13 @@ async def approve_count(user: User, count_id: str) -> CycleCount:
         # Post only the difference, not the counted quantity — the ledger records the correction,
         # not a restatement of the whole balance.
         product = await Product.get(id=count.product_id)
+        held = await balance(str(count.product_id), str(count.bin_id))
+        if held + delta < ZERO:
+            # Picked or moved since the count was made: the difference would leave the bin below zero.
+            raise WarehouseError(
+                f"{product.name} in this bin has gone down to {held.normalize():f} since the count was made, so taking off its "
+                f"difference of {(-delta).normalize():f} would leave less than nothing. Count the bin again."
+            )
         await StockMovement.create(
             product_id=count.product_id, bin_id=count.bin_id, kind="count-correction",
             qty=delta, reason="Cycle count", origin_user=user, at=datetime.now(timezone.utc), unit_cost=product.avg_cost,

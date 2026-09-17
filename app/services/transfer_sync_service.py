@@ -5,7 +5,8 @@ receiving branch gets `transfer.inbound` with the transfer as it now stands, and
 transfer — the sending branch gets `transfer.outbound`. Lines travel by Item code (sku), because each
 branch has its own Item ids.
 
-Up, step by step:
+Up, step by step (a branch's stock request comes the same way: `requisition.sent` and `requisition.cancelled`, handled
+by requisition_service):
   requested     a branch asks to send stock to another branch (created here, relayed to the other branch)
   acknowledged  the receiving branch agrees to take it — only then is it picked or dispatched
   declined      the receiving branch says no, and why
@@ -116,6 +117,11 @@ async def _product_for(line: dict) -> Product:
 
 async def project(branch: Branch, payload: dict) -> str:
     event = payload.get("event")
+    if str(event or "").startswith("requisition."):
+        # A branch's stock request travels with its transfer events. See requisition_service.
+        from app.services import requisition_service
+
+        return await requisition_service.apply_from_branch(branch, payload)
     if event == "requested":
         return await _branch_requested(branch, payload.get("transfer") or {})
     if event in ("acknowledged", "declined"):
@@ -228,7 +234,10 @@ async def _branch_cancelled(branch: Branch, payload: dict) -> str:
         return "already-left"
     transfer.status, transfer.cancelled_at = "cancelled", datetime.now(timezone.utc)
     reason = payload.get("reason")
-    transfer.notes = ((transfer.notes or "") + (f" — cancelled: {reason}" if reason else " — cancelled"))[:255]
+    # Worded the same as the branch writes it on its own copy of the transfer.
+    earlier = (transfer.notes or "").rstrip(". ")
+    cancelled = f"Cancelled: {reason.strip()}" if reason and reason.strip() else "Cancelled"
+    transfer.notes = (f"{earlier}. {cancelled}" if earlier else cancelled)[:255]
     await transfer.save()
     await publish(transfer)
     return "cancelled"
@@ -298,11 +307,11 @@ async def _branch_received(branch: Branch, payload: dict) -> str:
     disputed = short or bool(payload.get("dispute"))
     if disputed:
         transfer.dispute_open = True
-        transfer.dispute_note = payload.get("note") or "Short receipt — the branch received less than was sent."
+        transfer.dispute_note = payload.get("note") or "Short receipt: the branch received less than was sent."
     await transfer.save()
     await publish(transfer)
     await alerts_service.notify(
-        "transfer.received", f"{branch.name} received {transfer.transfer_number}" + (" and opened a dispute" if disputed else " — accepted"),
+        "transfer.received", f"{branch.name} received {transfer.transfer_number}" + (" and opened a dispute" if disputed else " and accepted it"),
         body=transfer.dispute_note if disputed else f"Signed for by {transfer.received_by_name or branch.name}.", link=LINK,
         audience_any=MANAGERS + EXECUTIVE, subject=("transfer", str(transfer.id)), tone="bad" if disputed else "good",
     )

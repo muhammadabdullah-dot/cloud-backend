@@ -13,7 +13,8 @@ ZERO = Decimal("0")
 OPEN = ("draft", "pending_approval", "approved", "partially_received")
 RECEIVABLE = ("approved", "partially_received")
 
-# What each starting role may approve on its own when no limit is set on the person. None = no limit.
+# What each starting role may approve on its own when no limit is set on the person. None = no limit. These are the
+# limits until someone saves others in Admin > Company & Settings; call `use_saved_limits()` before reading them.
 ROLE_PO_LIMITS: dict[str, Decimal | None] = {"executive": None, "warehouse-manager": Decimal("500000")}
 
 LINK = "/warehouse/purchase-orders"
@@ -39,6 +40,12 @@ def rs(v: Decimal) -> str:
 def money(v: Decimal | None) -> str | None:
     """Plain rupees with paisa for the wire: 1500.00, never 1.5E+3."""
     return None if v is None else format(Decimal(v).quantize(Decimal("0.01")), "f")
+
+
+async def use_saved_limits() -> None:
+    from app.services import office_settings_service
+
+    await office_settings_service.warm()
 
 
 def po_limit_of(user: User) -> Decimal | None:
@@ -118,7 +125,7 @@ async def create_order(user: User, supplier_id: str, lines, expected_at, notes: 
 async def update_order(user: User, order_id: str, supplier_id: str, lines, expected_at, notes: str | None, reason: str | None) -> PurchaseOrder:
     po = await get_order(order_id)
     if po.status not in ("draft", "rejected"):
-        raise PurchasingError(f"{po.po_number} can't be changed now — it's {po.status.replace('_', ' ')}.")
+        raise PurchasingError(f"{po.po_number} can't be changed now because it's {po.status.replace('_', ' ')}.")
     if po.raised_by_id != user.id:
         raise PurchasingError("Only the person who raised an order changes it.", 403)
     supplier = await Supplier.get_or_none(id=supplier_id)
@@ -140,6 +147,7 @@ async def submit_order(user: User, order_id: str) -> PurchaseOrder:
     for someone whose limit covers it."""
     from app.services.rbac_service import has_permission
 
+    await use_saved_limits()
     po = await get_order(order_id)
     if po.status not in ("draft", "rejected"):
         raise PurchasingError(f"{po.po_number} was already submitted.")
@@ -153,7 +161,7 @@ async def submit_order(user: User, order_id: str) -> PurchaseOrder:
         po.status, po.approved_by, po.approved_at, po.auto_approved = "approved", user, now, True
         await po.save()
         await alerts_service.notify(
-            "po.approved", f"{po.po_number} to {po.supplier.name} approved — {rs(po.total)}",
+            "po.approved", f"{po.po_number} to {po.supplier.name} approved ({rs(po.total)})",
             body=f"Within {user.name}'s own approval limit.{f' Reason: {po.reason}.' if po.reason else ''}", link=LINK,
             audience_any=EXECUTIVE, subject=subject, tone="good",
         )
@@ -161,7 +169,7 @@ async def submit_order(user: User, order_id: str) -> PurchaseOrder:
         po.status, po.auto_approved = "pending_approval", False
         await po.save()
         await alerts_service.notify(
-            "po.submitted", f"{po.po_number} to {po.supplier.name} waits for approval — {rs(po.total)}",
+            "po.submitted", f"{po.po_number} to {po.supplier.name} waits for approval ({rs(po.total)})",
             body=f"Raised by {user.name}.{f' Reason: {po.reason}.' if po.reason else ''}", link=LINK,
             audience_any=EXECUTIVE + APPROVERS, subject=subject,
         )
@@ -170,14 +178,15 @@ async def submit_order(user: User, order_id: str) -> PurchaseOrder:
 
 @atomic()
 async def approve_order(user: User, order_id: str) -> PurchaseOrder:
+    await use_saved_limits()
     po = await get_order(order_id)
     if po.status != "pending_approval":
         raise PurchasingError(f"{po.po_number} isn't waiting for approval.")
     if po.raised_by_id == user.id:
-        raise PurchasingError("Nobody approves their own order — it's above your limit, so someone else decides.", 403)
+        raise PurchasingError("Nobody approves their own order. It's above your limit, so someone else decides.", 403)
     if not covers(user, po.total):
         raise PurchasingError(
-            f"Your purchase approval limit is {rs(po_limit_of(user))} — {po.po_number} is {rs(po.total)}. Someone with a higher limit approves it.", 403,
+            f"Your purchase approval limit is {rs(po_limit_of(user))}, but {po.po_number} is {rs(po.total)}. Someone with a higher limit approves it.", 403,
         )
     po.status, po.approved_by, po.approved_at = "approved", user, _now()
     await po.save()
@@ -210,7 +219,7 @@ async def reject_order(user: User, order_id: str, reason: str | None) -> Purchas
 async def cancel_order(user: User, order_id: str, reason: str | None) -> PurchaseOrder:
     po = await get_order(order_id)
     if po.status not in ("draft", "pending_approval", "rejected", "approved"):
-        raise PurchasingError(f"{po.po_number} can't be cancelled — it's {po.status.replace('_', ' ')}. Close it instead.")
+        raise PurchasingError(f"{po.po_number} can't be cancelled because it's {po.status.replace('_', ' ')}. Close it instead.")
     if any(l.received_qty > ZERO for l in po.lines):
         raise PurchasingError(f"Some of {po.po_number} has been received. Close it instead.")
     was = po.status
@@ -244,7 +253,7 @@ async def receive_against(po_id: str, supplier_id: str, received: list[tuple[str
     if po.status not in RECEIVABLE:
         raise PurchasingError(f"{po.po_number} isn't approved, so nothing can be received against it.")
     if str(po.supplier_id) != str(supplier_id):
-        raise PurchasingError(f"{po.po_number} is from {po.supplier.name} — pick that supplier on the GRN.")
+        raise PurchasingError(f"{po.po_number} is from {po.supplier.name}, so pick that supplier on the GRN.")
     by_product = {str(l.product_id): l for l in po.lines}
     names = {str(p.id): p.name for p in await Product.filter(id__in=[pid for pid, _, _ in received])}
     mismatches: list[str] = []
@@ -266,7 +275,7 @@ async def receive_against(po_id: str, supplier_id: str, received: list[tuple[str
     await po.save()
     await alerts_service.notify(
         "po.received", f"{grn_number} received against {po.po_number} from {po.supplier.name}"
-        + (" — doesn't match the order" if mismatches else ""),
+        + (", but it doesn't match the order" if mismatches else ""),
         body="; ".join(mismatches) if mismatches else ("Everything ordered has arrived." if all_in else "Part of the order has arrived."),
         link=LINK, audience_any=BUYERS + EXECUTIVE, subject=("purchase-order", str(po.id)), tone="warning" if mismatches else "good",
     )

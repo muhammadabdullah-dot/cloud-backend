@@ -50,6 +50,10 @@ async def apply_chart(branch: Branch, payload: dict) -> None:
             await accounts_chart_service.apply_account(book, payload.get("account") or {})
         elif kind == "accountDeleted":
             await accounts_chart_service.delete_branch_account(book, (payload.get("accountDeleted") or {}).get("id"))
+        elif kind == "groupDeleted":
+            await accounts_chart_service.delete_branch_group(book, payload.get("groupDeleted") or {})
+        elif kind == "subGroupDeleted":
+            await accounts_chart_service.delete_branch_sub_group(book, payload.get("subGroupDeleted") or {})
     except accounts_chart_service.ChartError as exc:
         raise MirrorError(exc.message) from exc
     await _touch(book)

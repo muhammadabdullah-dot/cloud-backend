@@ -31,6 +31,7 @@ from app.routes.health import router as health_router
 from app.routes.rbac import router as rbac_router
 from app.routes.rbac import users_router
 from app.routes.warehouse import router as warehouse_router
+from app.routes.suppliers import router as suppliers_router
 from app.services.seed_service import seed_branches_if_empty, seed_if_empty, sync_role_resource_grants
 from app.services.warehouse_seed import seed_warehouse_if_empty
 
@@ -83,12 +84,25 @@ app.include_router(loyalty_router)
 app.include_router(racks_router)
 app.include_router(putaway_router)
 app.include_router(warehouse_router)
+app.include_router(suppliers_router)
 app.include_router(executive_router)
 app.include_router(accounts_router)
+from app.routes import fixed_assets, tax_reports  # noqa: E402
+app.include_router(fixed_assets.router)
+app.include_router(tax_reports.router)
 from app.routes.maintenance import router as maintenance_router  # noqa: E402
+from app.routes.item_lists import router as item_lists_router  # noqa: E402
+from app.routes.office_settings import router as office_settings_router  # noqa: E402
+from app.routes.requisitions import router as branch_requests_router  # noqa: E402
+
+app.include_router(item_lists_router)
+app.include_router(office_settings_router)
+app.include_router(branch_requests_router)
 
 app.include_router(maintenance_router)
 app.include_router(client_errors_router)
+from app.routes.technical_reports import router as technical_reports_router  # noqa: E402
+app.include_router(technical_reports_router)
 
 register_tortoise(app, config=TORTOISE_ORM, generate_schemas=False, add_exception_handlers=True)
 
@@ -111,6 +125,11 @@ async def _seed() -> None:
     # Backfills resources added to core/resources.py onto users who were seeded before they
     # existed — role templates only materialize into real UserPermission rows at User.create()
     # time, so without this a new screen would never reach an existing account.
+    from app.services.seed_service import split_the_books_access
+
+    split = await split_the_books_access()
+    if split:
+        print(f"  accounts: {split} account(s) moved onto a tick per accounts screen and area", flush=True)
     await sync_role_resource_grants()
     # Branch events head office couldn't apply before (a receipt, an account change) get another go.
     from app.services import accounts_chart_service
@@ -139,7 +158,7 @@ async def _print_banner() -> None:
     if FRONTEND_DIST is not None:
         found = (FRONTEND_DIST / "index.html").is_file()
         print(
-            f"  App:     {'served from ' + str(FRONTEND_DIST) if found else 'not built yet — run npm run build in cloud-app'}\n",
+            f"  App:     {'served from ' + str(FRONTEND_DIST) if found else 'not built yet (run npm run build in cloud-app)'}\n",
             flush=True,
         )
 

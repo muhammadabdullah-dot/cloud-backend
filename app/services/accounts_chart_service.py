@@ -309,7 +309,12 @@ def account_payload(account: Account) -> dict:
     }
 
 
-async def tree(book: str) -> dict:
+async def tree(book: str, access=None) -> dict:
+    """One book's chart, limited to what `access` (accounts_areas.Access) may see. Each account says its area and
+    whether the person may put it on a voucher line."""
+    from app.services import accounts_areas
+
+    access = access or accounts_areas.EVERYTHING
     await ensure_types_and_categories()
     types = await AccountType.all().order_by("code")
     categories = await AccountCategory.all().order_by("code")
@@ -317,13 +322,27 @@ async def tree(book: str) -> dict:
     subs = await AccountSubGroup.filter(book=book).order_by("code")
     accounts = await Account.filter(book=book).order_by("code")
     used = {str(a) for a in await VoucherLine.filter(account__book=book).distinct().values_list("account_id", flat=True)}
+    by_id = {g.id: g for g in groups}
+    area = {}
+    for a in accounts:
+        group = by_id.get(a.group_id)
+        area[str(a.id)] = accounts_areas.area_of(a.kind, group.code if group else None, group.category_id if group else None, a.system_key)
+    if not access.sees_everything:
+        accounts = [a for a in accounts if access.can_see(area[str(a.id)], a.system_key)]
+        # A group shows when its own area is seen, or when it holds an account that is (a bank account under advances).
+        shown = {a.group_id for a in accounts} | {g.id for g in groups if access.can_see(accounts_areas.area_of(None, g.code, g.category_id))}
+        groups = [g for g in groups if g.id in shown]
+        subs = [s for s in subs if s.group_id in shown]
+        categories = [c for c in categories if c.code in {g.category_id for g in groups}]
+        types = [t for t in types if t.code in {c.type_id for c in categories}]
     return {
         "book": book,
         "types": [{"code": t.code, "name": t.name, "nature": t.nature, "statement": t.statement} for t in types],
         "categories": [{"code": c.code, "name": c.name, "typeCode": c.type_id} for c in categories],
         "groups": [group_payload(g) for g in groups],
         "subGroups": [{"code": s.code, "name": s.name, "groupCode": s.group_id.split(":", 1)[1], "standard": s.standard} for s in subs],
-        "accounts": [{**account_payload(a), "used": str(a.id) in used} for a in accounts],
+        "accounts": [{**account_payload(a), "used": str(a.id) in used, "area": area[str(a.id)],
+                      "canUse": access.can_use(area[str(a.id)], a.system_key)} for a in accounts],
     }
 
 
@@ -391,6 +410,35 @@ async def update_sub_group(code: str, name: str) -> AccountSubGroup:
     sub.name = cleaned.upper()
     await sub.save()
     return sub
+
+
+@atomic()
+async def delete_group(code: str) -> None:
+    """Only a group somebody added, and only while nothing is in it."""
+    group = await AccountGroup.get_or_none(id=gid(BOOK, code))
+    if not group:
+        raise ChartError("That group doesn't exist.")
+    if group.standard:
+        raise ChartError(f"{group.name} is part of the standard chart every branch and head office share, so it stays.")
+    held = await Account.filter(group_id=group.id).count()
+    if held:
+        raise ChartError(f"{group.name} still holds {held} account{'s' if held != 1 else ''}. Move or delete them first.")
+    await AccountSubGroup.filter(group_id=group.id).delete()
+    await group.delete()
+
+
+@atomic()
+async def delete_sub_group(code: str) -> None:
+    sub = await AccountSubGroup.get_or_none(id=gid(BOOK, code))
+    if not sub:
+        raise ChartError("That sub group doesn't exist.")
+    # Every group's first sub group is where its accounts land when nobody picks one.
+    if sub.standard or sub.id == f"{sub.group_id}01":
+        raise ChartError("A group's first sub group holds the accounts nobody put elsewhere, so it stays.")
+    held = await Account.filter(sub_group_id=sub.id).count()
+    if held:
+        raise ChartError(f"{sub.name} still holds {held} account{'s' if held != 1 else ''}. Move them to another sub group first.")
+    await sub.delete()
 
 
 async def _type_of_group(group_code: str) -> str:
@@ -551,3 +599,17 @@ async def delete_branch_account(book: str, account_id: str) -> None:
     account = await Account.get_or_none(id=account_id, book=book)
     if account and not await VoucherLine.exists(account_id=account.id):
         await account.delete()
+
+
+async def delete_branch_group(book: str, data: dict) -> None:
+    """A branch deleted an empty group it had added (the branch refuses anything else)."""
+    group = await AccountGroup.get_or_none(id=gid(book, str(data.get("code") or "")))
+    if group and not await Account.exists(group_id=group.id):
+        await AccountSubGroup.filter(group_id=group.id).delete()
+        await group.delete()
+
+
+async def delete_branch_sub_group(book: str, data: dict) -> None:
+    sub = await AccountSubGroup.get_or_none(id=gid(book, str(data.get("code") or "")))
+    if sub and not await Account.exists(sub_group_id=sub.id):
+        await sub.delete()

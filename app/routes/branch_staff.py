@@ -54,6 +54,7 @@ def _out(staff: BranchStaff, branches: list[Branch], deliveries: dict) -> Branch
         rows.append(StaffBranchOut(branchId=str(branch.id), code=branch.code, name=branch.name, delivery=state, deliveryError=error))
     return BranchStaffOut(
         id=staff.id, name=staff.name, email=staff.email, roleId=staff.role_id, active=staff.active,
+        title=staff.title, discountLimit=None if staff.discount_limit is None else format(staff.discount_limit.normalize(), "f"),
         permissions=[PermissionIn(**p) for p in staff_sync_service._norm_permissions(staff.permissions)],
         rev=staff.rev, lastChangedAt=staff.last_changed_at, lastChangedBy=staff.last_changed_by,
         updatedAt=staff.updated_at, branches=sorted(rows, key=lambda r: r.code),

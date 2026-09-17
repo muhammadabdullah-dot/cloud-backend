@@ -389,7 +389,7 @@ class Story:
         row.locked_until = date(2026, 8, 31)
         await row.save()
         notice = await alerts_service.notify("accounts.period", "Closed the books up to 31 Aug 2026", body=f"By {self.accounts_admin.name}", link="/accounts/settings",
-                                             audience_any=[("accounts.period", "X"), ("accounts.books", "R")], tone="warning")
+                                             audience_any=[("accounts.period", "X"), ("accounts.settings", "R")], tone="warning")
         await Notice.filter(id=notice.id).update(at=at(date(2026, 9, 5), 16, 30))
         del GRN
 

@@ -172,6 +172,7 @@ async def _check_home_bin(bin_id: str | None) -> None:
 async def create(data: ItemCreate, user: User | None = None) -> Product:
     sku = (data.sku or "").strip() or await _next_sku()
     await _refuse_taken(sku, "Code")
+    await _refuse_switched_off(data.model_dump())
     fields = _to_model_fields(data.model_dump())
     if fields.get("barcode"):
         if fields["barcode"] == sku:
@@ -197,6 +198,11 @@ async def update(product_id: str, data: ItemUpdate, user: User | None = None) ->
     if not product:
         raise ItemError("Item not found", status=404)
     old_price, old_rpp = product.price, product.rpp
+    await _refuse_switched_off(data.model_dump(exclude_unset=True), {
+        "department": product.department, "category": product.category, "itemClass": product.item_class,
+        "subclass": product.subclass, "manufacturer": product.manufacturer, "brand": product.brand,
+        "unit": product.unit, "packUnit": product.pack_unit, "taxRate": product.tax_rate,
+    })
     changes = _to_model_fields(data.model_dump(exclude_unset=True))
     if changes.get("barcode"):
         if changes["barcode"] == product.sku:
@@ -280,16 +286,28 @@ async def replace_suppliers(product_id: str, links: list[ItemSupplierIn]) -> lis
 
 
 async def facets() -> dict[str, list[str]]:
-    async def distinct(column: str) -> list[str]:
-        values = await Product.filter(**{f"{column}__isnull": False}).distinct().order_by(column).limit(2000).values_list(column, flat=True)
-        return [v for v in values if v and v.strip()]
+    """What the Item form offers. The lists come from Godown > Item Lists (switched-on values only, so a value switched
+    off there stops being offered); variants aren't a list, so they are every variant already typed."""
+    from app.services import item_lists_service
 
+    values = await Product.filter(variant__isnull=False).distinct().order_by("variant").limit(2000).values_list("variant", flat=True)
+    lists = await item_lists_service.choices()
     return {
-        "departments": await distinct("department"), "categories": await distinct("category"),
-        "classes": await distinct("item_class"), "subclasses": await distinct("subclass"),
-        "manufacturers": await distinct("manufacturer"), "brands": await distinct("brand"),
-        "units": await distinct("unit"), "packUnits": await distinct("pack_unit"), "variants": await distinct("variant"),
+        "departments": lists["department"], "categories": lists["category"],
+        "classes": lists["class"], "subclasses": lists["subclass"],
+        "manufacturers": lists["manufacturer"], "brands": lists["brand"],
+        "units": lists["unit"], "packUnits": lists["pack-unit"], "variants": [v for v in values if v and v.strip()],
+        "taxRates": lists["gst-rate"],
     }
+
+
+async def _refuse_switched_off(values: dict, before: dict | None = None) -> None:
+    from app.services import item_lists_service
+
+    try:
+        await item_lists_service.refuse_switched_off(values, before)
+    except item_lists_service.ItemListError as exc:
+        raise ItemError(exc.message)
 
 
 async def lookup_by_code(code: str) -> tuple[Product, ProductAlias | None] | None:
@@ -374,7 +392,7 @@ def _num(raw: str | None, label: str) -> Decimal | None:
     try:
         return Decimal(raw.replace(",", ""))
     except InvalidOperation:
-        raise ValueError(f"{label} must be a number — this row has {raw!r}") from None
+        raise ValueError(f"{label} must be a number, but this row has {raw!r}") from None
 
 
 def _row_to_create(row: dict) -> ItemCreate:
@@ -473,7 +491,7 @@ async def import_aliases(filename: str, content: bytes) -> ImportSummary:
                 raise ValueError(f"Barcode {code} already rings up an Item")
             product_id = sku_to_id.get(item_code) if item_code else name_to_id.get(name.strip().upper())
             if not product_id:
-                raise ValueError(f"No Item {'with code ' + item_code if item_code else 'named ' + repr(name)} — import the Items first")
+                raise ValueError(f"No Item {'with code ' + item_code if item_code else 'named ' + repr(name)}. Import the Items first")
             qty_raw = cell_str_any(row, "qty", "Units per scan")
             seen.add(code)
             to_create.append(ProductAlias(

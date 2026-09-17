@@ -8,7 +8,11 @@ hold a free-text branch name on the frontend, which frontend-baseline.md §4 nam
 biggest structural gap on this side: nothing tied "Fort Colony" the requisition to "Fort Colony"
 the registered branch.
 """
+from decimal import Decimal
+
 from tortoise import fields, models
+from tortoise.functions import Sum
+from tortoise.signals import pre_save
 
 MOVEMENT_KINDS = ("receive", "dispatch", "count-correction", "adjust", "move")
 REQUISITION_STATUSES = ("pending", "approved", "rejected")
@@ -246,3 +250,34 @@ class BinMove(models.Model):
     class Meta:
         table = "warehouse_bin_moves"
         ordering = ["-at"]
+
+
+class StockBelowZero(Exception):
+    """A godown movement that would leave a bin holding less than nothing. Shown to the person as it is (409)."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+@pre_save(StockMovement)
+async def _never_below_zero(sender, instance: StockMovement, using_db, update_fields) -> None:
+    """The last line: whatever path wrote this movement, no bin may hold less than nothing. Dispatch, put-away and counts
+    check first with their own words; this catches anything that didn't."""
+    if instance._saved_in_db or instance.qty is None or Decimal(str(instance.qty)) >= 0:
+        return
+    qs = StockMovement.filter(product_id=instance.product_id, bin_id=instance.bin_id)
+    if using_db is not None:
+        qs = qs.using_db(using_db)
+    rows = await qs.annotate(total=Sum("qty")).values_list("total", flat=True)
+    held = Decimal(str(rows[0])) if rows and rows[0] is not None else Decimal("0")
+    if held + Decimal(str(instance.qty)) < Decimal("-0.0005"):
+        from app.models.catalog import Bin, Product
+
+        product = await Product.get_or_none(id=instance.product_id)
+        bin_ = await Bin.get_or_none(id=instance.bin_id)
+        name = product.name if product else "This Item"
+        where = bin_.label if bin_ else "This bin"
+        have = format(held.quantize(Decimal("0.001")).normalize(), "f")
+        need = format((-Decimal(str(instance.qty))).quantize(Decimal("0.001")).normalize(), "f")
+        raise StockBelowZero(f"{where} holds {have} of {name}, not enough to take {need}. Stock can't go below zero, so nothing was saved.")
