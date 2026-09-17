@@ -43,7 +43,7 @@ async def _loop() -> None:
 async def _replay_once() -> None:
     global _still_failing
 
-    from app.services import projector
+    from app.services import downstream_service, projector
 
     applied, failing = await projector.replay_failed()
     # Only when something changed. A permanently unapplicable event would otherwise write the same
@@ -52,6 +52,10 @@ async def _replay_once() -> None:
     if applied or failing != _still_failing:
         logs.log.info("sync: replayed failed branch events: %s applied, %s still failing", applied, failing)
     _still_failing = failing
+    # The other direction on the same timer: messages a branch couldn't apply go to it again.
+    resent = await downstream_service.resend_refused()
+    if resent:
+        logs.log.info("sync: %s message(s) a branch couldn't apply queued for it again", resent)
 
 
 async def _replay_loop() -> None:

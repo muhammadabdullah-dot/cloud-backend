@@ -253,6 +253,26 @@ async def approve_requisition(user: User, requisition_id: str) -> tuple[Requisit
         raise WarehouseError(exc.message) from exc
 
 
+async def _same_transfer_just_made(branch: Branch, lines: list[tuple[str, Decimal]], notes: str | None) -> Transfer | None:
+    """The same transfer to the same branch made in the last minute and not dispatched yet: a second click, a browser
+    retry or another tab. Head office doesn't record who made a transfer, so the branch, the Items, the quantities and
+    the note are what must match."""
+    from datetime import timedelta
+
+    since = datetime.now(timezone.utc) - timedelta(seconds=60)
+    wanted = sorted((str(product_id), Decimal(qty)) for product_id, qty in lines)
+    recent = await Transfer.filter(
+        branch=branch, source_branch_id__isnull=True, requisition_id__isnull=True, status="approved",
+    ).order_by("-requested_at").limit(5).prefetch_related("lines")
+    for earlier in recent:
+        at = earlier.requested_at if earlier.requested_at.tzinfo else earlier.requested_at.replace(tzinfo=timezone.utc)
+        if at < since:
+            break
+        if earlier.notes == ((notes or "").strip() or None) and sorted((str(l.product_id), l.qty_sent) for l in earlier.lines) == wanted:
+            return earlier
+    return None
+
+
 @atomic()
 async def create_transfer(user: User, branch_id: str, lines: list[tuple[str, Decimal]], notes: str | None) -> Transfer:
     """Head office decides to send stock to a branch without waiting for it to ask. Starts approved;
@@ -271,6 +291,9 @@ async def create_transfer(user: User, branch_id: str, lines: list[tuple[str, Dec
             raise WarehouseError("Every line needs a quantity above zero")
         if not await Product.exists(id=product_id):
             raise WarehouseError(f"Unknown product {product_id}")
+    duplicate = await _same_transfer_just_made(branch, lines, notes)
+    if duplicate:
+        return duplicate  # already made a moment ago; sending it twice would pick the stock twice
     now = datetime.now(timezone.utc)
     seq = await next_value("transfer", 45)
     # A branch with its own server says whether it can take the stock before anything is picked. One without a

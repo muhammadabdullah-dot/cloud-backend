@@ -14,6 +14,7 @@ from tortoise import Tortoise
 from tortoise.expressions import Q
 
 from app.controllers import executive_controller as xc
+from app.core.pk_time import pk_day
 from app.models import BranchDailyStat, BranchSnapshotRun, BranchStockAlert, Transfer, User
 from app.services import analytics_service as an
 from app.services import executive_service as ex
@@ -197,7 +198,8 @@ async def people(scope: xc.Scope) -> dict:
             me["discountsApproved"] += o["discTotal"] or D0
             me["discountsApprovedCount"] += 1
     for r in returns:
-        if r["cashier"]:
+        # Once per return, not once per line: a return of three Items is one return and one refund.
+        if r["cashier"] and r["firstLine"]:
             me = row(r["cashier"])
             me["returnsValue"] += r["refundTotal"] or D0
             me["returnsCount"] += 1
@@ -366,8 +368,7 @@ OPEN = ("requested", "approved", "dispatched", "in_transit")
 def _local_day(at: datetime | None):
     if at is None:
         return None
-    at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
-    return at.astimezone(ex.PKT).date()
+    return pk_day(at)
 
 
 async def _transfer_rows(branch_id: str) -> list[Transfer]:

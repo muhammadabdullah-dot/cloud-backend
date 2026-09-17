@@ -204,6 +204,27 @@ async def apply_from_branch(branch: Branch, payload: dict) -> str:
     return "ignored"
 
 
+async def _same_request_just_recorded(user: User, branch: Branch, source: Branch | None, rows: list) -> Requisition | None:
+    """The same phoned-in request, written down by the same person in the last minute and still waiting for a decision."""
+    from datetime import timedelta
+
+    since = _now() - timedelta(seconds=60)
+    wanted = sorted((str(product.id), Decimal(qty)) for product, qty, _, _ in rows)
+    for req in await Requisition.filter(branch=branch, status="pending").order_by("-requested_at").limit(5):
+        at = req.requested_at if req.requested_at.tzinfo else req.requested_at.replace(tzinfo=timezone.utc)
+        if at < since:
+            break
+        detail, lines = await _parts(req)
+        if (
+            detail is None or detail.origin != "head-office" or detail.requested_by_name != f"{user.name} (head office)"
+            or str(detail.source_branch_id or "") != (str(source.id) if source else "")
+        ):
+            continue
+        if sorted((str(l.product_id), l.qty_requested) for l in lines) == wanted:
+            return req
+    return None
+
+
 @atomic()
 async def record_for_branch(
     user: User, branch_id: str, source_branch_id: str | None, reason: str | None, needed_by: date | None,
@@ -226,6 +247,9 @@ async def record_for_branch(
         if not product:
             raise RequisitionError(f"Unknown Item {product_id}")
         rows.append((product, qty, None, None))
+    duplicate = await _same_request_just_recorded(user, branch, source, rows)
+    if duplicate:
+        return duplicate  # a second click, a browser retry or another tab: the branch asked once
     req = await _create(
         branch, None, rows, origin="head-office", source=source, reason=reason, needed_by=needed_by,
         requested_by=f"{user.name} (head office)", branch_number=None, requested_at=None,

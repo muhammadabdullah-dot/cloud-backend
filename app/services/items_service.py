@@ -19,6 +19,7 @@ from openpyxl.utils import get_column_letter
 from tortoise.expressions import Q
 from tortoise.transactions import atomic
 
+from app.core.pk_time import now_pk
 from app.models import (
     GRNLine, Product, ProductAlias, ProductAttachment, ProductPriceChange, ProductSupplier, StockMovement, Supplier, User,
 )
@@ -575,4 +576,4 @@ async def export_xlsx(include_costs: bool = True) -> tuple[bytes, str]:
         offset += 2000
         await asyncio.sleep(0)
     content = await asyncio.to_thread(_write_xlsx, rows, columns)
-    return content, f"godown-items-{datetime.now(timezone.utc):%Y%m%d-%H%M}.xlsx"
+    return content, f"godown-items-{now_pk():%Y%m%d-%H%M}.xlsx"

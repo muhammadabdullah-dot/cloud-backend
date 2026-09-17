@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from app.core.pk_time import day_start, pk_time, today_pk
 from app.models import CycleCount, Notice, NoticeRead, PurchaseOrder, Requisition, Transfer, User
 from app.services.rbac_service import effective_permissions
 
@@ -224,7 +225,7 @@ async def _purchasing(user: User, can) -> list[dict]:
         for po in await PurchaseOrder.filter(status__in=["approved", "partially_received"], expected_at__lt=_now()).prefetch_related("supplier"):
             out.append(_task(
                 f"po:{po.id}:late", "Purchasing", f"{po.po_number} from {po.supplier.name} is late",
-                f"Expected {_aware(po.expected_at):%d %b}. Receive what came against it, or chase the supplier.", "/warehouse/receiving", po.expected_at, timedelta(0),
+                f"Expected {pk_time(po.expected_at):%d %b}. Receive what came against it, or chase the supplier.", "/warehouse/receiving", po.expected_at, timedelta(0),
             ))
     if can("warehouse.purchase-orders", "W"):
         low = await purchasing_service.low_stock()
@@ -282,7 +283,7 @@ async def _low_stock_notice() -> None:
     """Once a day, tell the Executive how many godown Items are running low with nothing on order."""
     from app.services import purchasing_service
 
-    today = _now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = day_start(today_pk())
     if await Notice.filter(kind="stock.low", at__gte=today).exists():
         return
     low = await purchasing_service.low_stock()

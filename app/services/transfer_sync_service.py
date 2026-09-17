@@ -89,9 +89,14 @@ def _unit_cost(line: dict):
     return Decimal(str(value)) if value not in (None, "") else None
 
 
-async def publish(transfer: Transfer) -> None:
-    """Send the transfer as it now stands to the branch receiving it, and to the branch that sent it."""
+async def publish(transfer: Transfer, reinstated: bool = False) -> None:
+    """Send the transfer as it now stands to the branch receiving it, and to the branch that sent it.
+
+    `reinstated` says head office took back its own cancel because the sending branch had already dispatched it; only
+    then may the receiving branch put a shipment it has as cancelled back on its way."""
     state = await _state(transfer)
+    if reinstated:
+        state["reinstatedByHeadOffice"] = True
     destination = transfer.branch
     if destination.verified_at:
         await downstream_service.enqueue(str(destination.id), "transfer.inbound", {"transfer": state})
@@ -253,7 +258,15 @@ async def _branch_dispatched(branch: Branch, data: dict) -> str:
             return "duplicate"
         if str(existing.source_branch_id) != str(branch.id):
             raise TransferSyncError("Only the branch sending a transfer can dispatch it.")
+        # Head office cancelled it while the sending branch was already dispatching it. The stock has left that branch,
+        # so the cancel came too late: put the shipment back on its way instead of leaving the stock nowhere.
+        too_late_cancel = existing.status == "cancelled"
         existing.status = "dispatched"
+        if too_late_cancel:
+            existing.cancelled_at = None
+            earlier = (existing.notes or "").rstrip(". ")
+            undone = f"Cancel undone: {branch.name} had already dispatched it"
+            existing.notes = (f"{earlier}. {undone}" if earlier else undone)[:255]
         # The sending branch's cost when the stock actually left.
         costs = {str(l.get("sku")): _unit_cost(l) for l in data.get("lines") or []}
         for line in await TransferLine.filter(transfer=existing).prefetch_related("product"):
@@ -263,7 +276,15 @@ async def _branch_dispatched(branch: Branch, data: dict) -> str:
         existing.vehicle, existing.driver = data.get("vehicle") or existing.vehicle, data.get("driver") or existing.driver
         existing.dispatched_at = _dt(data.get("dispatchedAt")) or datetime.now(timezone.utc)
         await existing.save()
-        await publish(existing)
+        await publish(existing, reinstated=too_late_cancel)
+        if too_late_cancel:
+            await existing.fetch_related("branch")
+            await alerts_service.notify(
+                "transfer.cancel_too_late", f"{existing.transfer_number} had already left {branch.name}, so the cancel was undone",
+                body=f"{branch.name} dispatched it before the cancel reached them. It is on its way to {existing.branch.name} after all.",
+                link=LINK, audience_any=MANAGERS + EXECUTIVE, subject=("transfer", str(existing.id)), tone="bad",
+            )
+            return "dispatched-after-cancel"
         return "dispatched"
     destination = await Branch.get_or_none(code=str(data.get("destinationCode") or "").upper())
     if not destination:

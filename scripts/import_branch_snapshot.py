@@ -39,10 +39,8 @@ from app.models import (
     BranchTillClose,
 )
 
-# Branch trading days are stored shifted so the stored UTC hour maps to the branch's own local
-# clock +5. Converting here means the hour-of-day profile reads as real shop hours (09:00–20:00)
-# rather than as a UTC artefact nobody recognises.
-PKT_OFFSET_HOURS = 5
+# Times are stored as UTC instants; every day and hour here is the Pakistan one (date(at, '+5 hours'),
+# strftime('%H', at, '+5 hours')), so the hour-of-day profile reads as real shop hours (09:00 to 20:00).
 
 # A dashboard is a glance. A real catalog can put thousands of items under the low-stock line, so
 # only the most urgent are stored — `total_of_kind` carries the true count alongside.
@@ -69,7 +67,7 @@ def read_branch(db_path: Path) -> dict:
     q = lambda sql, *a: [dict(r) for r in conn.execute(sql, a).fetchall()]
 
     daily = q("""
-        SELECT date(at) AS day,
+        SELECT date(at, '+5 hours') AS day,
                COUNT(*)                         AS invoices,
                COALESCE(SUM(gross), 0)          AS gross_sales,
                COALESCE(SUM(disc_total), 0)     AS disc_total,
@@ -80,59 +78,59 @@ def read_branch(db_path: Path) -> dict:
                COUNT(DISTINCT CASE WHEN party_id IS NOT NULL THEN party_id END)     AS named_customers,
                MIN(at) AS first_sale_at,
                MAX(at) AS last_sale_at
-        FROM sale_records GROUP BY date(at)
+        FROM sale_records GROUP BY date(at, '+5 hours')
     """)
 
     items = q("""
-        SELECT date(s.at) AS day, COALESCE(SUM(sl.qty), 0) AS items_sold
+        SELECT date(s.at, '+5 hours') AS day, COALESCE(SUM(sl.qty), 0) AS items_sold
         FROM sale_lines sl JOIN sale_records s ON s.id = sl.sale_id
-        GROUP BY date(s.at)
+        GROUP BY date(s.at, '+5 hours')
     """)
 
     # Cost of goods sold, from each product's weighted-average cost at import time. An exact
     # figure would need the cost captured on the sale line itself, which the branch does not
     # record — noted rather than silently presented as exact.
     cogs = q("""
-        SELECT date(s.at) AS day, COALESCE(SUM(sl.qty * COALESCE(p.avg_cost, 0)), 0) AS cogs
+        SELECT date(s.at, '+5 hours') AS day, COALESCE(SUM(sl.qty * COALESCE(p.avg_cost, 0)), 0) AS cogs
         FROM sale_lines sl
         JOIN sale_records s ON s.id = sl.sale_id
         JOIN products p ON p.id = sl.product_id
-        GROUP BY date(s.at)
+        GROUP BY date(s.at, '+5 hours')
     """)
 
     returns = q("""
-        SELECT date(at) AS day, COUNT(*) AS returns_count,
+        SELECT date(at, '+5 hours') AS day, COUNT(*) AS returns_count,
                COALESCE(SUM(refund_total), 0) AS returns_value
-        FROM return_records GROUP BY date(at)
+        FROM return_records GROUP BY date(at, '+5 hours')
     """)
 
     tills = q("""
-        SELECT date(closed_at) AS day, COUNT(*) AS tills_closed,
+        SELECT date(closed_at, '+5 hours') AS day, COUNT(*) AS tills_closed,
                COALESCE(SUM(variance), 0) AS till_variance
-        FROM till_sessions WHERE closed_at IS NOT NULL GROUP BY date(closed_at)
+        FROM till_sessions WHERE closed_at IS NOT NULL GROUP BY date(closed_at, '+5 hours')
     """)
 
     cash = q("""
-        SELECT date(at) AS day,
+        SELECT date(at, '+5 hours') AS day,
                COALESCE(SUM(CASE WHEN kind = 'in'  THEN amount ELSE 0 END), 0) AS cash_in,
                COALESCE(SUM(CASE WHEN kind = 'out' THEN amount ELSE 0 END), 0) AS cash_out
-        FROM cash_movements GROUP BY date(at)
+        FROM cash_movements GROUP BY date(at, '+5 hours')
     """)
 
     staff = q("""
-        SELECT date(at) AS day, COUNT(DISTINCT cashier_id) AS staff_on_duty
-        FROM sale_records GROUP BY date(at)
+        SELECT date(at, '+5 hours') AS day, COUNT(DISTINCT cashier_id) AS staff_on_duty
+        FROM sale_records GROUP BY date(at, '+5 hours')
     """)
 
     cashiers = q("""
-        SELECT date(s.at) AS day, u.name AS cashier_name,
+        SELECT date(s.at, '+5 hours') AS day, u.name AS cashier_name,
                COUNT(*) AS invoices, COALESCE(SUM(s.net_value), 0) AS net_sales
         FROM sale_records s JOIN users u ON u.id = s.cashier_id
-        GROUP BY date(s.at), u.name
+        GROUP BY date(s.at, '+5 hours'), u.name
     """)
 
     products = q("""
-        SELECT date(s.at) AS day, p.sku AS product_sku, p.name AS product_name,
+        SELECT date(s.at, '+5 hours') AS day, p.sku AS product_sku, p.name AS product_name,
                p.department, p.category, p.brand,
                COALESCE(SUM(sl.qty), 0) AS qty,
                COALESCE(SUM(sl.qty * sl.unit_price), 0) AS net_sales,
@@ -140,7 +138,7 @@ def read_branch(db_path: Path) -> dict:
         FROM sale_lines sl
         JOIN sale_records s ON s.id = sl.sale_id
         JOIN products p ON p.id = sl.product_id
-        GROUP BY date(s.at), p.sku
+        GROUP BY date(s.at, '+5 hours'), p.sku
     """)
 
     # Stock value at sale price, folded over the whole ledger — the same figure the Branch App's
@@ -166,29 +164,29 @@ def read_branch(db_path: Path) -> dict:
 
     # ── the grain a drill-down lands on ─────────────────────────────────────
     hourly = q("""
-        SELECT date(at) AS day, cast(strftime('%H', at) AS int) AS utc_hour,
+        SELECT date(at, '+5 hours') AS day, cast(strftime('%H', at, '+5 hours') AS int) AS pk_hour,
                COUNT(*) AS invoices, COALESCE(SUM(net_value), 0) AS net_sales
-        FROM sale_records GROUP BY date(at), utc_hour
+        FROM sale_records GROUP BY date(at, '+5 hours'), pk_hour
     """)
 
     till_closes = q("""
-        SELECT date(s.closed_at) AS day, s.session_number, u.name AS cashier_name,
+        SELECT date(s.closed_at, '+5 hours') AS day, s.session_number, u.name AS cashier_name,
                s.opened_at, s.closed_at, s.opening_float, s.net_cash, s.counted_cash, s.variance
         FROM till_sessions s LEFT JOIN users u ON u.id = s.opened_by_id
         WHERE s.closed_at IS NOT NULL
     """)
 
     tenders = q("""
-        SELECT date(s.at) AS day, t.code, COALESCE(m.name, t.code) AS name,
+        SELECT date(s.at, '+5 hours') AS day, t.code, COALESCE(m.name, t.code) AS name,
                COUNT(*) AS uses, COALESCE(SUM(t.amount), 0) AS amount
         FROM sale_tenders t
         JOIN sale_records s ON s.id = t.sale_id
         LEFT JOIN payment_methods m ON m.code = t.code
-        GROUP BY date(s.at), t.code
+        GROUP BY date(s.at, '+5 hours'), t.code
     """)
 
     overrides = q("""
-        SELECT date(s.at) AS day, s.invoice_number, s.at,
+        SELECT date(s.at, '+5 hours') AS day, s.invoice_number, s.at,
                c.name AS cashier_name, a.name AS approved_by,
                s.gross, s.disc_total, s.net_value
         FROM sale_records s
@@ -198,7 +196,7 @@ def read_branch(db_path: Path) -> dict:
     """)
 
     return_rows = q("""
-        SELECT date(r.at) AS day, r.at, s.invoice_number AS against_invoice,
+        SELECT date(r.at, '+5 hours') AS day, r.at, s.invoice_number AS against_invoice,
                u.name AS cashier_name, r.refund_total,
                p.name AS product_name, p.sku AS product_sku, rl.qty
         FROM return_records r
@@ -337,7 +335,7 @@ async def import_branch(code: str, db_path: Path) -> None:
 
     await BranchHourlyStat.bulk_create([
         BranchHourlyStat(
-            branch=branch, day=r["day"], hour=(r["utc_hour"] + PKT_OFFSET_HOURS) % 24,
+            branch=branch, day=r["day"], hour=r["pk_hour"],
             invoices=r["invoices"], net_sales=_dec(r["net_sales"]),
         ) for r in data["hourly"]
     ], batch_size=500)

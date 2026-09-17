@@ -15,6 +15,7 @@ from decimal import Decimal
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 
+from app.core.pk_time import pk_time
 from app.schemas.executive import (
     Crumb,
     DetailSection,
@@ -1974,7 +1975,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
         rows = await ex.daily_breakdown(period, bid) if branch else []
         notes = [
             f"Registered {branch.code} · {branch.city or 'city not set'} · status {branch.status}.",
-            "Last reported " + (branch.last_seen_at.strftime("%d %b %Y %H:%M") if branch.last_seen_at else "never") + ".",
+            "Last reported " + (pk_time(branch.last_seen_at).strftime("%d %b %Y %H:%M") if branch.last_seen_at else "never") + ".",
             "Everything this page opens stays at this branch: its days, its Items, its people and its classes. "
             "Choose All branches above to go back to the whole company.",
         ] if branch else [

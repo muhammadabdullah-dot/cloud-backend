@@ -24,6 +24,7 @@ from decimal import Decimal
 from tortoise.exceptions import ValidationError
 from tortoise.functions import Count, Sum
 
+from app.core.pk_time import PKT, today_pk
 from app.models import (
     Bin,
     Branch,
@@ -58,12 +59,11 @@ def _money(v: Decimal) -> Decimal:
     return v.quantize(_CENTS)
 
 # Pakistan is UTC+5 with no daylight saving, and branch trading days are stored against that
-# local day. Using the server's UTC date would roll the business date over five hours early.
-PKT = timezone(timedelta(hours=5))
+# local day. Using the server's UTC date would roll the business date over five hours early (core/pk_time.py).
 
 
 def business_today() -> date:
-    return datetime.now(PKT).date()
+    return today_pk()
 
 
 # ── periods ─────────────────────────────────────────────────────────────────
@@ -812,12 +812,22 @@ async def discount_overrides(period: Period, approver: str | None = None, branch
 
 
 async def returns_detail(period: Period, branch_id: str | None = None) -> list[dict]:
+    """One row per line taken back. A branch sends the whole return's refund on every line of it, so the refund sits on
+    the return's first line only (the lines after it show none) and `firstLine` marks the row to count a return by.
+    A return is its branch, its time, the bill it was against and who took it."""
     qs = _in(BranchReturn.filter(day__gte=period.start, day__lte=period.end), branch_id)
-    return [{
-        "at": r.at, "day": r.day.isoformat(), "againstInvoice": r.against_invoice,
-        "cashier": r.cashier_name, "productName": r.product_name, "productSku": r.product_sku,
-        "qty": r.qty, "refundTotal": r.refund_total,
-    } for r in await qs.order_by("-at")]
+    seen: set[tuple] = set()
+    out = []
+    for r in await qs.order_by("-at"):
+        key = (str(r.branch_id), r.at, r.against_invoice, r.cashier_name)
+        first = key not in seen
+        seen.add(key)
+        out.append({
+            "at": r.at, "day": r.day.isoformat(), "againstInvoice": r.against_invoice,
+            "cashier": r.cashier_name, "productName": r.product_name, "productSku": r.product_sku,
+            "qty": r.qty, "refundTotal": r.refund_total if first else None, "firstLine": first,
+        })
+    return out
 
 
 async def credit_customers(branch_id: str | None = None) -> list[dict]:

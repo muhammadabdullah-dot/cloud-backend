@@ -10,9 +10,12 @@ The console keeps printing one line per problem, as before; the file is what out
 import logging
 import logging.handlers
 import secrets
+import time
+from datetime import datetime
 from pathlib import Path
 
 from app.core.config import settings
+from app.core.pk_time import PKT
 
 LOGGER_NAME = "dmarina"
 MAX_BYTES = 5 * 1024 * 1024
@@ -48,6 +51,11 @@ class _OneCopyOfEachError(logging.Filter):
         return not record.getMessage().startswith("Exception in ASGI application")
 
 
+def _pakistan_clock(seconds: float | None) -> time.struct_time:
+    """Log times on the Pakistan clock, whatever zone the server machine's own clock is set to."""
+    return datetime.fromtimestamp(time.time() if seconds is None else seconds, PKT).timetuple()
+
+
 class _ConsoleFormat(logging.Formatter):
     """One line on the console, the way the server always printed; the traceback goes to the file only."""
 
@@ -66,7 +74,9 @@ def setup() -> Path:
         folder = log_dir()
         folder.mkdir(parents=True, exist_ok=True)
         _file_handler = logging.handlers.RotatingFileHandler(log_file(), maxBytes=MAX_BYTES, backupCount=KEEP, encoding="utf-8", delay=True)
-        _file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S"))
+        file_format = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
+        file_format.converter = _pakistan_clock
+        _file_handler.setFormatter(file_format)
         _file_handler.addFilter(_OneCopyOfEachError())
         console = logging.StreamHandler()
         console.setFormatter(_ConsoleFormat())

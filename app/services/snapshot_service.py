@@ -344,18 +344,33 @@ async def apply_stock_changes(branch: Branch, rows: list[dict]) -> dict:
 
 
 async def complete_stock(branch: Branch, snapshot_id: str) -> dict:
-    """The branch says the picture is whole. Promote it and drop every earlier generation."""
+    """The branch says the picture is whole. Promote it and drop the generations it replaces: the ones
+    started before it. One started after it is left alone while it is still arriving; and if one of
+    those is already complete, this picture is the out-of-date one and is dropped instead, so the
+    current picture never goes back in time."""
     async with in_transaction():
         kept = await BranchProductStock.filter(branch=branch, snapshot_id=snapshot_id).count()
-        await BranchProductStock.filter(branch=branch).exclude(snapshot_id=snapshot_id).delete()
         run = await BranchSnapshotRun.get_or_none(branch=branch, snapshot_id=snapshot_id)
+        started = run.started_at if run else datetime.now(timezone.utc)
+        newer = await BranchSnapshotRun.filter(branch=branch, started_at__gt=started).exclude(snapshot_id=snapshot_id)
+        if any(r.status == "complete" for r in newer):
+            await BranchProductStock.filter(branch=branch, snapshot_id=snapshot_id).delete()
+            if run:
+                await run.delete()
+            logs.log.warning(
+                "stock list %s from %s finished after a newer one and was dropped", snapshot_id, branch.code,
+            )
+            return {"stockRows": kept}
+        await BranchProductStock.filter(branch=branch).exclude(
+            snapshot_id__in=[snapshot_id, *(r.snapshot_id for r in newer)],
+        ).delete()
         if run:
             run.status = "complete"
             run.completed_at = datetime.now(timezone.utc)
             run.stock_rows = kept
             await run.save()
         # Superseded runs are history, not clutter — but only the last few are interesting.
-        stale = await BranchSnapshotRun.filter(branch=branch).exclude(snapshot_id=snapshot_id).order_by("-started_at")
+        stale = await BranchSnapshotRun.filter(branch=branch, started_at__lt=started).exclude(snapshot_id=snapshot_id).order_by("-started_at")
         for old in stale[5:]:
             await old.delete()
     return {"stockRows": kept}

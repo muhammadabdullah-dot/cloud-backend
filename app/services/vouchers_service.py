@@ -18,6 +18,7 @@ from decimal import Decimal
 
 from tortoise.transactions import atomic
 
+from app.core.pk_time import pk_day
 from app.models import HEAD_OFFICE_BOOK, Account, AccountsSettings, User, Voucher, VoucherLine, next_value
 from app.services import accounts_areas
 from app.services.accounts_chart_service import money
@@ -171,7 +172,7 @@ def _parse_date(value) -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     if isinstance(value, datetime):
-        return value.date()
+        return value.date() if value.tzinfo is None else pk_day(value)
     try:
         return date.fromisoformat(str(value)[:10])
     except ValueError as exc:

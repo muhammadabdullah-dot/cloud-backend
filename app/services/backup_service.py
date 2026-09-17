@@ -32,10 +32,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.config import settings
+from app.core.pk_time import PKT
 
 APP_ID = "dmarina-cloud-server"
 APP_LABEL = "head office"
-PKT = timezone(timedelta(hours=5))
 FORMAT = 1
 NAME_RE = re.compile(r"^DMARINA-[A-Za-z0-9_-]+-\d{8}-\d{6}-(manual|automatic|before-restore|uploaded)\.zip$")
 KINDS = ("manual", "automatic", "before-restore", "uploaded")

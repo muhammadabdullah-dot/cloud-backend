@@ -224,7 +224,11 @@ async def ingest(branch: Branch, events: list[dict]) -> tuple[SyncRun, list[str]
             # Projected straight away so a receipt or a staff change takes effect at head office on the
             # same push. A projection failure is recorded on the event and never un-acknowledges it.
             from app.services import projector
-            await projector.project(branch, stored)
+            try:
+                await projector.project(branch, stored)
+            except Exception as exc:  # noqa: BLE001 (the event is stored and acknowledged all the same)
+                # Counted once, as accepted: it is here. Still 'stored' or 'failed', the replay picks it up.
+                logs.log.error("sync: event %s from %s stored but not applied yet", event_id, branch.code, exc_info=exc)
         except IntegrityError:
             # The unique_together did its job. This event is already stored — which, from the
             # branch's point of view, is a success: it is on the Cloud.

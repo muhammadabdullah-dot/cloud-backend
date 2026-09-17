@@ -5,12 +5,14 @@ itself: each field is cut to a sensible length and one device can send at most 3
 """
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel, Field
 
 from app.core import logs
+from app.core.pk_time import pk_time
 from app.middlewares.error_handler import describe_caller
 
 router = APIRouter(tags=["client-errors"])
@@ -36,6 +38,14 @@ def _cut(value: str | None, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
+def _seen(value: str | None) -> str:
+    """When the browser saw it, on the Pakistan clock when it is a time this can read (a browser sends UTC)."""
+    try:
+        return pk_time(datetime.fromisoformat((value or "").strip())).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _cut(value, 40)
+
+
 @router.post("/client-errors", status_code=status.HTTP_204_NO_CONTENT)
 async def report_client_error(payload: ClientErrorIn, request: Request) -> Response:
     source = request.headers.get("x-device-id") or (request.client.host if request.client else "unknown")
@@ -53,7 +63,7 @@ async def report_client_error(payload: ClientErrorIn, request: Request) -> Respo
         f"  {_cut(payload.message, 1000) or '(no message)'}",
     ]
     if payload.at or payload.userAgent:
-        lines.append(f"  seen {_cut(payload.at, 40)} in {_cut(payload.userAgent, 300)}")
+        lines.append(f"  seen {_seen(payload.at)} in {_cut(payload.userAgent, 300)}")
     if payload.stack:
         lines.append("  stack:\n" + _cut(payload.stack, 8000))
     if payload.componentStack:

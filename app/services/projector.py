@@ -7,6 +7,9 @@ office's handling of it, which is ours to fix and replay, not the branch's to re
 
 Event types with no projector yet stay `stored`, untouched, for a later projection to pick up.
 """
+from datetime import datetime, timedelta, timezone
+
+from tortoise.expressions import Q
 from tortoise.transactions import in_transaction
 
 from app.core import logs
@@ -17,6 +20,10 @@ PROJECTED = (
     "Staff", "Transfer", "Member", "LoyaltyEntry", "LoyaltySettings", "Activity", "AccChart", "AccVoucher", "AccSettings",
     "Supplier", "SupplierList",
 )
+# How long an event of a kind head office applies may read 'stored' before the replay takes it as
+# left behind. A push stores and applies each event within moments; minutes means head office stopped
+# in between.
+STORED_GRACE = timedelta(minutes=2)
 
 
 def _mirror_error():
@@ -48,15 +55,15 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
             elif event.aggregate_type == "AccChart":
                 from app.services import accounts_mirror_service
 
-                await accounts_mirror_service.apply_chart(branch, event.payload or {})
+                await accounts_mirror_service.apply_chart(branch, event.payload or {}, event)
             elif event.aggregate_type == "AccVoucher":
                 from app.services import accounts_mirror_service
 
-                await accounts_mirror_service.apply_voucher(branch, event.payload or {})
+                await accounts_mirror_service.apply_voucher(branch, event.payload or {}, event)
             elif event.aggregate_type == "AccSettings":
                 from app.services import accounts_mirror_service
 
-                await accounts_mirror_service.apply_settings(branch, event.payload or {})
+                await accounts_mirror_service.apply_settings(branch, event.payload or {}, event)
             elif event.aggregate_type == "LoyaltySettings":
                 await loyalty_service.apply_settings(branch, (event.payload or {}).get("settings") or {})
             elif event.aggregate_type == "Supplier":
@@ -71,8 +78,12 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
                 payload = dict(event.payload or {})
                 payload.setdefault("transferId", event.aggregate_id)
                 await transfer_sync_service.project(branch, payload)
-        event.status = "applied"
-        event.apply_error = None
+            # In the same transaction as the change itself, so an event is never applied here while
+            # still reading 'stored', which the replay would take as never applied and apply again.
+            event.status = "applied"
+            event.apply_error = None
+            await event.save(update_fields=["status", "apply_error"])
+        return
     except (
         staff_sync_service.StaffError, transfer_sync_service.TransferSyncError, loyalty_service.LoyaltyError, _mirror_error(),
         _supplier_error(),
@@ -110,11 +121,23 @@ async def _store_activity(branch: Branch, data: dict) -> None:
 async def replay_failed() -> tuple[int, int]:
     """Try every failed Staff and Transfer event again, oldest first — after a fix to head office's
     handling, the receipts and account changes it couldn't apply take effect without any branch
-    resending. Returns (applied now, still failing)."""
+    resending. Returns (applied now, still failing).
+
+    Also picks up events of a kind head office applies that are still 'stored': head office stopped
+    between storing one and applying it. Only after `STORED_GRACE`, so an event a push is applying
+    right now isn't applied twice."""
     applied = failing = 0
-    events = await SyncInboxEvent.filter(status="failed", aggregate_type__in=list(PROJECTED)).order_by("received_at").prefetch_related("branch")
+    settled_before = datetime.now(timezone.utc) - STORED_GRACE
+    events = await (
+        SyncInboxEvent.filter(aggregate_type__in=list(PROJECTED))
+        .filter(Q(status="failed") | Q(status="stored", received_at__lt=settled_before))
+        .order_by("received_at").prefetch_related("branch")
+    )
     for event in events:
-        await project(event.branch, event)
+        try:
+            await project(event.branch, event)
+        except Exception as exc:  # noqa: BLE001 (one event that can't even be marked must not stop the rest)
+            logs.log.error("sync: replaying %s event %s failed", event.aggregate_type, event.id, exc_info=exc)
         if event.status == "applied":
             applied += 1
         else:

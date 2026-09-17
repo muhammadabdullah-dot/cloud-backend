@@ -11,19 +11,17 @@ from decimal import Decimal
 
 from tortoise import Tortoise
 
+from app.core.pk_time import PKT, pk_day  # noqa: F401  (PKT is imported from here by other services)
 from app.models import HEAD_OFFICE_BOOK, Account, AccountCategory, AccountGroup, AccountType, Voucher
 from app.services.accounts_chart_service import money
 
 ZERO = Decimal("0")
-PKT = timezone(timedelta(hours=5))
 ALL = "ALL"
 
 
 def shop_day(at: datetime | None = None) -> date:
-    at = at or datetime.now(timezone.utc)
-    if at.tzinfo is None:
-        at = at.replace(tzinfo=timezone.utc)
-    return at.astimezone(PKT).date()
+    """The Pakistan day an instant falls on, today when none is given (core/pk_time.py)."""
+    return pk_day(at)
 
 
 def _d(value) -> Decimal:

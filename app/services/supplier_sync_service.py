@@ -30,6 +30,8 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
+from tortoise.transactions import atomic
+
 from app.core import logs
 from app.models import Branch, BranchMessage, Counter, Supplier, SupplierBranchLink, SupplierQuestion, User
 from app.services import downstream_service
@@ -495,10 +497,15 @@ async def branch_status(branch: Branch) -> dict:
 
 # ── a person's answer ────────────────────────────────────────────────────────────────────────────
 
+@atomic()
 async def answer(question_id: str, answer_kind: str, supplier_id: str | None, user: User) -> SupplierQuestion:
+    """All in one go: a failure part way leaves no extra supplier on the list, and a second click (or a second person
+    answering at the same time) finds the question already answered instead of adding the supplier again."""
     question = await SupplierQuestion.get_or_none(id=question_id)
     if question is None or question.status != "open":
         raise SupplierSyncError("That question has already been answered.", 409)
+    if answer_kind in ("same", "different") and await SupplierBranchLink.exists(branch_id=question.branch_id, branch_supplier_id=question.branch_supplier_id):
+        raise SupplierSyncError("That branch's supplier is already on the list, so this question has been settled.", 409)
     branch = await Branch.get(id=question.branch_id)
     data = dict(question.branch_supplier or {})
     chosen: Supplier | None = None

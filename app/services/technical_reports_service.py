@@ -27,6 +27,7 @@ from pathlib import Path
 from tortoise.expressions import Q
 
 from app.core import logs
+from app.core.pk_time import PKT
 from app.models import Branch, BranchMessage, BranchSnapshotRun, SyncInboxEvent, SyncRun
 
 # ---------------------------------------------------------------------------------------------
@@ -188,7 +189,7 @@ def _scan(*, q: str | None, day: date | None, kind: str | None, limit: int, key:
         if day is not None:
             try:
                 # A file last written before the day holds nothing from it, and every older file is older still.
-                if datetime.fromtimestamp(path.stat().st_mtime).date() < day:
+                if datetime.fromtimestamp(path.stat().st_mtime, PKT).date() < day:
                     break
             except OSError:
                 continue
