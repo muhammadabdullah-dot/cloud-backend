@@ -59,6 +59,8 @@ RESOURCES: list[str] = [
     # The Item master: viewing it, and adding / editing / importing Items and their files.
     "warehouse.items",
     "warehouse.items.manage",
+    # Every change to a godown Item's prices, cost and discount, who made it and where it came from.
+    "warehouse.price-changes",
     # The company's supplier list: seeing it, and adding / changing / importing suppliers (every branch gets them).
     "warehouse.suppliers",
     "warehouse.suppliers.manage",
@@ -126,6 +128,7 @@ ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
             "warehouse.counts.approve",       # whoever counts must not accept the variance
             "warehouse.decisions",
             "warehouse.items.manage",
+            "warehouse.price-changes",        # prices and costs over time: the manager's
             "warehouse.suppliers.manage",
             "warehouse.bins.manage",
             "warehouse.item-lists",

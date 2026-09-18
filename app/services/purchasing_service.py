@@ -301,3 +301,239 @@ async def low_stock() -> list[dict]:
         if held <= p.reorder_level and on_order.get(str(p.id), ZERO) <= ZERO:
             out.append({"productId": str(p.id), "sku": p.sku, "name": p.name, "onHand": held, "reorderLevel": p.reorder_level, "avgCost": p.avg_cost})
     return sorted(out, key=lambda r: (r["onHand"] - r["reorderLevel"], r["name"]))
+
+
+# ── suggestions: what to put on an order, by plain rules ─────────────────────────────────────────
+#
+# Quantity to order = what the branches sell in the cover days (from their last 30 days of sales), or the Item's reorder
+# level if that is higher, less what the godown holds and what is already on open orders, rounded up to whole packs.
+# Choosing a supplier suggests the Items bought from them before (earlier orders, GRNs and the Item's supplier list);
+# without a supplier, the Items running low.
+
+SALES_WINDOW_DAYS = 30
+SHORT_DAYS = 7
+MAX_SUGGESTIONS = 300
+
+
+def _num(v: Decimal) -> str:
+    """A quantity in words: 12, 1.5, never 12.000."""
+    v = Decimal(v)
+    if v == v.to_integral_value():
+        return f"{int(v):,}"
+    return f"{v.quantize(Decimal('0.1')).normalize():f}"
+
+
+def rate_words(rate: Decimal, who: str = "sells") -> str:
+    """How fast an Item goes, the way a person would say it."""
+    if rate <= 0:
+        return f"no sales in the last {SALES_WINDOW_DAYS} days"
+    if rate >= 1:
+        return f"{who} {_num(rate if rate >= 10 else rate.quantize(Decimal('0.1')))} a day"
+    week = rate * 7
+    if week >= 1:
+        return f"{who} about {_num(week.quantize(Decimal('0.1')) if week < 10 else week.quantize(Decimal('1')))} a week"
+    return f"{who} about {_num(max(Decimal('1'), (rate * 30).quantize(Decimal('1'))))} a month"
+
+
+def round_up(need: Decimal, pack_size: int | None, weighed: bool = False) -> tuple[Decimal, str | None]:
+    """Round what is needed up to what can be bought: whole packs when the pack size is known, whole units otherwise
+    (half a unit for a weighed Item). Gives the quantity and, when packs changed it, how."""
+    import math
+
+    if need <= 0:
+        return ZERO, None
+    if pack_size and pack_size > 1:
+        packs = math.ceil(need / Decimal(pack_size))
+        qty = Decimal(packs * pack_size)
+        return qty, (f"rounded up to {packs} full pack{'s' if packs != 1 else ''} of {pack_size}" if qty != need else None)
+    if weighed:
+        return Decimal(math.ceil(need * 2)) / 2, None
+    return Decimal(math.ceil(need)), None
+
+
+def suggest_line(rate: Decimal, held: Decimal, on_order: Decimal, reorder_level: Decimal | None, cover_days: int,
+                 pack_size: int | None = None, weighed: bool = False, who: str = "sells", holder: str = "holds") -> dict:
+    """The suggested quantity for one Item and the reasoning in plain words."""
+    by_sales = rate * cover_days
+    level = reorder_level if reorder_level and reorder_level > 0 else ZERO
+    target = max(by_sales, level)
+    need = target - held - on_order
+    qty, packed = round_up(need, pack_size, weighed)
+    parts = [rate_words(rate, who), f"{holder} {_num(held)}"]
+    if on_order > 0:
+        parts.append(f"{_num(on_order)} already on order")
+    if rate > 0:
+        parts.append(f"{cover_days} days of cover needs {_num(by_sales.quantize(Decimal('1')) if by_sales >= 10 else by_sales.quantize(Decimal('0.1')))}")
+    if level > by_sales:
+        parts.append(f"keeps at least its reorder level of {_num(level)}")
+    if qty > 0:
+        parts.append(f"so order {_num(qty)}" + (f" ({packed})" if packed else ""))
+    elif target <= 0:
+        parts.append("so nothing is suggested")
+    else:
+        parts.append("enough for now")
+    return {"rate": rate, "target": target, "qty": qty, "reason": ", ".join(parts)}
+
+
+async def _branch_sales_rates(skus: list[str]) -> dict[str, Decimal]:
+    """Units a day the branches sell of each code, together: each branch's sales over the last 30 days it reported,
+    divided by the days it reported."""
+    from datetime import timedelta
+
+    from tortoise import Tortoise
+
+    from app.core.pk_time import today_pk
+
+    if not skus:
+        return {}
+    since = str(today_pk() - timedelta(days=SALES_WINDOW_DAYS))
+    conn = Tortoise.get_connection("default")
+    days = {str(r["branch_id"]): int(r["days"] or 0) for r in await conn.execute_query_dict(
+        "SELECT branch_id, COUNT(DISTINCT day) AS days FROM branch_daily_stats WHERE day > ? GROUP BY branch_id", [since])}
+    rates: dict[str, Decimal] = {}
+    for i in range(0, len(skus), 500):
+        chunk = skus[i:i + 500]
+        for r in await conn.execute_query_dict(
+            f"SELECT branch_id, product_sku, SUM(CAST(qty AS REAL)) AS qty FROM branch_product_stats "
+            f"WHERE day > ? AND product_sku IN ({','.join('?' * len(chunk))}) GROUP BY branch_id, product_sku", [since, *chunk],
+        ):
+            d = days.get(str(r["branch_id"]), 0)
+            if d > 0 and (r["qty"] or 0) > 0:
+                rates[r["product_sku"]] = rates.get(r["product_sku"], ZERO) + Decimal(str(r["qty"])) / d
+    return rates
+
+
+async def _dispatch_rates(product_ids: list[str]) -> dict[str, Decimal]:
+    """Units a day the godown sends out to branches of each Item: its last 30 days of dispatches over those days (fewer
+    for a godown that started keeping stock more recently)."""
+    from datetime import timedelta
+
+    from tortoise import Tortoise
+
+    from app.core.pk_time import day_start, today_pk
+
+    if not product_ids:
+        return {}
+    conn = Tortoise.get_connection("default")
+    first = await conn.execute_query_dict("SELECT MIN(at) AS first FROM warehouse_stock_movements", [])
+    if not first or not first[0]["first"]:
+        return {}
+    try:
+        from app.core.pk_time import pk_day
+
+        began = pk_day(datetime.fromisoformat(str(first[0]["first"]).replace("Z", "+00:00")))
+    except ValueError:
+        began = today_pk() - timedelta(days=SALES_WINDOW_DAYS)
+    start = max(today_pk() - timedelta(days=SALES_WINDOW_DAYS - 1), began)
+    days = max((today_pk() - start).days + 1, 1)
+    since = day_start(start).strftime("%Y-%m-%d %H:%M:%S")
+    out: dict[str, Decimal] = {}
+    for i in range(0, len(product_ids), 500):
+        chunk = product_ids[i:i + 500]
+        for r in await conn.execute_query_dict(
+            "SELECT product_id, -SUM(CAST(qty AS REAL)) AS sent FROM warehouse_stock_movements "
+            f"WHERE kind = 'dispatch' AND at >= ? AND product_id IN ({','.join('?' * len(chunk))}) GROUP BY product_id", [since, *chunk],
+        ):
+            if (r["sent"] or 0) > 0:
+                out[str(r["product_id"])] = Decimal(str(r["sent"])) / days
+    return out
+
+
+async def _branches_hold(skus: list[str]) -> dict[str, Decimal]:
+    from app.services import items_service
+
+    out: dict[str, Decimal] = {}
+    lists = await items_service.latest_branch_lists()
+    for i in range(0, len(skus), 500):
+        for r in await items_service.branch_rows(lists, skus=skus[i:i + 500], limit=50000):
+            out[r["product_sku"]] = out.get(r["product_sku"], ZERO) + max(Decimal(str(r["qty"] or 0)), ZERO)
+    return out
+
+
+async def _on_order(product_ids: list[str], exclude_order_id: str | None) -> dict[str, Decimal]:
+    qs = PurchaseOrderLine.filter(purchase_order__status__in=list(OPEN), product_id__in=product_ids)
+    if exclude_order_id:
+        qs = qs.exclude(purchase_order_id=exclude_order_id)
+    out: dict[str, Decimal] = {}
+    for pid, qty, got in await qs.values_list("product_id", "qty", "received_qty"):
+        out[str(pid)] = out.get(str(pid), ZERO) + max(Decimal(str(qty)) - Decimal(str(got)), ZERO)
+    return out
+
+
+async def suggestions(supplier_id: str | None, cover_days: int = 30, exclude_order_id: str | None = None) -> dict:
+    """With a supplier: the Items bought from them before, each with a suggested quantity and why. Without one: the
+    godown Items running low (at or below their reorder level, or lasting under a week at the branches' rate)."""
+    from tortoise.functions import Sum
+
+    from app.models import GRNLine, ProductSupplier, StockMovement
+
+    cover_days = min(max(int(cover_days or 30), 1), 365)
+    supplier = None
+    last_cost: dict[str, tuple[datetime, Decimal]] = {}
+    source: dict[str, str] = {}
+    if supplier_id:
+        supplier = await Supplier.get_or_none(id=supplier_id)
+        if not supplier:
+            raise PurchasingError("That supplier doesn't exist.", 404)
+        for pid, cost, at in await GRNLine.filter(grn__supplier_id=supplier_id).values_list("product_id", "unit_price", "grn__at"):
+            source[str(pid)] = "received from them"
+            if at and (str(pid) not in last_cost or at > last_cost[str(pid)][0]):
+                last_cost[str(pid)] = (at, Decimal(str(cost)))
+        ordered_at: dict[str, tuple[datetime, Decimal]] = {}
+        for pid, cost, at in await PurchaseOrderLine.filter(purchase_order__supplier_id=supplier_id).exclude(
+            purchase_order__status="cancelled",
+        ).values_list("product_id", "unit_cost", "purchase_order__raised_at"):
+            source.setdefault(str(pid), "ordered from them")
+            if at and (str(pid) not in ordered_at or at > ordered_at[str(pid)][0]):
+                ordered_at[str(pid)] = (at, Decimal(str(cost)))
+        # What was last paid them on a GRN, or else the price last agreed on an order.
+        for pid, seen in ordered_at.items():
+            last_cost.setdefault(pid, seen)
+        for pid in await ProductSupplier.filter(supplier_id=supplier_id).values_list("product_id", flat=True):
+            source.setdefault(str(pid), "on the Item's supplier list")
+        products = await Product.filter(id__in=list(source), active=True) if source else []
+    else:
+        products = await Product.filter(active=True)
+    ids = [p.id for p in products]
+    held: dict[str, Decimal] = {}
+    for i in range(0, len(ids), 500):
+        for row in await StockMovement.filter(product_id__in=ids[i:i + 500]).annotate(total=Sum("qty")).group_by("product_id").values("product_id", "total"):
+            held[str(row["product_id"])] = Decimal(str(row["total"] or 0))
+    on_order = await _on_order(ids, exclude_order_id) if ids else {}
+    rates = await _branch_sales_rates([p.sku for p in products])
+    sent = await _dispatch_rates(ids)
+    branches = await _branches_hold([p.sku for p in products]) if products else {}
+    if not supplier_id and ids:
+        # Without a supplier, the cost is the last price paid anyone.
+        for pid, cost, at in await GRNLine.filter(product_id__in=ids).values_list("product_id", "unit_price", "grn__at"):
+            if at and (str(pid) not in last_cost or at > last_cost[str(pid)][0]):
+                last_cost[str(pid)] = (at, Decimal(str(cost)))
+
+    lines = []
+    for p in products:
+        h, o = held.get(p.id, ZERO), on_order.get(p.id, ZERO)
+        # The faster of the two: what the branches sell of it, or what the godown sends out to them.
+        r, who = rates.get(p.sku, ZERO), "branches sell"
+        if sent.get(p.id, ZERO) > r:
+            r, who = sent[p.id], "the godown sends branches"
+        s = suggest_line(r, h, o, p.reorder_level, cover_days, p.pack_size, p.is_weighed, who=who, holder="godown holds")
+        if not supplier_id:
+            low = (p.reorder_level is not None and p.reorder_level > 0 and h + o <= p.reorder_level) or (r > 0 and h + o < r * SHORT_DAYS)
+            if not low or s["qty"] <= 0:
+                continue
+        cost = last_cost.get(p.id, (None, p.avg_cost))[1]
+        lines.append({
+            "productId": p.id, "sku": p.sku, "name": p.name, "unit": p.unit, "packSize": p.pack_size,
+            "ratePerDay": s["rate"], "held": h, "onOrder": o, "reorderLevel": p.reorder_level, "branchesHold": branches.get(p.sku, ZERO),
+            "suggestedQty": s["qty"], "unitCost": cost or ZERO, "reason": s["reason"], "why": source.get(p.id, "running low"),
+            "needsDetails": p.needs_details,
+        })
+    lines.sort(key=lambda l: (l["suggestedQty"] <= 0, -(l["ratePerDay"] or ZERO), l["name"]))
+    return {
+        "supplierId": supplier_id, "supplierName": supplier.name if supplier else None, "coverDays": cover_days,
+        "salesDays": SALES_WINDOW_DAYS, "count": len(lines), "lines": lines[:MAX_SUGGESTIONS],
+        "rule": (f"Suggested quantity is what the branches sell in {cover_days} days (from their last {SALES_WINDOW_DAYS} days of sales, "
+                 "or what the godown sent them if that is more), "
+                 "or the Item's reorder level if that is higher, less what the godown holds and what is already on open orders, "
+                 "rounded up to whole packs where the pack size is known."),
+    }

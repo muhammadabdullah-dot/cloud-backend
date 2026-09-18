@@ -179,11 +179,16 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
         incoming = line.qty + line.bonusQty
         paid = line.qty * line.unitPrice * (Decimal("1") - line.discPercent / Decimal("100"))
         if incoming > ZERO:
+            from app.services import price_history_service
+
+            cost_before = price_history_service.snapshot(product)
             if on_hand > ZERO:
                 product.avg_cost = (product.avg_cost * on_hand + paid) / (on_hand + incoming)
             else:
                 product.avg_cost = paid / incoming
             await product.save(update_fields=["avg_cost"])
+            # The new average cost goes into the Item's price history against this GRN.
+            await price_history_service.record(product, cost_before, "receiving", grn.grn_number, user)
         # Bonus units are real stock — they go onto the shelf even though they were not paid for.
         await StockMovement.create(
             product_id=line.productId, bin_id=line_bin_id, kind="receive",

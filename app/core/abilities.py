@@ -15,6 +15,7 @@ ABILITIES: list[tuple[str, str, str, str, str]] = [
     ("godown", "warehouse.dashboard", "R", "Godown dashboard", "Stock value, what's running low and what's waiting for a decision."),
     ("godown", "warehouse.items", "R", "See Items", "The Item master: names, barcodes, prices and files."),
     ("godown", "warehouse.items.manage", "W", "Add, edit and import Items", "Including their prices, files and home bins."),
+    ("godown", "warehouse.price-changes", "R", "Price changes report", "Every change to a godown Item's prices, cost and discount: old and new, who, when and from where. Cost shows only to people who see cost."),
     ("godown", "warehouse.item-lists", "R", "See Item Lists", "Departments, categories, brands, units and GST rates of the godown's Items."),
     ("godown", "warehouse.item-lists", "W", "Change Item Lists", "Add, rename, merge and switch off values. A rename changes every Item that has it."),
     ("godown", "warehouse.bins", "R", "Racks, bins and put-away", "Where every Item is kept."),

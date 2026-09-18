@@ -52,6 +52,9 @@ class ItemOut(BaseModel):
     parentId: str | None = None
     parentQty: Qty | None = None
     homeBinId: str | None = None
+    # Added while buying (by hand, or from a branch's stock list) and waiting for someone to save the Item form.
+    needsDetails: bool = False
+    detailsNote: str | None = None
     # Set only by the code lookup, when the code was an alternate barcode.
     matchedAlias: ItemAliasOut | None = None
 

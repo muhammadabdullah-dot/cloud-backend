@@ -114,10 +114,14 @@ async def _product_for(line: dict) -> Product:
     if product:
         return product
     product_id = sku if not await Product.exists(id=sku) else f"br-{sku}"
-    return await Product.create(
+    product = await Product.create(
         id=product_id[:60], sku=sku, name=line.get("name") or sku, price=Decimal(str(line.get("price") or "0")),
         tax_rate=Decimal(str(line.get("taxRate") or "0")), unit=line.get("unit") or "pc", is_weighed=bool(line.get("isWeighed")),
     )
+    from app.services import price_history_service
+
+    await price_history_service.save_rows([price_history_service.first_price(product, "transfer-new")])
+    return product
 
 
 async def project(branch: Branch, payload: dict) -> str:

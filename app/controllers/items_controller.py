@@ -24,6 +24,7 @@ def _fields(p: Product, include_aliases: bool = False, attachments: int = 0) -> 
         discPercent=p.disc_percent, discFlat=p.disc_flat, lockDisc=p.lock_disc, variant=p.variant,
         origin=p.origin, remarks=p.remarks, hasPicture=bool(p.picture), attachmentCount=attachments,
         parentId=p.parent_id, parentQty=p.parent_qty, reorderLevel=p.reorder_level, homeBinId=p.home_bin_id,
+        needsDetails=p.needs_details, detailsNote=p.details_note if p.needs_details else None,
     )
 
 
@@ -48,8 +49,8 @@ def _fail(exc: items_service.ItemError) -> HTTPException:
     return HTTPException(exc.status, exc.message)
 
 
-async def list_all(q, limit, offset, ids, sort, order, supplier_id, include_inactive) -> ItemListOut:
-    items, total = await items_service.list_all(q, limit, offset, ids, sort, order, supplier_id, include_inactive)
+async def list_all(q, limit, offset, ids, sort, order, supplier_id, include_inactive, needs_details=None) -> ItemListOut:
+    items, total = await items_service.list_all(q, limit, offset, ids, sort, order, supplier_id, include_inactive, needs_details)
     counts = await items_service.attachment_counts([p.id for p in items])
     return ItemListOut(items=[_out(p, True, counts.get(p.id, 0)) for p in items], total=total)
 

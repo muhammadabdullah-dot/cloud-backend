@@ -53,6 +53,11 @@ class Product(models.Model):
     home_bin: fields.ForeignKeyNullableRelation["Bin"] = fields.ForeignKeyField(
         "models.Bin", related_name="home_items", null=True, on_delete=fields.SET_NULL
     )
+    # Added 2026-09-18. An Item added while buying (written in by hand on an order, or taken from a branch's stock
+    # list) whose details someone still has to check on the Item form. Saving the Item form clears it.
+    needs_details = fields.BooleanField(default=False)
+    # What is missing or where it came from, in words: "Written in by hand on a purchase order by Ali".
+    details_note = fields.CharField(max_length=200, null=True)
 
     class Meta:
         table = "products"
@@ -94,22 +99,31 @@ class ProductSupplier(models.Model):
 
 
 class ProductPriceChange(models.Model):
-    """Every change to an Item's sale or retail price, and where it came from."""
+    """Every change to what a godown Item sells or costs for, one row per value that moved, and where it came from
+    (services/price_history_service.py writes and reads them)."""
 
     id = fields.UUIDField(pk=True)
     product: fields.ForeignKeyRelation[Product] = fields.ForeignKeyField(
         "models.Product", related_name="price_changes", on_delete=fields.CASCADE
     )
+    # The sale and retail price before and after. On a row for another value they hold the prices at the time.
     old_price = fields.DecimalField(max_digits=14, decimal_places=2)
     new_price = fields.DecimalField(max_digits=14, decimal_places=2)
     old_rpp = fields.DecimalField(max_digits=14, decimal_places=2, null=True)
     new_rpp = fields.DecimalField(max_digits=14, decimal_places=2, null=True)
-    # "new-item", "form" or "import"
+    # Where it came from: "new-item", "form", "import", "import-new", "receiving", "transfer-new".
     source = fields.CharField(max_length=20)
     changed_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
         "models.User", related_name="price_changes", null=True, on_delete=fields.SET_NULL
     )
     at = fields.DatetimeField(auto_now_add=True)
+    # Added 2026-09-18: which value moved (a Product column: price, rpp, avg_cost, disc_percent...), from what to
+    # what, and the paper it came on (a GRN number, an imported file's name). Blank on rows written before then,
+    # which hold the sale and retail price together.
+    field = fields.CharField(max_length=30, null=True)
+    old_value = fields.DecimalField(max_digits=18, decimal_places=4, null=True)
+    new_value = fields.DecimalField(max_digits=18, decimal_places=4, null=True)
+    reference = fields.CharField(max_length=120, null=True)
 
     class Meta:
         table = "product_price_changes"

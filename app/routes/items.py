@@ -1,8 +1,11 @@
 """The godown's Item master — add, edit, import, export, pictures and attachments."""
-from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
+from datetime import datetime
 
-from app.controllers import items_controller
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+
+from app.controllers import items_controller, price_history_controller
 from app.middlewares.auth import require_any_permission, require_permission
+from app.schemas.price_history import PriceChangeChoicesOut, PriceChangesReportOut, PriceHistoryEntryOut
 from app.models import User
 from app.services.rbac_service import can_see_costs
 from app.schemas.import_result import ImportSummary
@@ -25,7 +28,8 @@ _manage = require_permission("warehouse.items.manage", "W")
 @router.get("", response_model=ItemListOut)
 async def list_items(
     q: str | None = None, ids: str | None = None, limit: int = 50, offset: int = 0, sort: str | None = None,
-    order: str | None = None, supplierId: str | None = None, includeInactive: bool = True, user: User = Depends(_read),
+    order: str | None = None, supplierId: str | None = None, includeInactive: bool = True, needsDetails: bool | None = None,
+    user: User = Depends(_read),
 ) -> ItemListOut:
     """Paged and searched on the server (name, code or barcode). `sort`: sku, name, brand, category, price,
     taxRate, unit, avgCost; `order`: asc or desc. `ids` resolves a known set of Items (at most 200)."""
@@ -34,7 +38,7 @@ async def list_items(
     if not costs and sort == "avgCost":
         sort = None
     out = await items_controller.list_all(
-        q, min(max(limit, 1), 200), max(offset, 0), id_list or None, sort, order, supplierId, includeInactive,
+        q, min(max(limit, 1), 200), max(offset, 0), id_list or None, sort, order, supplierId, includeInactive, needsDetails,
     )
     if not costs:
         for item in out.items:
@@ -77,6 +81,36 @@ async def lookup(code: str, user: User = Depends(_read)) -> ItemOut | None:
 @router.get("/facets", response_model=ItemFacetsOut)
 async def facets(user: User = Depends(_read)) -> ItemFacetsOut:
     return await items_controller.facets()
+
+
+# Price history: the Godown's Price Changes report (its own tick), and one Item's history on the Item form. Cost rows
+# only reach people who see cost.
+_price_report = require_permission("warehouse.price-changes", "R")
+_item_history = require_any_permission(("warehouse.items", "R"), ("warehouse.price-changes", "R"))
+
+
+@router.get("/price-history", response_model=PriceChangesReportOut)
+async def price_history_report(
+    from_: datetime | None = Query(None, alias="from"), to: datetime | None = None, department: str | None = None,
+    userId: str | None = None, source: str | None = None, field: str | None = None, q: str | None = None,
+    limit: int = 100, offset: int = 0, user: User = Depends(_price_report),
+) -> PriceChangesReportOut:
+    """Every change to a godown Item's sale or retail price, cost or discount in the window, newest first.
+    `userId=none` is changes nobody made by hand. `limit` up to 20000 for an export."""
+    return await price_history_controller.report(
+        from_, to, department, userId, source, field, q, min(max(limit, 1), 20000), max(offset, 0), await can_see_costs(user),
+    )
+
+
+@router.get("/price-history/choices", response_model=PriceChangeChoicesOut)
+async def price_history_choices(user: User = Depends(_price_report)) -> PriceChangeChoicesOut:
+    return await price_history_controller.choices(await can_see_costs(user))
+
+
+@router.get("/{product_id}/price-history", response_model=list[PriceHistoryEntryOut])
+async def item_price_history(product_id: str, user: User = Depends(_item_history)) -> list[PriceHistoryEntryOut]:
+    """One Item's price history, newest first."""
+    return await price_history_controller.for_item(product_id, await can_see_costs(user))
 
 
 # Paths with an id come last, so /import, /export, /lookup and /facets are never read as an id.
