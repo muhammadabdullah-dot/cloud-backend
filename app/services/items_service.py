@@ -818,12 +818,32 @@ async def add_from_branches(skus: list[str], user: User | None) -> list[tuple[Pr
     return out
 
 
+def _by_hand_pack(unit: str, pack_unit: str | None, pack_size: int | None) -> tuple[str | None, int | None]:
+    """How an Item written in by hand comes, kept the way the Item form keeps it: a pack unit (carton) and how many units
+    make one, both or neither. With both, Billing can sell it by that pack and order suggestions round to whole packs."""
+    pack_unit = " ".join((pack_unit or "").split()) or None
+    if pack_unit is None and pack_size is None:
+        return None, None
+    if pack_unit is None:
+        raise ItemError(f"Say what the pack of {pack_size} {unit} is called (carton, box, case), or leave the number empty.")
+    if pack_size is None:
+        raise ItemError(f"Say how many {unit} are in one {pack_unit}, or leave the pack unit empty.")
+    if len(pack_unit) > 30:
+        raise ItemError("Keep the pack unit under 30 letters.")
+    if pack_unit.lower() == unit.lower():
+        raise ItemError(f"The pack can't be a {unit} as well. Pick a bigger pack (carton, case), or leave the pack empty.")
+    if pack_size < 2:
+        raise ItemError(f"One {pack_unit} has to hold at least 2 {unit}. Leave the pack empty if it comes one at a time.")
+    return pack_unit, pack_size
+
+
 @atomic()
 async def add_by_hand(
     name: str, unit: str | None, cost: Decimal, price: Decimal | None, sku: str | None, user: User | None, where: str = "a purchase order",
+    pack_unit: str | None = None, pack_size: int | None = None,
 ) -> Product:
-    """An Item nobody carries yet, written in while buying: a name, unit, cost and, if known, a sale price and code.
-    It can be ordered and received at once and is marked "details to complete" for the Item form."""
+    """An Item nobody carries yet, written in while buying: a name, unit, cost and, if known, a sale price, code and the
+    pack it comes in. It can be ordered and received at once and is marked "details to complete" for the Item form."""
     name = " ".join((name or "").split())
     if not name:
         raise ItemError("Write the Item's name.")
@@ -831,6 +851,12 @@ async def add_by_hand(
         raise ItemError("Keep the name under 200 letters.")
     if cost < 0 or (price is not None and price < 0):
         raise ItemError("A price can't be below zero.")
+    unit = " ".join((unit or "").split()) or "pc"
+    if len(unit) > 30:
+        raise ItemError("Keep the unit under 30 letters.")
+    pack_unit, pack_size = _by_hand_pack(unit, pack_unit, pack_size)
+    # The same as the Item form: a unit or pack unit switched off in Item Lists can't go on an Item.
+    await _refuse_switched_off({"unit": unit, "packUnit": pack_unit})
     same = await Product.filter(name__iexact=name).first()
     if same:
         raise ItemError(f"The godown already has {same.name} ({same.sku}). Search for it and pick it instead.")
@@ -846,7 +872,7 @@ async def add_by_hand(
         code = await _next_company_sku()
     missing = "sale price, " if price is None else ""
     product = await Product.create(
-        id=code, sku=code, name=name, unit=((unit or "").strip() or "pc")[:30],
+        id=code, sku=code, name=name, unit=unit, pack_unit=pack_unit, pack_size=pack_size,
         price=(price if price is not None else cost).quantize(Decimal("0.01")), avg_cost=Decimal("0"), tax_rate=Decimal("0"),
         needs_details=True,
         details_note=f"Written in by hand on {where}{f' by {user.name}' if user else ''}. Check the {missing}GST, department and barcode."[:200],

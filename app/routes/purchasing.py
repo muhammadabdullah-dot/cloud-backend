@@ -159,6 +159,9 @@ class ByHandIn(BaseModel):
     sku: str | None = Field(default=None, max_length=60)
     # Where it is being written in, for the note on the Item: "order" or "grn".
     where: str | None = Field(default=None, max_length=20)
+    # How it comes, as on the Item form: a bigger pack (carton) and how many units make one. Both or neither.
+    packUnit: str | None = Field(default=None, max_length=30)
+    packSize: int | None = None
 
 
 class MyLimitOut(BaseModel):
@@ -389,7 +392,9 @@ async def add_by_hand(payload: ByHandIn, user: User = Depends(_add_items)) -> Bu
 
     where = "a GRN" if (payload.where or "").strip().lower() == "grn" else "a purchase order"
     try:
-        p = await items_service.add_by_hand(payload.name, payload.unit, payload.cost, payload.price, payload.sku, user, where)
+        p = await items_service.add_by_hand(
+            payload.name, payload.unit, payload.cost, payload.price, payload.sku, user, where, payload.packUnit, payload.packSize,
+        )
     except items_service.ItemError as exc:
         raise HTTPException(exc.status, exc.message) from exc
     return _buy_item(_product_as_buy_item(p, True), await can_see_costs(user))
