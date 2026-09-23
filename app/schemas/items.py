@@ -29,6 +29,11 @@ class ItemOut(BaseModel):
     barcode: str | None = None
     packUnit: str | None = None
     packSize: int | None = None
+    # How a branch sells it besides by the unit: packs to a box, and pieces (tablets) to a unit and to a strip.
+    packsPerBox: int | None = None
+    piecesPerUnit: int | None = None
+    pieceUnit: str | None = None
+    piecesPerStrip: int | None = None
     # Left out for people who don't see cost (see rbac_service.can_see_costs).
     avgCost: Money | None = None
     rpp: Money | None = None
@@ -126,6 +131,10 @@ class ItemCreate(BaseModel):
     barcode: str | None = Field(default=None, max_length=60)
     packUnit: str | None = Field(default=None, max_length=30)
     packSize: int | None = Field(default=None, ge=1)
+    packsPerBox: int | None = Field(default=None, ge=1)
+    piecesPerUnit: int | None = Field(default=None, ge=1, le=1000)
+    pieceUnit: str | None = Field(default=None, max_length=20)
+    piecesPerStrip: int | None = Field(default=None, ge=1, le=1000)
     avgCost: Decimal | None = None
     rpp: Decimal | None = Field(default=None, ge=0)
     department: str | None = Field(default=None, max_length=80)
@@ -159,6 +168,10 @@ class ItemUpdate(BaseModel):
     barcode: str | None = Field(default=None, max_length=60)
     packUnit: str | None = Field(default=None, max_length=30)
     packSize: int | None = Field(default=None, ge=1)
+    packsPerBox: int | None = Field(default=None, ge=1)
+    piecesPerUnit: int | None = Field(default=None, ge=1, le=1000)
+    pieceUnit: str | None = Field(default=None, max_length=20)
+    piecesPerStrip: int | None = Field(default=None, ge=1, le=1000)
     rpp: Decimal | None = Field(default=None, ge=0)
     department: str | None = Field(default=None, max_length=80)
     category: str | None = Field(default=None, max_length=80)

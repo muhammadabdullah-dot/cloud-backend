@@ -252,7 +252,16 @@ async def update_member(code: str, data: dict, user: User) -> Member:
     return member
 
 
-async def search(q: str | None, branch_code: str | None, limit: int, offset: int) -> tuple[list[Member], int]:
+# The Members list's sort keys and what they sort by. Status reads Active before Switched off, as the column does.
+SORTS = {
+    "code": "code", "name": "name", "phone": "phone", "points": "points_balance", "joinedVia": "joined_via",
+    "branch": "home_branch_code", "party": "party_name", "status": "-active", "joined": "created_at",
+}
+
+
+async def search(
+    q: str | None, branch_code: str | None, limit: int, offset: int, sort: str | None = None, order: str | None = None,
+) -> tuple[list[Member], int]:
     qs = Member.all()
     if branch_code:
         qs = qs.filter(home_branch_code=branch_code.upper())
@@ -264,7 +273,11 @@ async def search(q: str | None, branch_code: str | None, limit: int, offset: int
             predicate |= Q(phone__contains=digits[-10:])
         qs = qs.filter(predicate)
     total = await qs.count()
-    return await qs.order_by("-created_at").offset(offset).limit(limit), total
+    field = SORTS.get(sort or "")
+    if field and order == "desc":
+        field = field[1:] if field.startswith("-") else f"-{field}"
+    ordering = (field, "id") if field else ("-created_at",)
+    return await qs.order_by(*ordering).offset(offset).limit(limit), total
 
 
 async def detail(code: str) -> tuple[Member, list[LoyaltyEntry]]:

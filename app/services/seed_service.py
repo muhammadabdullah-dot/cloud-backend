@@ -42,6 +42,24 @@ BRANCHES = [
 ]
 
 
+DEMO_OFF_MARK = "demo-data:off"
+
+
+async def demo_data_wanted() -> bool:
+    """False once this database has been started with DEMO_DATA=off (config.py), and from then on: the choice is the
+    database's, so a later start that forgets the switch still adds no demo branch or demo godown. Every database that
+    was never started with it off (live, development) answers True, exactly as before the switch existed."""
+    from app.core.config import settings
+    from app.models import Counter
+
+    if await Counter.exists(id=DEMO_OFF_MARK):
+        return False
+    if settings.demo_data:
+        return True
+    await Counter.create(id=DEMO_OFF_MARK, value=1)
+    return False
+
+
 async def seed_branches_if_empty() -> None:
     """Separate from seed_if_empty: that one is guarded on Role.exists() and so never runs again
     on an already-seeded database — which is every database that existed before branches did."""

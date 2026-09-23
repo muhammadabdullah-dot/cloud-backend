@@ -199,6 +199,10 @@ class TransferLine(models.Model):
     qty_received = fields.DecimalField(max_digits=16, decimal_places=3, null=True)
     # What one unit cost the sender when it left (the godown's average cost, or the sending branch's).
     unit_cost = fields.DecimalField(max_digits=14, decimal_places=4, null=True)
+    # Added 2026-09-21. On a branch-to-branch transfer, the Item as the sending branch described it (department, pack,
+    # pieces, barcodes, prices), passed on to the receiving branch as it came. Null on a line from the godown, which
+    # carries the godown's own Item, and until the sending branch has reported the shipment.
+    item = fields.JSONField(null=True)
 
     class Meta:
         table = "transfer_lines"

@@ -186,7 +186,8 @@ async def cancel_transfer(transfer_id: str, payload: TransferReasonRequest, user
 
 @router.post("/transfers/{transfer_id}/resolve-dispute", response_model=TransferOut)
 async def resolve_dispute(transfer_id: str, payload: ResolveDisputeRequest, user: User = Depends(_transfers_manage)) -> TransferOut:
-    return await warehouse_controller.resolve_dispute(transfer_id, payload.note)
+    """Close a short-receipt dispute, saying how it was settled."""
+    return await warehouse_controller.resolve_dispute(user, transfer_id, payload.note)
 
 
 # ── cycle counts ────────────────────────────────────────────────────────────

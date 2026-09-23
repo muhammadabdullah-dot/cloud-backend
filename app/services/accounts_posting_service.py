@@ -69,7 +69,8 @@ class Run:
 async def _grns(run: Run) -> None:
     lo, hi = bounds(run.start, run.end)
     acc = run.accounts
-    for grn in await GRN.filter(at__gte=lo, at__lt=hi).prefetch_related("lines", "supplier"):
+    # Oldest first, so the vouchers are numbered in the order the goods came (WGRN-0001 gets the first PV).
+    for grn in await GRN.filter(at__gte=lo, at__lt=hi).order_by("at", "grn_number").prefetch_related("lines", "supplier"):
         net = sum((Decimal(l.qty) * Decimal(l.unit_price) * (Decimal("1") - Decimal(l.disc_percent or 0) / Decimal("100")) for l in grn.lines), ZERO)
         gst = sum((Decimal(l.qty) * Decimal(l.unit_price) * (Decimal("1") - Decimal(l.disc_percent or 0) / Decimal("100")) * Decimal(l.tax_rate or 0) / Decimal("100")
                    for l in grn.lines), ZERO)
@@ -90,7 +91,7 @@ async def _stock_corrections(run: Run) -> None:
     stock = await acc.key("stock.main")
     days: dict[date, list] = defaultdict(list)
     items: Counter = Counter()
-    for m in await StockMovement.filter(at__gte=lo, at__lt=hi, kind="count-correction").prefetch_related("product"):
+    for m in await StockMovement.filter(at__gte=lo, at__lt=hi, kind="count-correction").order_by("at", "id").prefetch_related("product"):
         value = _cost(m.qty, m.unit_cost, m.product)
         if not value:
             continue
@@ -108,7 +109,7 @@ async def _transfers(run: Run) -> None:
     acc = run.accounts
     stock, transit = await acc.key("stock.main"), await acc.key("stock.transit")
     lo, _ = bounds(run.settings.books_start, run.end)
-    for transfer in await Transfer.exclude(status="cancelled").prefetch_related("lines__product", "branch", "source_branch"):
+    for transfer in await Transfer.exclude(status="cancelled").order_by("requested_at", "transfer_number").prefetch_related("lines__product", "branch", "source_branch"):
         lines = list(transfer.lines)
         received = transfer.status in ("received", "received_short")
         if transfer.source_branch_id:

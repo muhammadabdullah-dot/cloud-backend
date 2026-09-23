@@ -93,12 +93,15 @@ _item_history = require_any_permission(("warehouse.items", "R"), ("warehouse.pri
 async def price_history_report(
     from_: datetime | None = Query(None, alias="from"), to: datetime | None = None, department: str | None = None,
     userId: str | None = None, source: str | None = None, field: str | None = None, q: str | None = None,
-    limit: int = 100, offset: int = 0, user: User = Depends(_price_report),
+    limit: int = 100, offset: int = 0, sort: str | None = None, order: str | None = None,
+    user: User = Depends(_price_report),
 ) -> PriceChangesReportOut:
     """Every change to a godown Item's sale or retail price, cost or discount in the window, newest first.
-    `userId=none` is changes nobody made by hand. `limit` up to 20000 for an export."""
+    `userId=none` is changes nobody made by hand. `limit` up to 20000 for an export. `sort`: at, sku, name,
+    department, field, oldValue, newValue, change, changedBy, source; `order`: asc or desc."""
     return await price_history_controller.report(
         from_, to, department, userId, source, field, q, min(max(limit, 1), 20000), max(offset, 0), await can_see_costs(user),
+        sort, order,
     )
 
 

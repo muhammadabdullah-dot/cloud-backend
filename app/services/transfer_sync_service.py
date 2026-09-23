@@ -13,11 +13,19 @@ by requisition_service):
   cancelled     the sending branch drops a branch-to-branch transfer that hasn't left
   dispatched    the sending branch's stock left
   received      the receiving branch counted it in — accepted, or with a dispute
+
+Every line carries its Item described in full, so the receiving branch never has to describe it again: department,
+category, brand, pack and pieces, barcodes, GST, the discount lock, the reorder level, and the prices a branch new to
+the Item starts from. From the godown that is the godown's Item. A branch sending to another branch describes its own
+Items when it asks or dispatches; head office keeps that description on the line (TransferLine.item) and passes it on as
+it came. Until the sending branch has reported a shipment head office asked it to send, its lines carry the godown's
+copy marked `provisional`.
 """
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
-from app.models import Branch, Product, Transfer, TransferLine
+from app.core.pk_time import pk_day
+from app.models import Branch, Product, ProductAlias, Transfer, TransferLine
 from app.services import alerts_service, downstream_service
 
 ZERO = Decimal("0")
@@ -46,9 +54,85 @@ class TransferSyncError(Exception):
         self.message = message
 
 
+# ── the Item on a transfer line ─────────────────────────────────────────────────────────────────
+
+# Line key, the godown Item's column, the longest value the column holds.
+_TEXT = (
+    ("department", "department", 80), ("category", "category", 80), ("itemClass", "item_class", 80), ("subclass", "subclass", 80),
+    ("brand", "brand", 120), ("manufacturer", "manufacturer", 120), ("variant", "variant", 60),
+)
+# What a line from a branch carries besides its Item: kept on the line itself, not in the description passed on.
+_LINE_ONLY = ("qtySent", "qtyReceived", "unitCost", "provisional")
+
+
+def _plain(value) -> str | None:
+    """A number as it travels: plain digits, never 1E+1."""
+    return None if value is None else format(Decimal(str(value)).normalize(), "f")
+
+
+async def describe(product: Product) -> dict:
+    """The godown's Item as a transfer line carries it to a branch. A branch keeps prices the godown doesn't (wholesale,
+    piece, strip, pack and box), so those go blank and the branch's own rules price them."""
+    aliases = await ProductAlias.filter(product_id=product.id)
+    return {
+        "sku": product.sku, "name": product.name, "unit": product.unit, "isWeighed": product.is_weighed,
+        "taxRate": _plain(product.tax_rate), "price": _plain(product.price), "rpp": _plain(product.rpp),
+        "barcode": product.barcode,
+        "aliases": [
+            {"code": a.code, "qty": _plain(a.qty), "remarks": a.remarks, "discPercent": _plain(a.disc_percent), "discFlat": _plain(a.disc_flat)}
+            for a in aliases
+        ],
+        **{key: getattr(product, column) for key, column, _ in _TEXT},
+        "origin": product.origin, "packUnit": product.pack_unit, "packSize": product.pack_size, "packsPerBox": product.packs_per_box,
+        "piecesPerUnit": product.pieces_per_unit, "pieceUnit": product.piece_unit, "piecesPerStrip": product.pieces_per_strip,
+        "lockDisc": product.lock_disc, "reorderLevel": _plain(product.reorder_level),
+        "needsDetails": product.needs_details, "detailsNote": product.details_note if product.needs_details else None,
+    }
+
+
+def _item_of(line: dict) -> dict | None:
+    """The description a branch's line carries, to pass on as it came; None from a branch whose software doesn't
+    describe its Items yet (its line has only the code, name, unit, price and GST)."""
+    if "aliases" not in line and "department" not in line:
+        return None
+    return {key: value for key, value in line.items() if key not in _LINE_ONLY}
+
+
+def _text(line: dict, key: str, size: int) -> str | None:
+    return str(line.get(key) or "").strip()[:size] or None
+
+
+def _number(line: dict, key: str) -> Decimal | None:
+    value = line.get(key)
+    if value in (None, ""):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return number if number.is_finite() and number >= 0 else None
+
+
+def _count(line: dict, key: str, top: int | None = None) -> int | None:
+    number = _number(line, key)
+    if number is None or number < 1 or number != number.to_integral_value() or (top and number > top):
+        return None
+    return int(number)
+
+
 async def _state(transfer: Transfer) -> dict:
     await transfer.fetch_related("lines__product", "branch", "source_branch")
     source = transfer.source_branch
+    lines = []
+    for line in transfer.lines:
+        item = line.item if isinstance(line.item, dict) and line.item else None
+        lines.append({
+            **(item or await describe(line.product)), "sku": line.product.sku,
+            "qtySent": str(line.qty_sent), "qtyReceived": None if line.qty_received is None else str(line.qty_received),
+            "unitCost": None if line.unit_cost is None else str(line.unit_cost),
+            # Branch to branch, before the sending branch has described the Item: the godown's copy, to be replaced.
+            **({"provisional": True} if source and not item else {}),
+        })
     return {
         "id": str(transfer.id),
         "number": transfer.transfer_number,
@@ -72,15 +156,7 @@ async def _state(transfer: Transfer) -> dict:
         "overrideReason": transfer.override_reason,
         "overrideBy": transfer.override_by_name,
         "overrideAt": _iso(transfer.override_at),
-        "lines": [
-            {
-                "sku": line.product.sku, "name": line.product.name, "unit": line.product.unit,
-                "price": str(line.product.price), "taxRate": str(line.product.tax_rate), "isWeighed": line.product.is_weighed,
-                "qtySent": str(line.qty_sent), "qtyReceived": None if line.qty_received is None else str(line.qty_received),
-                "unitCost": None if line.unit_cost is None else str(line.unit_cost),
-            }
-            for line in transfer.lines
-        ],
+        "lines": lines,
     }
 
 
@@ -106,7 +182,12 @@ async def publish(transfer: Transfer, reinstated: bool = False) -> None:
 
 async def _product_for(line: dict) -> Product:
     """The Cloud's own Item for a line reported by a branch, created from the line when head office
-    doesn't have that code yet — a branch-to-branch transfer can carry anything a branch sells."""
+    doesn't have that code yet: a branch-to-branch transfer can carry anything a branch sells.
+
+    A new one takes the whole description the line carries (a branch describes its Items on every transfer it sends).
+    One head office already has is left as it is: the godown's Items are head office's to describe."""
+    from app.services import items_service, price_history_service
+
     sku = str(line.get("sku") or "").strip()
     if not sku:
         raise TransferSyncError("A transfer line has no Item code.")
@@ -114,12 +195,33 @@ async def _product_for(line: dict) -> Product:
     if product:
         return product
     product_id = sku if not await Product.exists(id=sku) else f"br-{sku}"
+    origin = str(line.get("origin") or "").strip().lower()
+    barcode = str(line.get("barcode") or "").strip()
+    if not barcode or len(barcode) > 60 or barcode == sku or await items_service.code_owner(barcode):
+        barcode = None
+    note = f"Still to complete at the branch it came from: {str(line.get('detailsNote') or 'check its details').strip()}"[:200]
     product = await Product.create(
-        id=product_id[:60], sku=sku, name=line.get("name") or sku, price=Decimal(str(line.get("price") or "0")),
-        tax_rate=Decimal(str(line.get("taxRate") or "0")), unit=line.get("unit") or "pc", is_weighed=bool(line.get("isWeighed")),
+        id=product_id[:60], sku=sku, name=(str(line.get("name") or "").strip() or sku)[:200], price=_number(line, "price") or Decimal("0"),
+        tax_rate=_number(line, "taxRate") or Decimal("0"), unit=_text(line, "unit", 30) or "pc", is_weighed=bool(line.get("isWeighed")),
+        rpp=_number(line, "rpp"), barcode=barcode, lock_disc=bool(line.get("lockDisc")),
+        **{column: _text(line, key, size) for key, column, size in _TEXT},
+        origin=origin if origin in ("local", "imported") else None,
+        pack_unit=_text(line, "packUnit", 30), pack_size=_count(line, "packSize"), packs_per_box=_count(line, "packsPerBox"),
+        pieces_per_unit=_count(line, "piecesPerUnit", 1000), piece_unit=_text(line, "pieceUnit", 20),
+        pieces_per_strip=_count(line, "piecesPerStrip", 1000), reorder_level=_number(line, "reorderLevel"),
+        needs_details=bool(line.get("needsDetails")), details_note=note if line.get("needsDetails") else None,
     )
-    from app.services import price_history_service
-
+    seen = {sku, barcode}
+    for alias in line.get("aliases") or []:
+        code = str((alias or {}).get("code") or "").strip()
+        qty = _number(alias, "qty")
+        if not code or len(code) > 60 or code in seen or not qty or await items_service.code_owner(code):
+            continue
+        seen.add(code)
+        await ProductAlias.create(
+            product=product, code=code, remarks=_text(alias, "remarks", 255), qty=qty,
+            disc_percent=_number(alias, "discPercent") or Decimal("0"), disc_flat=_number(alias, "discFlat") or Decimal("0"),
+        )
     await price_history_service.save_rows([price_history_service.first_price(product, "transfer-new")])
     return product
 
@@ -163,7 +265,9 @@ async def _create_from_branch(branch: Branch, data: dict, status: str) -> Transf
     )
     for line in data.get("lines") or []:
         product = await _product_for(line)
-        await TransferLine.create(transfer=transfer, product=product, qty_sent=Decimal(str(line.get("qtySent") or "0")), unit_cost=_unit_cost(line))
+        await TransferLine.create(
+            transfer=transfer, product=product, qty_sent=Decimal(str(line.get("qtySent") or "0")), unit_cost=_unit_cost(line), item=_item_of(line),
+        )
     return transfer
 
 
@@ -271,12 +375,17 @@ async def _branch_dispatched(branch: Branch, data: dict) -> str:
             earlier = (existing.notes or "").rstrip(". ")
             undone = f"Cancel undone: {branch.name} had already dispatched it"
             existing.notes = (f"{earlier}. {undone}" if earlier else undone)[:255]
-        # The sending branch's cost when the stock actually left.
-        costs = {str(l.get("sku")): _unit_cost(l) for l in data.get("lines") or []}
+        # The sending branch's cost when the stock actually left, and its own description of each Item: a shipment head
+        # office asked it to send has carried the godown's copy until now.
+        sent = {str(l.get("sku")): l for l in data.get("lines") or []}
         for line in await TransferLine.filter(transfer=existing).prefetch_related("product"):
-            if costs.get(line.product.sku) is not None:
-                line.unit_cost = costs[line.product.sku]
-                await line.save(update_fields=["unit_cost"])
+            reported = sent.get(line.product.sku)
+            if reported is None:
+                continue
+            if _unit_cost(reported) is not None:
+                line.unit_cost = _unit_cost(reported)
+            line.item = _item_of(reported) or line.item
+            await line.save(update_fields=["unit_cost", "item"])
         existing.vehicle, existing.driver = data.get("vehicle") or existing.vehicle, data.get("driver") or existing.driver
         existing.dispatched_at = _dt(data.get("dispatchedAt")) or datetime.now(timezone.utc)
         await existing.save()
@@ -305,7 +414,9 @@ async def _branch_dispatched(branch: Branch, data: dict) -> str:
     )
     for line in data.get("lines") or []:
         product = await _product_for(line)
-        await TransferLine.create(transfer=transfer, product=product, qty_sent=Decimal(str(line.get("qtySent") or "0")), unit_cost=_unit_cost(line))
+        await TransferLine.create(
+            transfer=transfer, product=product, qty_sent=Decimal(str(line.get("qtySent") or "0")), unit_cost=_unit_cost(line), item=_item_of(line),
+        )
     await publish(transfer)
     return "created"
 
@@ -360,12 +471,36 @@ async def _branch_hold(branch: Branch, payload: dict, held: bool) -> str:
     return "held" if held else "released"
 
 
+def add_to_dispute_note(previous: str | None, latest: str, size: int = 255) -> str:
+    """A transfer's dispute note is its whole story: what the branch reported, how it was settled, any reopening.
+    Something new goes after what is already there, and when the column is full the oldest words give way,
+    never the newest."""
+    previous, latest = (previous or "").strip(), latest.strip()
+    if not previous:
+        return latest[:size]
+    room = size - len(latest) - 3
+    if room < 2:
+        return latest[:size]
+    if len(previous) > room:
+        previous = "…" + previous[len(previous) - room + 1:].lstrip()
+    return f"{previous} · {latest}"
+
+
 async def _branch_dispute(branch: Branch, payload: dict) -> str:
     transfer = await Transfer.get_or_none(id=str(payload.get("transferId") or payload.get("aggregateId") or ""))
     if not transfer:
         raise TransferSyncError("That transfer isn't known at head office.")
+    words = (payload.get("note") or "").strip() or "The branch reported a problem with this delivery."
+    if (transfer.dispute_note or "").strip():
+        # Opened again after an earlier dispute: the earlier report and how it was settled stay on record.
+        try:
+            day = pk_day(datetime.fromisoformat(payload["at"])) if payload.get("at") else pk_day()
+        except ValueError:
+            day = pk_day()
+        who = payload.get("by") or branch.name
+        words = add_to_dispute_note(transfer.dispute_note, f"Reopened by {who} on {day:%d %b %Y}: {words}")
     transfer.dispute_open = True
-    transfer.dispute_note = payload.get("note") or transfer.dispute_note
+    transfer.dispute_note = words
     await transfer.save(update_fields=["dispute_open", "dispute_note"])
     await publish(transfer)
     await alerts_service.notify(

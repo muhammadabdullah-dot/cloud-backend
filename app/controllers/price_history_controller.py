@@ -16,11 +16,13 @@ async def for_item(product_id: str, include_costs: bool) -> list[PriceHistoryEnt
 async def report(
     from_at: datetime | None, to_at: datetime | None, department: str | None, user_id: str | None, source: str | None,
     field: str | None, q: str | None, limit: int, offset: int, include_costs: bool,
+    sort: str | None = None, order: str | None = None,
 ) -> PriceChangesReportOut:
     if field in price_history_service.COST_FIELDS and not include_costs:
         return PriceChangesReportOut(rows=[], total=0)
     found = await price_history_service.search(
         from_at, to_at, department, user_id, source, field, q, limit, offset, include_costs=include_costs,
+        sort=sort, order=order,
     )
     return PriceChangesReportOut(rows=[PriceHistoryEntryOut(**e) for e in found["rows"]], total=found["total"])
 

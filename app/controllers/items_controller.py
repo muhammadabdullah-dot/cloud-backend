@@ -18,6 +18,7 @@ def _fields(p: Product, include_aliases: bool = False, attachments: int = 0) -> 
     return dict(
         id=p.id, sku=p.sku, name=p.name, price=p.price, taxRate=p.tax_rate, isWeighed=p.is_weighed,
         unit=p.unit, barcode=p.barcode, packUnit=p.pack_unit, packSize=p.pack_size, avgCost=p.avg_cost,
+        packsPerBox=p.packs_per_box, piecesPerUnit=p.pieces_per_unit, pieceUnit=p.piece_unit, piecesPerStrip=p.pieces_per_strip,
         rpp=p.rpp, department=p.department, category=p.category, itemClass=p.item_class,
         subclass=p.subclass, manufacturer=p.manufacturer, brand=p.brand, active=p.active,
         aliases=[_alias_out(a) for a in p.aliases] if include_aliases else [],

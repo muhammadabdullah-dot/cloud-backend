@@ -19,8 +19,8 @@ from decimal import Decimal
 from tortoise.transactions import atomic
 
 from app.core.pk_time import pk_day
-from app.models import HEAD_OFFICE_BOOK, Account, AccountsSettings, User, Voucher, VoucherLine, next_value
-from app.services import accounts_areas
+from app.models import HEAD_OFFICE_BOOK, Account, AccountsSettings, User, Voucher, VoucherLine
+from app.services import accounts_areas, numbering_service
 from app.services.accounts_chart_service import money
 from app.services.accounts_reports_service import shop_day
 
@@ -69,8 +69,7 @@ async def book_prefix() -> str:
 
 
 async def _number(vtype: str) -> str:
-    seq = await next_value(f"voucher:{vtype}", 1)
-    return f"{await book_prefix()}-{vtype}-{seq:06d}"
+    return await numbering_service.next_number(f"voucher:{vtype}", Voucher, "number", f"{await book_prefix()}-{vtype}-", 6)
 
 
 # ── what a voucher looks like outside ───────────────────────────────────────────────────────────
@@ -405,10 +404,40 @@ async def get(voucher_id: str) -> Voucher:
     return voucher
 
 
+# The Vouchers list's headings, each to what it sorts by. The type sorts by its name, the amount as a number (the
+# database keeps it as text) and "By" by the name the list shows: who posted it, else who made it.
+SORTS = {
+    "date": "date", "number": "number", "type": "sort_type", "description": "description", "amount": "sort_amount",
+    "status": "status", "by": "sort_by",
+}
+
+
+def _sorted(qs, sort: str | None, order: str | None):
+    """In the order a heading asks for, newest first within a tie. No heading (or one it doesn't know): newest first."""
+    field = SORTS.get(sort or "")
+    if not field:
+        return qs.order_by("-date", "-created_at")
+    from tortoise.expressions import RawSQL
+    from tortoise.functions import Coalesce
+
+    table = Voucher._meta.db_table
+    if field == "sort_type":
+        names = " ".join(f"WHEN '{code}' THEN '{name}'" for code, name in TYPE_LABELS.items())
+        qs = qs.annotate(sort_type=RawSQL(f'CASE "{table}"."vtype" {names} ELSE "{table}"."vtype" END'))
+    elif field == "sort_amount":
+        qs = qs.annotate(sort_amount=RawSQL(f'CAST("{table}"."total" AS REAL)'))
+    elif field == "sort_by":
+        qs = qs.annotate(sort_by=Coalesce("posted_by_name", "created_by_name"))
+    direction = "-" if order == "desc" else ""
+    if field == "date":
+        return qs.order_by(f"{direction}date", f"{direction}created_at", "id")
+    return qs.order_by(f"{direction}{field}", "-date", "-created_at", "id")
+
+
 async def list_vouchers(
     books: list[str], vtype: str | None, status: str | None, auto: bool | None, from_day: date | None, to_day: date | None,
     q: str | None, account_id: str | None, limit: int, offset: int, access: accounts_areas.Access | None = None,
-    account_kind: str | None = None,
+    account_kind: str | None = None, sort: str | None = None, order: str | None = None,
 ) -> tuple[list[dict], int]:
     qs = Voucher.filter(book__in=books)
     if vtype:
@@ -442,7 +471,7 @@ async def list_vouchers(
 
         qs = qs.exclude(id__in=Subquery(VoucherLine.filter(account_id__in=hidden).values("voucher_id")))
     total = await qs.count()
-    rows = await qs.order_by("-date", "-created_at").offset(offset).limit(limit)
+    rows = await _sorted(qs, sort, order).offset(offset).limit(limit)
     return [await voucher_out(v, with_lines=False) for v in rows], total
 
 

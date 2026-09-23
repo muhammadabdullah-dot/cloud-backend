@@ -17,8 +17,10 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from tortoise.expressions import Q
+from tortoise.expressions import Case, Q, RawSQL, When
+from tortoise.queryset import QuerySet
 
+from app.core.ordering import by_column
 from app.models import Product, ProductPriceChange, User
 
 # The Item's money values that keep a history: column -> what a person calls it. A column the Item doesn't have
@@ -50,6 +52,8 @@ SOURCES: dict[str, str] = {
     "by-hand": "Written in by hand while buying",
     "transfer-new": "Added from a branch",
 }
+# Where a new Item's first line comes from: it has nothing before it.
+_FIRST_SOURCES = ("new-item", "import-new", "transfer-new", "from-branch", "by-hand")
 
 _PAISA = Decimal("0.01")
 REFERENCE_MAX = 120
@@ -185,7 +189,7 @@ def entries(row: ProductPriceChange) -> list[dict[str, Any]]:
     if row.field:
         return [_entry(row, row.field, row.old_value, row.new_value)]
     out = []
-    first = row.source in ("new-item", "import-new", "transfer-new", "from-branch", "by-hand")
+    first = row.source in _FIRST_SOURCES
     if first or _paisa(row.old_price) != _paisa(row.new_price):
         out.append(_entry(row, "price", None if first else row.old_price, row.new_price))
     if not first and _paisa(row.old_rpp) != _paisa(row.new_rpp):
@@ -196,6 +200,68 @@ def entries(row: ProductPriceChange) -> list[dict[str, Any]]:
 def _field_filter(field: str) -> Q:
     # Older rows have no field and are sale (and sometimes retail) price changes.
     return Q(field=field) | Q(field__isnull=True) if field in SHELF_FIELDS else Q(field=field)
+
+
+# The report's columns a person can sort by: the app's key -> a column, the Item's and the person's through their
+# links. Which value, where it came from and the values themselves are worked out per row (`_sort_term`). A key not
+# here or there keeps the report's own order, newest first.
+SORTS: dict[str, str] = {
+    "at": "at", "sku": "product__sku", "name": "product__name", "department": "product__department",
+    "changedBy": "changed_by__name",
+}
+
+
+def _col(name: str) -> str:
+    return f'"{ProductPriceChange._meta.db_table}"."{name}"'
+
+
+# Before and after as numbers: a price is kept as text on SQLite, where 9 would sort after 10. An older row (no field)
+# is its sale price change, and a new Item's first line has nothing before it, as `entries` reads them.
+_FIRST_IN = ", ".join(f"'{s}'" for s in _FIRST_SOURCES)
+_BEFORE = (
+    f"CAST(CASE WHEN {_col('field')} IS NOT NULL THEN {_col('old_value')} "
+    f"WHEN {_col('source')} IN ({_FIRST_IN}) THEN NULL ELSE {_col('old_price')} END AS REAL)"
+)
+_AFTER = f"CAST(CASE WHEN {_col('field')} IS NULL THEN {_col('new_price')} ELSE {_col('new_value')} END AS REAL)"
+
+
+def _by_label(column: str, labels: dict[str, str], blank: str | None = None) -> Case:
+    """A column of keys in the order of the words the screen shows for them. `blank` is what an empty one reads as."""
+    ranked = sorted(labels, key=lambda k: labels[k].lower())
+    whens = [When(**{column: k}, then=i) for i, k in enumerate(ranked)]
+    if blank is not None:
+        whens.insert(0, When(**{f"{column}__isnull": True}, then=ranked.index(blank)))
+    return Case(*whens, default=len(ranked))
+
+
+def _sort_term(sort: str) -> Case | RawSQL | None:
+    if sort == "field":
+        return _by_label("field", FIELDS, blank="price")
+    if sort == "source":
+        return _by_label("source", SOURCES)
+    if sort == "oldValue":
+        return RawSQL(_BEFORE)
+    if sort == "newValue":
+        return RawSQL(_AFTER)
+    if sort == "change":
+        return RawSQL(f"{_AFTER} - {_BEFORE}")
+    return None
+
+
+def _ordered(qs: QuerySet[ProductPriceChange], sort: str | None, order: str | None) -> QuerySet[ProductPriceChange]:
+    """The report sorted by one column, newest first within it. No sort, or one it doesn't know: newest first."""
+    direction = "-" if order == "desc" else ""
+    then = ("id",) if sort == "at" else ("-at", "id")
+    if sort in SORTS:
+        qs, keys = by_column(qs, SORTS[sort], direction, {"sku": "code", "name": "text", "department": "text"}.get(sort))
+        return qs.order_by(*keys, *then)
+    term = _sort_term(sort) if sort else None
+    if term is None:
+        return qs.order_by("-at", "id")
+    # Where it came from: then the paper it came on (a GRN, a file).
+    if sort == "source":
+        then = (f"{direction}reference", *then)
+    return qs.annotate(sort_key=term).order_by(f"{direction}sort_key", *then)
 
 
 async def for_item(product_id: str, limit: int = 300, include_costs: bool = True) -> list[dict[str, Any]]:
@@ -210,10 +276,11 @@ async def for_item(product_id: str, limit: int = 300, include_costs: bool = True
 async def search(
     from_at: datetime | None = None, to_at: datetime | None = None, department: str | None = None,
     user_id: str | None = None, source: str | None = None, field: str | None = None, q: str | None = None,
-    limit: int = 100, offset: int = 0, include_costs: bool = True,
+    limit: int = 100, offset: int = 0, include_costs: bool = True, sort: str | None = None, order: str | None = None,
 ) -> dict[str, Any]:
     """The Price Changes report: every change in a window, newest first, narrowed by department, who, where it came
-    from, which value, and an Item's name or code."""
+    from, which value, and an Item's name or code. `sort` (a key of SORTS, or field, oldValue, newValue, change,
+    source) and `order` (asc or desc) sort the whole list, so every page follows on from the last."""
     qs = ProductPriceChange.all()
     if from_at:
         qs = qs.filter(at__gte=from_at)
@@ -235,7 +302,7 @@ async def search(
         term = q.strip()
         qs = qs.filter(Q(product__name__icontains=term) | Q(product__sku__icontains=term) | Q(product__barcode__icontains=term))
     total = await qs.count()
-    rows = await qs.order_by("-at", "id").offset(offset).limit(limit).prefetch_related("changed_by", "product")
+    rows = await _ordered(qs, sort, order).offset(offset).limit(limit).prefetch_related("changed_by", "product")
     out = [e for r in rows for e in entries(r)]
     if field:
         out = [e for e in out if e["field"] == field]

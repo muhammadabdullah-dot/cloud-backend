@@ -40,6 +40,10 @@ class ActivityPersonOut(BaseModel):
     actions: int
 
 
+# The activity list's sort keys and what they sort by.
+SORTS = {"at": "at", "person": "user_name", "action": "action", "device": "device_id"}
+
+
 @router.get("/{branch_id}/activity", response_model=ActivityListOut)
 async def branch_activity(
     branch_id: str,
@@ -49,9 +53,12 @@ async def branch_activity(
     to: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
+    sort: str | None = None,
+    order: str | None = None,
     caller: User = Depends(_read),
 ) -> ActivityListOut:
-    """Newest first. `user` is the person's id at that branch; `q` searches the action, the person and the path."""
+    """Newest first unless `sort` names a column (see SORTS) and `order` is asc or desc. `user` is the person's id at
+    that branch; `q` searches the action, the person and the path."""
     if not await Branch.exists(id=branch_id):
         raise HTTPException(404, "No such branch")
     qs = BranchActivity.filter(branch_id=branch_id)
@@ -64,7 +71,9 @@ async def branch_activity(
     if to:
         qs = qs.filter(at__lte=to)
     total = await qs.count()
-    rows = await qs.order_by("-at").offset(max(offset, 0)).limit(min(max(limit, 1), 500))
+    field = SORTS.get(sort or "")
+    ordering = (f"{'-' if order == 'desc' else ''}{field}", "id") if field else ("-at",)
+    rows = await qs.order_by(*ordering).offset(max(offset, 0)).limit(min(max(limit, 1), 500))
     return ActivityListOut(total=total, items=[
         ActivityOut(
             id=str(r.id), at=r.at, userId=r.user_id, userName=r.user_name, userTitle=r.user_title, action=r.action,

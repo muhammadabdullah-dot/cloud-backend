@@ -113,9 +113,13 @@ async def _seed() -> None:
     from app.services.seed_service import ensure_roles
 
     await ensure_roles()
-    await seed_branches_if_empty()
-    # Branches first — the warehouse seed points requisitions and transfers at them.
-    await seed_warehouse_if_empty()
+    # DEMO_DATA=off: no demo branch and no demo godown, so staff type every branch, Item and figure in themselves.
+    from app.services.seed_service import demo_data_wanted
+
+    if await demo_data_wanted():
+        await seed_branches_if_empty()
+        # Branches first — the warehouse seed points requisitions and transfers at them.
+        await seed_warehouse_if_empty()
     from app.services import racks_service
     await racks_service.backfill_racks()
     from app.services import putaway_service

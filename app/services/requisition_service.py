@@ -17,9 +17,9 @@ from decimal import Decimal
 from tortoise.functions import Sum
 from tortoise.transactions import atomic
 
-from app.models import Branch, Product, Requisition, StockMovement, Transfer, TransferLine, User, next_value
+from app.models import Branch, Product, Requisition, StockMovement, Transfer, TransferLine, User
 from app.models.requisition_detail import RequisitionDetail, RequisitionLine
-from app.services import alerts_service, downstream_service
+from app.services import alerts_service, downstream_service, numbering_service
 
 ZERO = Decimal("0")
 LINK = "/warehouse/requisitions"
@@ -72,15 +72,15 @@ async def _state(req: Requisition) -> dict:
     detail, lines = await _parts(req)
     transfer = await Transfer.filter(requisition_id=req.id).order_by("-requested_at").first()
     source = detail.source_branch if detail else None
+    # Each Item described in full, as on a transfer line: a request head office writes down for a branch can name an
+    # Item the branch doesn't stock yet, and the branch makes it from this.
+    from app.services.transfer_sync_service import describe
+
     if not lines:
         product = await Product.get(id=req.product_id)
-        rows = [{"sku": product.sku, "name": product.name, "unit": product.unit, "price": str(product.price), "taxRate": str(product.tax_rate),
-                 "isWeighed": product.is_weighed, "qtyRequested": _qty(req.qty_requested), "qtyApproved": None}]
+        rows = [{**await describe(product), "qtyRequested": _qty(req.qty_requested), "qtyApproved": None}]
     else:
-        rows = [{
-            "sku": l.product.sku, "name": l.product.name, "unit": l.product.unit, "price": str(l.product.price), "taxRate": str(l.product.tax_rate),
-            "isWeighed": l.product.is_weighed, "qtyRequested": _qty(l.qty_requested), "qtyApproved": _qty(l.qty_approved),
-        } for l in lines]
+        rows = [{**await describe(l.product), "qtyRequested": _qty(l.qty_requested), "qtyApproved": _qty(l.qty_approved)} for l in lines]
     return {
         "id": str(req.id), "headOfficeNumber": req.requisition_number, "branchNumber": detail.branch_number if detail else None,
         "status": req.status, "origin": detail.origin if detail else "head-office",
@@ -129,11 +129,11 @@ async def _create(
         if qty is None or qty <= ZERO:
             raise RequisitionError(f"{product.name}: the quantity must be above zero.")
     now = _now()
-    seq = await next_value("requisition", 32)
+    number = await numbering_service.next_number("requisition", Requisition, "requisition_number", "REQ-", 4)
     first_product, first_qty, _, _ = lines[0]
     extra = {"id": requisition_id} if requisition_id else {}
     req = await Requisition.create(
-        requisition_number=f"REQ-{seq:04d}", branch=branch, product=first_product, qty_requested=first_qty,
+        requisition_number=number, branch=branch, product=first_product, qty_requested=first_qty,
         status="pending", requested_at=requested_at or now, **extra,
     )
     await RequisitionDetail.create(
@@ -314,9 +314,9 @@ async def approve(user: User, requisition_id: str, quantities: dict[str, Decimal
     if detail:
         detail.decided_by_name, detail.decision_note = user.name, summary[:255] or None
         await detail.save(update_fields=["decided_by_name", "decision_note"])
-    seq = await next_value("transfer", 45)
+    number = await numbering_service.next_number("transfer", Transfer, "transfer_number", "TR-", 4)
     transfer = await Transfer.create(
-        transfer_number=f"TR-{seq:04d}", branch_id=req.branch_id, source_branch=source, requisition=req,
+        transfer_number=number, branch_id=req.branch_id, source_branch=source, requisition=req,
         status="approved", requested_at=req.requested_at, approved_at=now, dispute_open=False,
         # The branch asked for this stock, so it doesn't have to agree to it again.
         ack_status="skipped", ack_note=f"{req.branch.name} asked for it ({req.requisition_number})",

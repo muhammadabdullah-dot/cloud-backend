@@ -6,8 +6,8 @@ from decimal import Decimal
 
 from tortoise.transactions import atomic
 
-from app.models import Product, PurchaseOrder, PurchaseOrderLine, Supplier, User, next_value
-from app.services import alerts_service
+from app.models import Product, PurchaseOrder, PurchaseOrderLine, Supplier, User
+from app.services import alerts_service, numbering_service
 
 ZERO = Decimal("0")
 OPEN = ("draft", "pending_approval", "approved", "partially_received")
@@ -111,9 +111,9 @@ async def create_order(user: User, supplier_id: str, lines, expected_at, notes: 
     supplier = await Supplier.get_or_none(id=supplier_id)
     if not supplier:
         raise PurchasingError("Pick a supplier.")
-    seq = await next_value("warehouse_po", 1)
+    number = await numbering_service.next_number("warehouse_po", PurchaseOrder, "po_number", "WPO-", 4)
     po = await PurchaseOrder.create(
-        po_number=f"WPO-{seq:04d}", supplier=supplier, status="draft", expected_at=expected_at,
+        po_number=number, supplier=supplier, status="draft", expected_at=expected_at,
         notes=(notes or "").strip() or None, reason=(reason or "").strip()[:120] or None, raised_by=user,
     )
     await _set_lines(po, lines)

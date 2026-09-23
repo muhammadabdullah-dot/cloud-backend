@@ -19,6 +19,7 @@ from openpyxl.utils import get_column_letter
 from tortoise.expressions import Q
 from tortoise.transactions import atomic
 
+from app.core.ordering import by_column
 from app.core.pk_time import now_pk
 from app.models import (
     GRNLine, Product, ProductAlias, ProductAttachment, ProductPriceChange, ProductSupplier, StockMovement, Supplier, User,
@@ -40,10 +41,11 @@ _FIELD_MAP = {
     "packSize": "pack_size", "avgCost": "avg_cost", "itemClass": "item_class",
     "discPercent": "disc_percent", "discFlat": "disc_flat", "lockDisc": "lock_disc",
     "parentId": "parent_id", "parentQty": "parent_qty", "reorderLevel": "reorder_level", "homeBinId": "home_bin_id",
+    "packsPerBox": "packs_per_box", "piecesPerUnit": "pieces_per_unit", "pieceUnit": "piece_unit", "piecesPerStrip": "pieces_per_strip",
 }
 _TEXT_FIELDS = {
     "name", "unit", "barcode", "packUnit", "department", "category", "itemClass", "subclass",
-    "manufacturer", "brand", "variant", "remarks",
+    "manufacturer", "brand", "variant", "remarks", "pieceUnit",
 }
 _REQUIRED_COLUMNS = {"name", "price", "tax_rate", "is_weighed", "unit", "active", "disc_percent", "disc_flat", "lock_disc"}
 
@@ -51,6 +53,7 @@ SORTS = {
     "sku": "sku", "name": "name", "brand": "brand", "category": "category",
     "price": "price", "taxRate": "tax_rate", "unit": "unit", "avgCost": "avg_cost",
 }
+SORT_KINDS = {"sku": "code", "name": "text", "brand": "text", "category": "text", "unit": "text"}
 
 
 def _to_model_fields(data: dict) -> dict:
@@ -83,7 +86,8 @@ async def list_all(
     total = await qs.count()
     field = SORTS.get(sort or "name", "name")
     direction = "-" if order == "desc" else ""
-    items = await qs.order_by(f"{direction}{field}", "id").offset(offset).limit(limit).prefetch_related("aliases")
+    qs, keys = by_column(qs, field, direction, SORT_KINDS.get(field))
+    items = await qs.order_by(*keys, "id").offset(offset).limit(limit).prefetch_related("aliases")
     return items, total
 
 

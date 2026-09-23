@@ -104,6 +104,26 @@ async def complete_stock(payload: StockCompleteIn, branch: Branch = Depends(bran
     return StockCompleteOut(snapshotId=payload.snapshotId, **result, serverTime=datetime.now(timezone.utc))
 
 
+@sync_router.get("/company-items")
+async def company_items(q: str, limit: int = 30, branch: Branch = Depends(branch_credential)) -> list[dict]:
+    """The company's Items matching `q` (name, code or barcode), for a branch writing a stock request: it may ask for
+    an Item it doesn't carry yet. The godown's Items (switched-off ones left out) with what the godown holds, then Items
+    only branches carry with what each holds. No costs: a branch's staff don't see head office's."""
+    from app.services import items_service
+
+    out = []
+    for item in await items_service.company_search(q, limit):
+        if item["source"] == "godown" and not item["active"]:
+            continue
+        out.append({
+            "sku": item["sku"], "name": item["name"], "unit": item["unit"], "brand": item["brand"], "category": item["category"],
+            "department": item["department"], "source": item["source"],
+            "godownQty": None if item["godownQty"] is None else str(item["godownQty"]),
+            "branches": [{"branchCode": h["branchCode"], "branchName": h["branchName"], "qty": str(h["qty"])} for h in item["branches"]],
+        })
+    return out
+
+
 # --- Admin side of the same workflow ----------------------------------------------------------
 
 _write = require_permission("admin.sync-endpoints", "W")

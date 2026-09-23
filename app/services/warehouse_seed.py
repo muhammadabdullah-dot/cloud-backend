@@ -17,7 +17,6 @@ from app.models import (
     Batch,
     Bin,
     Branch,
-    Counter,
     Product,
     Requisition,
     StockMovement,
@@ -77,11 +76,6 @@ REQUISITIONS = [
     ("REQ-0031", "FC", "p-1", "60", 0),
     ("REQ-0030", "FC", "p-5", "240", 1),
 ]
-
-# The sequence each generator resumes from — matching the frontend's own `nextSeq`.
-GRN_SEQ_SEED = 12
-TRANSFER_SEQ_SEED = 45
-REQUISITION_SEQ_SEED = 32
 
 
 async def seed_warehouse_if_empty() -> None:
@@ -149,12 +143,5 @@ async def seed_warehouse_if_empty() -> None:
         )
         await TransferLine.create(transfer=t2, product_id="p-3", qty_sent=Decimal("100"), qty_received=Decimal("96"))
 
-    # Prime the sequences so the first generated document continues the frontend's numbering
-    # rather than restarting at 1. A Counter holding V means `next_value` hands out V next, so the
-    # seed goes in as-is.
-    for name, seed in (
-        ("warehouse_grn", GRN_SEQ_SEED),
-        ("transfer", TRANSFER_SEQ_SEED),
-        ("requisition", REQUISITION_SEQ_SEED),
-    ):
-        await Counter.get_or_create(id=name, defaults={"value": seed})
+    # No sequence is primed: each series carries on from the highest number these rows carry (TR-0045, REQ-0032 next)
+    # and starts at 1 where there are none (WGRN-0001). See numbering_service.

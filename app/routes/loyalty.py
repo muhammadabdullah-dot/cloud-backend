@@ -94,9 +94,13 @@ def _settings(s: LoyaltySettings) -> SettingsOut:
 
 
 @router.get("/members", response_model=MemberListOut)
-async def members(q: str | None = None, branch: str | None = None, limit: int = 50, offset: int = 0, user: User = Depends(_read)) -> MemberListOut:
-    """Every branch's members: search by code, name, mobile number or Party; filter by the branch that signed them up."""
-    items, total = await loyalty_service.search(q, branch, min(max(limit, 1), 200), max(offset, 0))
+async def members(
+    q: str | None = None, branch: str | None = None, limit: int = 50, offset: int = 0,
+    sort: str | None = None, order: str | None = None, user: User = Depends(_read),
+) -> MemberListOut:
+    """Every branch's members: search by code, name, mobile number or Party; filter by the branch that signed them up.
+    Newest first unless `sort` names a column (see loyalty_service.SORTS) and `order` is asc or desc."""
+    items, total = await loyalty_service.search(q, branch, min(max(limit, 1), 200), max(offset, 0), sort, order)
     return MemberListOut(items=[_member(m) for m in items], total=total)
 
 

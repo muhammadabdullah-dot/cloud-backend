@@ -58,6 +58,14 @@ class Product(models.Model):
     needs_details = fields.BooleanField(default=False)
     # What is missing or where it came from, in words: "Written in by hand on a purchase order by Ali".
     details_note = fields.CharField(max_length=200, null=True)
+    # Added 2026-09-21. How a branch sells the Item in other amounts than its unit, kept here so an Item a transfer takes
+    # to a branch arrives ready to sell that way (the branch's Item form has the same four; see its sell_levels.py).
+    # Bigger: with a pack unit, how many packs make a box. Smaller: how many pieces one unit holds (200 tablets in a
+    # box), what a piece is called, and how many pieces make a strip.
+    packs_per_box = fields.IntField(null=True)
+    pieces_per_unit = fields.IntField(null=True)
+    piece_unit = fields.CharField(max_length=20, null=True)
+    pieces_per_strip = fields.IntField(null=True)
 
     class Meta:
         table = "products"

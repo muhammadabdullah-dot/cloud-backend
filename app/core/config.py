@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # The built app this server hands out on its own port. Blank = the app's dist/ folder in this
     # repo (cloud-app/dist); a path = that folder; "off" = API only.
     frontend_dir: str = ""
+    # The demo branch (Fort Colony) and demo godown (Items, suppliers, bins, stock, requisitions, transfers) a new
+    # database gets on its first start. DEMO_DATA=off starts it with only the roles, the seeded sign-ins and what the
+    # software needs to run (a fresh test, a real new install). Once a database has started without demo data it never
+    # gets any, whatever this says later (seed_service.demo_data_wanted).
+    demo_data: bool = True
 
 
 settings = Settings()

@@ -211,6 +211,27 @@ def _excluded(roles: list[dict], role_id: str) -> set[str]:
     return set(role.get("exclude", [])) if role else set()
 
 
+async def _standard_access(roles: list[dict], role_id: str) -> list[dict]:
+    """What someone starting in a branch role gets, exactly as a branch gives its own new starter: the branch's starting
+    ticks (its access screen's presets, sent at its start), so a Salesperson made here holds what one made at the
+    branch holds (dry run B4). A role head office manages (Role access) keeps head office's own list; and a head office
+    that has not heard the branch's ticks yet falls back to every action on the role's screens, as before."""
+    excluded = _excluded(roles, role_id)
+    if not await BranchRoleTemplate.exists(role_id=role_id):
+        preset = next((p for p in (await branch_abilities()).get("presets", []) if p.get("roleId") == role_id), None)
+        if preset is not None:
+            grants: dict[str, set[str]] = {}
+            for key in preset.get("abilities") or []:
+                resource, _, action = str(key).rpartition(":")
+                if resource and action in ("R", "W", "X") and resource not in excluded:
+                    grants.setdefault(resource, set()).add(action)
+            # Changing or deciding something brings seeing it along, as at the branch.
+            return _norm_permissions([
+                {"resource": r, "actions": sorted(a | ({"R"} if a & {"W", "X"} else set()))} for r, a in grants.items()
+            ])
+    return [{"resource": r, "actions": ["R", "W", "X"]} for r in sorted(await _template_for(role_id)) if r not in excluded]
+
+
 async def _check_branches(branch_ids: list[str]) -> list[Branch]:
     branches = await Branch.filter(id__in=branch_ids)
     if len(branches) != len(set(branch_ids)):
@@ -233,8 +254,7 @@ async def create(admin: User, data: dict) -> BranchStaff:
     await _check_branches(branch_ids)
     permissions = data.get("permissions")
     if permissions is None:
-        excluded = _excluded(roles, role_id)
-        permissions = [{"resource": r, "actions": ["R", "W", "X"]} for r in await _template_for(role_id) if r not in excluded]
+        permissions = await _standard_access(roles, role_id)
     staff = await BranchStaff.create(
         id=str(uuid.uuid4()), name=data["name"].strip(), email=email, role_id=role_id, active=True,
         password_hash=hash_password(data["password"]), permissions=_norm_permissions(permissions), rev=1,
@@ -278,8 +298,7 @@ async def update(admin: User, staff_id: str, data: dict) -> BranchStaff:
         staff.permissions = _norm_permissions([p for p in data["permissions"] if p.get("resource") not in excluded])
     elif role_changed:
         # A new role starts from that role's standard access, as a new starter in it would.
-        excluded = _excluded(roles, staff.role_id)
-        staff.permissions = [{"resource": r, "actions": ["R", "W", "X"]} for r in sorted(await _template_for(staff.role_id)) if r not in excluded]
+        staff.permissions = await _standard_access(roles, staff.role_id)
 
     before = set(await _branch_ids(staff))
     after = before

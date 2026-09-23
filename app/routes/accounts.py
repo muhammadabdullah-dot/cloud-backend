@@ -273,13 +273,15 @@ class ReasonIn(BaseModel):
 async def list_vouchers(
     type: str | None = None, status_: str | None = Query(None, alias="status"), auto: bool | None = None,
     from_: date | None = Query(None, alias="from"), to: date | None = None, q: str | None = None, accountId: str | None = None,
-    accountKind: str | None = None, limit: int = 50, offset: int = 0, book: str | None = None, user: User = Depends(_vouchers),
+    accountKind: str | None = None, limit: int = 50, offset: int = 0, book: str | None = None, sort: str | None = None,
+    order: str | None = None, user: User = Depends(_vouchers),
 ) -> dict:
-    """Only vouchers whose every line is in the person's areas. The Day Book is the whole book."""
+    """Only vouchers whose every line is in the person's areas. The Day Book is the whole book. `sort`: date, number,
+    type, description, amount, status or by; `order`: asc or desc. Without one, newest first."""
     books, _ = await _books_for(user, book)
     await accounts_posting_service.ensure_recent()
     items, total = await vouchers_service.list_vouchers(books, type, status_, auto, from_, to, q, accountId, min(max(limit, 1), 500), max(offset, 0),
-                                                        access=await access_of(user), account_kind=accountKind)
+                                                        access=await access_of(user), account_kind=accountKind, sort=sort, order=order)
     return {"items": items, "total": total}
 
 

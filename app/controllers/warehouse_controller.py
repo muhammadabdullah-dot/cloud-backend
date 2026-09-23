@@ -406,9 +406,9 @@ async def transfer_step(step: str, user: User, transfer_id: str, reason: str | N
     return await _one_transfer(transfer)
 
 
-async def resolve_dispute(transfer_id: str, note: str | None) -> TransferOut:
+async def resolve_dispute(user: User, transfer_id: str, note: str | None) -> TransferOut:
     try:
-        transfer = await warehouse_service.resolve_dispute(transfer_id, note)
+        transfer = await warehouse_service.resolve_dispute(user, transfer_id, note)
     except warehouse_service.WarehouseError as exc:
         raise _fail(exc)
     return await _one_transfer(transfer)

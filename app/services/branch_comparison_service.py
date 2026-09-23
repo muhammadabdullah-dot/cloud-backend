@@ -15,8 +15,9 @@ from decimal import Decimal
 from tortoise import Tortoise
 from tortoise.transactions import atomic
 
-from app.models import Branch, BranchSnapshotRun, Product, Transfer, TransferLine, User, next_value
+from app.models import Branch, BranchSnapshotRun, Product, Transfer, TransferLine, User
 from app.services import executive_service as ex
+from app.services import numbering_service
 
 D0 = Decimal("0")
 CENTS = Decimal("0.01")
@@ -300,13 +301,13 @@ async def create_transfer_request(user: User, from_code: str, to_code: str, line
         products.append((product, qty, unit_cost))
 
     now = datetime.now(timezone.utc)
-    seq = await next_value("transfer", 45)
+    number = await numbering_service.next_number("transfer", Transfer, "transfer_number", "TR-", 4)
     # The receiving branch says whether it can take the stock, as for any transfer. One without a server of its own is
     # received for at head office, so there is nobody to ask.
     asks = receiver.verified_at is not None
     written = (note or "").strip()
     transfer = await Transfer.create(
-        transfer_number=f"TR-{seq:04d}", branch=receiver, source_branch=sender,
+        transfer_number=number, branch=receiver, source_branch=sender,
         status="requested" if asks else "approved", requested_at=now, approved_at=None if asks else now, dispute_open=False,
         notes=f"Asked by head office ({user.name}){f': {written}' if written else ': slow at the sending branch, selling at the receiving branch'}"[:255],
         ack_status="awaiting" if asks else "skipped", ack_requested_at=now if asks else None,

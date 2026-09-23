@@ -29,13 +29,33 @@ ORIGINS = {
     "ever-warehouse": "json_extract(s.flows, '$.fromWarehouse') IS NOT NULL",
     "ever-branches": "json_extract(s.flows, '$.fromBranches') IS NOT NULL",
 }
+# The sort picker's orders and the table's column headings: what each sorts by, and which way it goes when the
+# app doesn't say (the picker's own choice). Blank cells go last whichever way.
 SORTS = {
-    "moved": "s.last_moved_at IS NULL, s.last_moved_at DESC",
-    "qty": "CAST(s.qty AS REAL) DESC",
-    "value": "CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL) DESC",
-    "sold": "COALESCE(CAST(json_extract(s.flows, '$.sold') AS REAL), 0) DESC",
-    "name": "s.product_name COLLATE NOCASE ASC",
+    "moved": ("s.last_moved_at", "DESC"),
+    "qty": ("CAST(s.qty AS REAL)", "DESC"),
+    "value": ("CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)", "DESC"),
+    "sold": ("COALESCE(CAST(json_extract(s.flows, '$.sold') AS REAL), 0)", "DESC"),
+    "name": ("s.product_name COLLATE NOCASE", "ASC"),
+    # Codes in number order, as the tables sort in the browser: an all-digit code is padded, so 200 comes before 11050010.
+    "code": (
+        "CASE WHEN TRIM(COALESCE(s.product_sku, '')) = '' THEN NULL WHEN s.product_sku NOT GLOB '*[^0-9]*' "
+        "THEN printf('%020d', CAST(s.product_sku AS INTEGER)) ELSE s.product_sku END COLLATE NOCASE",
+        "ASC",
+    ),
+    "warehouse": ("CAST(s.origin_warehouse AS REAL)", "DESC"),
+    "branches": ("CAST(s.origin_branches AS REAL)", "DESC"),
+    "within": ("CAST(s.origin_within AS REAL)", "DESC"),
+    "lastIn": ("json_extract(s.last_in, '$.at')", "DESC"),
 }
+
+
+def _order_by(sort: str, order: str | None) -> str:
+    """Unknown keys fall back to Recently moved. Rows that tie keep a steady order by name, then code, so paging
+    never shows an Item twice or skips one."""
+    field, default = SORTS.get(sort, SORTS["moved"])
+    direction = {"asc": "ASC", "desc": "DESC"}.get(order or "", default)
+    return f"({field}) IS NULL, {field} {direction}, s.product_name, s.product_sku"
 
 
 async def _q(sql: str, params: list) -> list[dict]:
@@ -137,7 +157,8 @@ async def overview() -> list[dict]:
     return out
 
 
-async def items(branch_id: str, *, q: str | None, state: str, origin: str | None, sort: str, limit: int, offset: int) -> dict | None:
+async def items(branch_id: str, *, q: str | None, state: str, origin: str | None, sort: str, limit: int, offset: int,
+                order: str | None = None) -> dict | None:
     branch = await Branch.get_or_none(id=branch_id)
     if not branch:
         return None
@@ -156,7 +177,7 @@ async def items(branch_id: str, *, q: str | None, state: str, origin: str | None
     clause = " AND ".join(where)
     totals = (await _q(f"SELECT {_TOTALS} FROM branch_product_stock s WHERE {clause}", params))[0]
     rows = await _q(
-        f"SELECT s.* FROM branch_product_stock s WHERE {clause} ORDER BY {SORTS.get(sort, SORTS['moved'])}, s.product_name LIMIT ? OFFSET ?",
+        f"SELECT s.* FROM branch_product_stock s WHERE {clause} ORDER BY {_order_by(sort, order)} LIMIT ? OFFSET ?",
         params + [min(max(limit, 1), 500), max(offset, 0)],
     )
     return {

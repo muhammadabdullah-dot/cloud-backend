@@ -9,6 +9,7 @@ from decimal import Decimal
 from tortoise.functions import Sum
 from tortoise.transactions import atomic
 
+from app.core.pk_time import pk_day
 from app.models import (
     GRN,
     Batch,
@@ -23,7 +24,6 @@ from app.models import (
     Transfer,
     TransferLine,
     User,
-    next_value,
 )
 from app.schemas.warehouse import (
     CountSubmitRequest,
@@ -140,10 +140,12 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
         if line.bonusQty < ZERO:
             raise WarehouseError("Bonus quantity can't be negative")
 
-    seq = await next_value("warehouse_grn", 12)
+    from app.services import numbering_service
+
+    number = await numbering_service.next_number("warehouse_grn", GRN, "grn_number", "WGRN-", 4)
     now = datetime.now(timezone.utc)
     grn = await GRN.create(
-        grn_number=f"WGRN-{seq:04d}", supplier_id=payload.supplierId, party_inv_no=payload.partyInvNo,
+        grn_number=number, supplier_id=payload.supplierId, party_inv_no=payload.partyInvNo,
         bin_id=payload.binId, gst_mode=payload.gstMode, advance_tax=payload.advanceTax,
         approved=payload.approved, received_by=user, at=now, purchase_order_id=payload.purchaseOrderId or None,
     )
@@ -233,9 +235,11 @@ async def create_requisition(branch_id: str, product_id: str, qty: Decimal) -> R
         raise WarehouseError("No such product")
     if qty <= ZERO:
         raise WarehouseError("Requested quantity must be above zero")
-    seq = await next_value("requisition", 32)
+    from app.services import numbering_service
+
+    number = await numbering_service.next_number("requisition", Requisition, "requisition_number", "REQ-", 4)
     req = await Requisition.create(
-        requisition_number=f"REQ-{seq:04d}", branch_id=branch_id, product_id=product_id,
+        requisition_number=number, branch_id=branch_id, product_id=product_id,
         qty_requested=qty, status="pending", requested_at=datetime.now(timezone.utc),
     )
     await RequisitionDetail.create(requisition=req, origin="head-office", received_at=req.requested_at)
@@ -300,12 +304,14 @@ async def create_transfer(user: User, branch_id: str, lines: list[tuple[str, Dec
     if duplicate:
         return duplicate  # already made a moment ago; sending it twice would pick the stock twice
     now = datetime.now(timezone.utc)
-    seq = await next_value("transfer", 45)
+    from app.services import numbering_service
+
+    number = await numbering_service.next_number("transfer", Transfer, "transfer_number", "TR-", 4)
     # A branch with its own server says whether it can take the stock before anything is picked. One without a
     # server is handled here at head office, so there is nobody to ask.
     asks = branch.verified_at is not None
     transfer = await Transfer.create(
-        transfer_number=f"TR-{seq:04d}", branch=branch, status="approved", requested_at=now, approved_at=now,
+        transfer_number=number, branch=branch, status="approved", requested_at=now, approved_at=now,
         dispute_open=False, notes=(notes or "").strip() or None,
         ack_status="awaiting" if asks else "skipped", ack_requested_at=now if asks else None,
         ack_note=None if asks else f"{branch.name} has no branch server; head office receives for it",
@@ -531,20 +537,30 @@ async def cancel_transfer(user: User, transfer_id: str, reason: str | None) -> T
     return transfer
 
 
+RESOLVE_NOTE_MAX = 150
+
+
 @atomic()
-async def resolve_dispute(transfer_id: str, note: str | None) -> Transfer:
+async def resolve_dispute(user: User, transfer_id: str, note: str | None) -> Transfer:
     """Closing a short-receipt dispute. The status stays `received_short` — the history of what
-    happened is not rewritten; only the "still needs attention" flag clears."""
+    happened is not rewritten; only the "still needs attention" flag clears. How it was settled is
+    required, and is kept after the branch's own words with who closed it and on which day, so both
+    the head office and the branch read the whole story."""
     transfer = await Transfer.get_or_none(id=transfer_id).prefetch_related("lines")
     if not transfer:
         raise WarehouseError("Transfer not found")
     if not transfer.dispute_open:
         raise WarehouseError("This transfer has no open dispute")
-    transfer.dispute_open = False
-    if note:
-        transfer.dispute_note = f"{transfer.dispute_note or ''} · Resolved: {note}".strip(" ·")
-    await transfer.save()
+    settled = " ".join((note or "").split())
+    if len(settled) < 5:
+        raise WarehouseError("Say how the dispute was settled, for example what the driver said or what was written off.")
+    settled = settled[:RESOLVE_NOTE_MAX]
     from app.services import transfer_sync_service
+
+    transfer.dispute_open = False
+    transfer.dispute_note = transfer_sync_service.add_to_dispute_note(
+        transfer.dispute_note, f"Resolved by {user.name} on {pk_day():%d %b %Y}: {settled}")
+    await transfer.save()
     await transfer_sync_service.publish(transfer)
     return transfer
 

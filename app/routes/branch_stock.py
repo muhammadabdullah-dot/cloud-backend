@@ -95,12 +95,16 @@ async def branch_items(
     q: str | None = None,
     state: str = Query(default="in-stock", pattern="^(in-stock|out|negative|all)$"),
     origin: str | None = Query(default=None, pattern="^(warehouse|branches|within|ever-warehouse|ever-branches)$"),
-    sort: str = Query(default="moved", pattern="^(moved|qty|value|sold|name)$"),
+    sort: str = Query(default="moved", pattern="^(moved|qty|value|sold|name|code|warehouse|branches|within|lastIn)$"),
+    order: str | None = Query(default=None, pattern="^(asc|desc)$"),
     limit: int = 50,
     offset: int = 0,
     user: User = Depends(_read),
 ) -> StockPage:
-    page = await branch_stock_service.items(branch_id, q=q, state=state, origin=origin, sort=sort, limit=limit, offset=offset)
+    """`sort` is the picker's moved, qty, value, sold or name, or a column's code, warehouse, branches, within or
+    lastIn. `order` is asc or desc; without it each goes its own way (name and code A to Z, the rest biggest or newest
+    first)."""
+    page = await branch_stock_service.items(branch_id, q=q, state=state, origin=origin, sort=sort, limit=limit, offset=offset, order=order)
     if page is None:
         raise HTTPException(404, "No such branch")
     return StockPage(**page)

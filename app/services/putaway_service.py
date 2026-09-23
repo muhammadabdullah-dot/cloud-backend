@@ -13,7 +13,8 @@ from decimal import Decimal
 
 from tortoise.transactions import atomic
 
-from app.models import Bin, BinMove, Product, StockMovement, User, next_value
+from app.models import Bin, BinMove, Product, StockMovement, User
+from app.services import numbering_service
 from app.services.warehouse_service import all_balances
 
 ZERO = Decimal("0")
@@ -97,8 +98,7 @@ async def _move(user: User | None, product: Product, from_bin: Bin, to_bin: Bin,
         raise PutAwayError(f"{to_bin.label} is switched off and takes no new stock.")
     if qty > held:
         raise PutAwayError(f"{from_bin.label} holds {held.normalize():f} of {product.name}, not enough to move {qty.normalize():f}.")
-    seq = await next_value("bin_move", 1)
-    number = f"MV-{seq:05d}"
+    number = await numbering_service.next_number("bin_move", BinMove, "number", "MV-", 5)
     for bin_, signed in ((from_bin, -qty), (to_bin, qty)):
         await StockMovement.create(product=product, bin=bin_, kind="move", qty=signed, reason=number, origin_user=user, at=now, unit_cost=product.avg_cost)
     move = await BinMove.create(number=number, product=product, from_bin=from_bin, to_bin=to_bin, qty=qty, note=(note or "").strip()[:255] or None,
