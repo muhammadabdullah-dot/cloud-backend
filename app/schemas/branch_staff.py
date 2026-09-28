@@ -100,7 +100,17 @@ class BranchDirectoryEntry(BaseModel):
     city: str | None = None
 
 
+class ChangesOut(BaseModel):
+    """The answer to a listen: is there anything for this branch, and did head office hold the question open."""
+    changed: bool = False
+    waited: bool = False
+    latestSeq: int = 0
+
+
 class PullOut(BaseModel):
+    # True when head office held this check open rather than answering at once: the branch may then ask again straight
+    # away, so anything head office does reaches it in about a second.
+    waited: bool = False
     messages: list[PulledMessage]
     latestSeq: int
     # Other branches this branch can send stock to.

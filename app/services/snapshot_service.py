@@ -21,7 +21,7 @@ original figure sitting underneath the correction forever.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 from tortoise.transactions import in_transaction
@@ -49,11 +49,17 @@ D0 = Decimal("0")
 
 # The aggregate tables a snapshot owns outright. Listed once so "replace everything this snapshot
 # is responsible for" can't quietly fall out of step with what a snapshot actually carries.
-AGGREGATE_MODELS = (
-    BranchDailyStat, BranchCashierStat, BranchProductStat, BranchProductCashierStat, BranchStockAlert,
+#
+# Split by whether a row belongs to a day, because a snapshot may now replace a window of days rather than a
+# branch's whole history (see `apply_aggregates`). Everything in DAY_MODELS carries `day` and can be replaced a
+# window at a time; the others are right-now facts with no day at all, so they are always replaced entirely.
+DAY_MODELS = (
+    BranchDailyStat, BranchCashierStat, BranchProductStat, BranchProductCashierStat,
     BranchHourlyStat, BranchTillClose, BranchTenderStat, BranchDiscountOverride,
-    BranchReturn, BranchCreditCustomer, BranchStaffDuty,
+    BranchReturn, BranchStaffDuty,
 )
+POINT_IN_TIME_MODELS = (BranchStockAlert, BranchCreditCustomer)
+AGGREGATE_MODELS = DAY_MODELS + POINT_IN_TIME_MODELS
 
 
 def dec(v) -> Decimal:
@@ -98,12 +104,55 @@ def _identifiable(rows: list[dict], *keys: str) -> tuple[list[dict], int]:
     return kept, len(rows) - len(kept)
 
 
-async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> dict:
-    """Replace this branch's entire aggregate picture with what it just sent.
+def _as_day(value) -> date | None:
+    """A row's day, however it arrived: a date from a local script, an ISO string over the wire."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _in_window(rows: list[dict], window: tuple[date, date]) -> tuple[list[dict], int]:
+    """The rows inside the window, and how many fell outside it.
+
+    A windowed run only clears the window, so a row outside it would be written where nothing was deleted: the day
+    would end up holding both the old figures and the new. Dropping those rows keeps the rule simple, a window
+    replaces exactly the days it names, and they are counted as skipped so the run says so.
+    """
+    start, end = window
+    kept = [r for r in rows if (d := _as_day(r.get("day"))) is not None and start <= d <= end]
+    return kept, len(rows) - len(kept)
+
+
+async def _place_stock_value(branch: Branch, value: Decimal) -> None:
+    """Stock is a right-now figure, so it sits on the branch's newest day alone and zero everywhere else.
+
+    Done by reading the branch's days back rather than by picking the highest day in the payload: a windowed run
+    carries an older window than the newest day on record, and writing the figure onto the payload's last day would
+    strand today's stock in the past while the newest day read zero.
+    """
+    await BranchDailyStat.filter(branch=branch).update(stock_value=D0)
+    newest = await BranchDailyStat.filter(branch=branch).order_by("-day").only("id").first()
+    if newest is not None:
+        await BranchDailyStat.filter(id=newest.id).update(stock_value=value)
+
+
+async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", window: tuple[date, date] | None = None) -> dict:
+    """Replace this branch's aggregate picture with what it just sent.
 
     One transaction: a half-applied snapshot — yesterday's product rows against today's daily
     totals — would be a dashboard that silently disagrees with itself, and nobody would know which
     half to trust.
+
+    `window` narrows what is replaced to a range of days, for a branch whose figures are rebuilt from a copy of
+    another system's database and whose history runs to years: rewriting days that cannot change costs an hour and
+    a database that keeps its high-water mark. Inside a window, only those days are cleared and only rows for those
+    days are written; the right-now tables (alerts, credit customers) are replaced either way, because that is what
+    they are. Left out, a snapshot replaces everything, which is what a branch server's own two-hourly push does.
     """
     skipped = 0
 
@@ -111,6 +160,9 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
         nonlocal skipped
         kept, dropped = _identifiable(rows or [], *keys)
         skipped += dropped
+        if window is not None:
+            kept, outside = _in_window(kept, window)
+            skipped += outside
         return kept
 
     daily = usable(data.get("daily"), "day")
@@ -128,10 +180,14 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
     credit_customers = data.get("creditCustomers") or []
     alerts = data.get("alerts") or []
     stock_value = dec(data.get("stockValue") or data.get("stock_value"))
-    latest_day = max((r["day"] for r in daily), default=None)
 
     async with in_transaction():
-        for model in AGGREGATE_MODELS:
+        for model in DAY_MODELS:
+            rows = model.filter(branch=branch)
+            if window is not None:
+                rows = rows.filter(day__gte=window[0], day__lte=window[1])
+            await rows.delete()
+        for model in POINT_IN_TIME_MODELS:
             await model.filter(branch=branch).delete()
 
         await BranchDailyStat.bulk_create([
@@ -148,9 +204,9 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
                 staff_on_duty=_int(r.get("staffOnDuty")),
                 first_sale_at=_dt(r.get("firstSaleAt")), last_sale_at=_dt(r.get("lastSaleAt")),
                 named_customers=_int(r.get("namedCustomers")),
-                # Stock is a right-now figure, not a per-day one: it belongs to the latest day
-                # alone, so a month-wide sum can't add it up 31 times.
-                stock_value=stock_value if r["day"] == latest_day else D0,
+                # Stock is a right-now figure, not a per-day one, and it is placed after the days are
+                # written (_place_stock_value) so a month-wide sum can't add it up 31 times.
+                stock_value=D0,
             ) for r in daily
         ], batch_size=200)
 
@@ -245,6 +301,8 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
             ) for r in alerts
         ], batch_size=500)
 
+        await _place_stock_value(branch, stock_value)
+
         branch.last_seen_at = datetime.now(timezone.utc)
         await branch.save(update_fields=["last_seen_at"])
 
@@ -252,8 +310,9 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
         # Worth a line even though the snapshot went through: it means the branch is sending
         # something malformed, and nobody would ever find out from figures that merely look thin.
         logs.log.warning(
-            "snapshot from %s: %s row(s) had no day or sku and were skipped; the rest was applied",
+            "snapshot from %s: %s row(s) skipped (no day or sku, or outside the window %s); the rest was applied",
             branch.code, skipped,
+            f"{window[0].isoformat()} to {window[1].isoformat()}" if window else "(none asked for)",
         )
 
     # Counts are of what was stored, not of what arrived — a figure an operator compares against the
@@ -267,6 +326,7 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync") -> 
         "alerts": len(alerts),
         "stockValue": str(stock_value),
         "skippedRows": skipped,
+        "window": f"{window[0].isoformat()}:{window[1].isoformat()}" if window else None,
         "source": source,
     }
 

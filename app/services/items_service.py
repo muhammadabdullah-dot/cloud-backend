@@ -411,6 +411,15 @@ def _row_to_create(row: dict) -> ItemCreate:
     status = cell_str_any(row, "STATUS", "Active")
     tax_raw = cell_str_any(row, "taxRate", "TAX RATE", "GST %")
     pack_size = _num(pack_size_raw, "Units per pack")
+    # The rest of what the export writes. Without these, exporting the Item master and importing it back zeroed
+    # every item discount, cleared the lock and dropped origin, though the titles line up exactly (_EXPORT_COLUMNS).
+    lock_raw = cell_str_any(row, "lockDisc", "Lock discount")
+    origin_raw = cell_str_any(row, "origin", "Imported / local", "IMPORTED/LOCAL")
+    if origin_raw and origin_raw.strip().lower() not in ("local", "imported"):
+        raise ValueError(f"Imported / local must say Imported or Local, but this row has {origin_raw!r}")
+    packs_per_box = _num(cell_str_any(row, "packsPerBox", "Packs per box", "PACKS PER BOX"), "Packs per box")
+    pieces_per_unit = _num(cell_str_any(row, "piecesPerUnit", "Pieces per unit", "PIECES PER UNIT"), "Pieces per unit")
+    pieces_per_strip = _num(cell_str_any(row, "piecesPerStrip", "Pieces per strip", "PIECES PER STRIP"), "Pieces per strip")
     present = {
         "taxRate": _num(tax_raw, "GST %"),
         "isWeighed": cell_bool(row, "isWeighed") if cell_str_any(row, "isWeighed") else None,
@@ -428,12 +437,35 @@ def _row_to_create(row: dict) -> ItemCreate:
         "brand": cell_str_any(row, "brand", "BRAND"),
         "variant": cell_str_any(row, "variant"),
         "active": (status.strip().upper() not in ("N", "NO", "FALSE", "0")) if status else None,
+        "discPercent": _num(cell_str_any(row, "discPercent", "Item disc %", "ITEM DISC %"), "Item disc %"),
+        "discFlat": _num(cell_str_any(row, "discFlat", "Item flat disc", "ITEM FLAT DISC"), "Item flat disc"),
+        "lockDisc": (lock_raw.strip().lower() in ("1", "true", "yes", "y")) if lock_raw else None,
+        "origin": origin_raw.strip().lower() if origin_raw else None,
+        "remarks": cell_str_any(row, "remarks", "Remarks", "REMARKS"),
+        "reorderLevel": _num(cell_str_any(row, "reorderLevel", "Reorder level", "REORDER LEVEL"), "Reorder level"),
+        "packsPerBox": (int(packs_per_box) or None) if packs_per_box is not None else None,
+        "piecesPerUnit": (int(pieces_per_unit) or None) if pieces_per_unit is not None else None,
+        "pieceUnit": cell_str_any(row, "pieceUnit", "Piece unit", "PIECE UNIT"),
+        "piecesPerStrip": (int(pieces_per_strip) or None) if pieces_per_strip is not None else None,
     }
+    # parentId, parentQty and homeBinId are deliberately still out of reach here: a child's parent may come later in
+    # the same file, which needs a second pass, and a godown bin is not something a catalogue file decides.
     return ItemCreate(sku=sku, name=name, price=_num(price, "Sale price"), **{k: v for k, v in present.items() if v is not None})
 
 
 async def import_items(filename: str, content: bytes, user: User | None = None) -> ImportSummary:
-    rows = parse_rows(filename, content)
+    """The Item file from the Godown screen. Parsing is all this does; the work is in `apply_item_rows`."""
+    return await apply_item_rows(parse_rows(filename, content), user, reference=filename)
+
+
+async def apply_item_rows(rows: list[dict], user: User | None = None, reference: str | None = None) -> ImportSummary:
+    """Rows already read, upserted by code: a new code creates, a known one updates only the cells the row filled.
+
+    Separate from `import_items` so anything holding rows already (another importer, a migration, a load from
+    another system's data) writes them the same way the screen does, instead of building a file for the parser to
+    read back. `item_lists_service.import_lists` takes parsed rows for the same reason. `reference` is what the
+    Item's price history shows as the paper this change came on.
+    """
     existing_skus = set(await Product.all().values_list("sku", flat=True))
     to_create: list[Product] = []
     to_update: list[tuple[str, dict]] = []
@@ -459,7 +491,7 @@ async def import_items(filename: str, content: bytes, user: User | None = None) 
             errors.append(ImportRowError(row=i, message=row_error(exc)))
 
     # Price history is collected across the whole file and written in one bulk insert at the end.
-    file_name = (filename or "").replace("\\", "/").split("/")[-1] or None
+    file_name = (reference or "").replace("\\", "/").split("/")[-1] or None
     history = []
     if to_create:
         await Product.bulk_create(to_create, batch_size=500)
@@ -478,14 +510,29 @@ async def import_items(filename: str, content: bytes, user: User | None = None) 
 async def import_aliases(filename: str, content: bytes) -> ImportSummary:
     """The legacy AliasName / Name / Remarks file. Rows match Items by exact name (or by code when the
     file has one), so import the Items first."""
-    rows = parse_rows(filename, content)
+    return await apply_alias_rows(parse_rows(filename, content))
+
+
+async def apply_alias_rows(rows: list[dict]) -> ImportSummary:
+    """Alternate barcodes, upserted by the barcode itself.
+
+    A code that already rings up *this* Item is not an error: its units per scan and remark are brought up to date
+    and the row counts as updated. A code ringing up a *different* Item still stops that row, because one code
+    ringing up two Items is the one thing this file must never be able to do. Which Item a code belongs to is
+    answered in one place, `code_owner`'s rule: an Item's own code, its barcode, or another Item's alternate.
+    """
     products = await Product.all().values("id", "name", "sku")
     name_to_id = {p["name"].strip().upper(): p["id"] for p in products}
     sku_to_id = {p["sku"]: p["id"] for p in products}
-    taken = set(await ProductAlias.all().values_list("code", flat=True)) | set(sku_to_id) | {
-        b for b in await Product.filter(barcode__isnull=False).values_list("barcode", flat=True) if b
-    }
+    owner: dict[str, str] = {code: pid for code, pid in sku_to_id.items()}
+    for code, pid in await Product.filter(barcode__isnull=False).values_list("barcode", "id"):
+        if code:
+            owner.setdefault(code, pid)
+    aliases = {a["code"]: a for a in await ProductAlias.all().values("code", "product_id", "qty", "remarks")}
+    for code, alias in aliases.items():
+        owner[code] = alias["product_id"]
     to_create: list[ProductAlias] = []
+    to_update: list[tuple[str, Decimal, str | None]] = []
     seen: set[str] = set()
     errors: list[ImportRowError] = []
     for i, row in enumerate(rows, start=2):
@@ -495,22 +542,35 @@ async def import_aliases(filename: str, content: bytes) -> ImportSummary:
             name = cell_str_any(row, "Name", "name", "Item name")
             if not code or not (name or item_code):
                 raise ValueError("Need the alternate barcode (AliasName) and the Item's Name or code")
-            if code in seen or code in taken:
-                raise ValueError(f"Barcode {code} already rings up an Item")
+            if code in seen:
+                raise ValueError(f"Barcode {code} is in this file twice")
             product_id = sku_to_id.get(item_code) if item_code else name_to_id.get(name.strip().upper())
             if not product_id:
                 raise ValueError(f"No Item {'with code ' + item_code if item_code else 'named ' + repr(name)}. Import the Items first")
+            held_by = owner.get(code)
+            if held_by and held_by != product_id:
+                raise ValueError(f"Barcode {code} already rings up another Item")
             qty_raw = cell_str_any(row, "qty", "Units per scan")
+            qty = _num(qty_raw, "qty") or Decimal("1")
+            remarks = cell_str_any(row, "Remarks", "remarks")
             seen.add(code)
-            to_create.append(ProductAlias(
-                product_id=product_id, code=code, remarks=cell_str_any(row, "Remarks", "remarks"),
-                qty=_num(qty_raw, "qty") or Decimal("1"),
-            ))
+            if code in aliases:
+                # Already this Item's own alternate: bring it up to date rather than refusing the row.
+                was = aliases[code]
+                if Decimal(str(was["qty"])) != qty or (was["remarks"] or None) != (remarks or None):
+                    to_update.append((code, qty, remarks))
+                continue
+            if held_by == product_id:
+                # It is the Item's own code or its barcode. Nothing to add, and nothing wrong either.
+                continue
+            to_create.append(ProductAlias(product_id=product_id, code=code, remarks=remarks, qty=qty))
         except (ValueError, InvalidOperation, KeyError) as exc:
             errors.append(ImportRowError(row=i, message=row_error(exc)))
     if to_create:
         await ProductAlias.bulk_create(to_create, batch_size=500)
-    return ImportSummary(created=len(to_create), updated=0, errors=errors)
+    for code, qty, remarks in to_update:
+        await ProductAlias.filter(code=code).update(qty=qty, remarks=remarks)
+    return ImportSummary(created=len(to_create), updated=len(to_update), errors=errors)
 
 
 # ── export ─────────────────────────────────────────────────────────────────────────────────────

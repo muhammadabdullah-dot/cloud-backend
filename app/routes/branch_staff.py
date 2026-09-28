@@ -8,7 +8,7 @@ from app.models import Branch, BranchMessage, BranchStaff, User
 from app.routes.registration import branch_credential
 from app.schemas.branch_staff import (
     AckIn, AckOut, BranchDirectoryEntry, BranchManifestOut, BranchRoleOut, BranchStaffCreate, BranchStaffOut,
-    BranchStaffUpdate, ManifestIn, PasswordResetOut, PermissionIn, PullOut, PulledMessage, RoleTemplateIn,
+    BranchStaffUpdate, ChangesOut, ManifestIn, PasswordResetOut, PermissionIn, PullOut, PulledMessage, RoleTemplateIn,
     RoleTemplateOut, StaffBranchOut,
 )
 from app.services import downstream_service, staff_sync_service
@@ -125,15 +125,33 @@ async def set_role(role_id: str, payload: RoleTemplateIn, user: User = Depends(_
 
 # ── branch-facing sync ─────────────────────────────────────────────────────────────────────────
 
+@sync_router.get("/changes", response_model=ChangesOut)
+async def changes(after: int = 0, wait: int = 0, branch: Branch = Depends(branch_credential)) -> ChangesOut:
+    """Listening only: is there anything for this branch after its cursor? `wait` seconds holds the question open and
+    answers the moment there is, which is how head office's own changes reach a branch in about a second.
+
+    Nothing is collected and no message is marked delivered here. That is the point of asking separately: the branch
+    listens outside its collecting lock, so its Sync now button never waits behind a hold."""
+    waited = await downstream_service.wait_for_change(branch, after, wait)
+    latest = await downstream_service.latest_seq(branch)
+    return ChangesOut(changed=latest > max(after, 0), waited=waited, latestSeq=latest)
+
+
 @sync_router.get("/pull", response_model=PullOut)
-async def pull(after: int = 0, limit: int = 200, branch: Branch = Depends(branch_credential)) -> PullOut:
-    """Messages for this branch after its cursor, oldest first. Every message is an idempotent upsert."""
+async def pull(after: int = 0, limit: int = 200, wait: int = 0, branch: Branch = Depends(branch_credential)) -> PullOut:
+    """Messages for this branch after its cursor, oldest first. Every message is an idempotent upsert.
+
+    `wait` seconds holds the question open while there is nothing to say. Waiting belongs to GET /sync/changes above,
+    which collects nothing: a branch that waits here would also make its own Sync now button wait, which is what the
+    branch software used to do. It is kept only for a branch still running that build, and is never asked for now."""
+    waited = await downstream_service.wait_for_change(branch, after, wait)
     messages, latest = await downstream_service.pull(branch, after, limit)
     others = await Branch.filter(verified_at__not_isnull=True, status="active").exclude(id=branch.id).order_by("name")
     return PullOut(
         messages=[PulledMessage(seq=m.seq, kind=m.kind, payload=m.payload, createdAt=m.created_at) for m in messages],
         latestSeq=latest,
         branches=[BranchDirectoryEntry(code=b.code, name=b.name, city=b.city) for b in others],
+        waited=waited,
         serverTime=datetime.now(timezone.utc),
     )
 
