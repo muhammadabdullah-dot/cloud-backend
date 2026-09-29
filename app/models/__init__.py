@@ -11,6 +11,15 @@ from app.models.accounts import (
 )
 from app.models.activity import BranchActivity
 from app.models.branch import Branch
+from app.models.branch_documents import (
+    BranchFbrInvoice,
+    BranchFbrInvoiceLine,
+    BranchReturnLine,
+    BranchReturnRecord,
+    BranchSale,
+    BranchSaleLine,
+    BranchSaleTender,
+)
 from app.models.promotion import BranchPromotionStat, Promotion
 from app.models.branch_staff import BranchRoleTemplate, BranchStaff, BranchStaffAssignment
 from app.models.downstream import BranchManifest, BranchMessage
@@ -100,7 +109,14 @@ __all__ = [
     "BranchReturn",
     "BranchSnapshotRun",
     "BranchStockAlert",
+    "BranchFbrInvoice",
+    "BranchFbrInvoiceLine",
     "BranchPromotionStat",
+    "BranchReturnLine",
+    "BranchReturnRecord",
+    "BranchSale",
+    "BranchSaleLine",
+    "BranchSaleTender",
     "BranchTenderStat",
     "Promotion",
     "BranchStaffDuty",

@@ -19,6 +19,9 @@ from app.services import loyalty_service, staff_sync_service, transfer_sync_serv
 PROJECTED = (
     "Staff", "Transfer", "Member", "LoyaltyEntry", "LoyaltySettings", "Activity", "AccChart", "AccVoucher", "AccSettings",
     "Supplier", "SupplierList",
+    # The documents. Until head office had tables for these they stayed `stored`, which is what the note above
+    # describes: 634 bills were already here waiting for somewhere to land.
+    "SaleRecord", "ReturnRecord", "FbrInvoice",
 )
 # How long an event of a kind head office applies may read 'stored' before the replay takes it as
 # left behind. A push stores and applies each event within moments; minutes means head office stopped
@@ -30,6 +33,12 @@ def _mirror_error():
     from app.services.accounts_mirror_service import MirrorError
 
     return MirrorError
+
+
+def _document_error():
+    from app.services.branch_documents_service import DocumentError
+
+    return DocumentError
 
 
 def _supplier_error():
@@ -74,6 +83,18 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
                 from app.services import supplier_sync_service
 
                 await supplier_sync_service.send_list(branch)
+            elif event.aggregate_type == "SaleRecord":
+                from app.services import branch_documents_service
+
+                await branch_documents_service.apply_sale(branch, (event.payload or {}).get("sale") or event.payload or {})
+            elif event.aggregate_type == "ReturnRecord":
+                from app.services import branch_documents_service
+
+                await branch_documents_service.apply_return(branch, (event.payload or {}).get("return") or event.payload or {})
+            elif event.aggregate_type == "FbrInvoice":
+                from app.services import branch_documents_service
+
+                await branch_documents_service.apply_fbr_invoice(branch, (event.payload or {}).get("invoice") or event.payload or {})
             else:
                 payload = dict(event.payload or {})
                 payload.setdefault("transferId", event.aggregate_id)
@@ -86,6 +107,7 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
         return
     except (
         staff_sync_service.StaffError, transfer_sync_service.TransferSyncError, loyalty_service.LoyaltyError, _mirror_error(),
+        _document_error(),
         _supplier_error(),
     ) as exc:
         event.status = "failed"
