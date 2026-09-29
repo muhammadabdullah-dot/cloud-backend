@@ -88,6 +88,9 @@ class SnapshotIn(BaseModel):
     # Who was on which counter, and for how long. Older branches don't send it.
     duties: list[dict] = Field(default_factory=list)
     tenders: list[dict] = Field(default_factory=list)
+    # What each campaign gave away, by day. Absent from an older branch build, which is why it defaults empty:
+    # a branch that has not been updated simply reports nothing about campaigns.
+    promotions: list[dict] = Field(default_factory=list)
     overrides: list[dict] = Field(default_factory=list)
     returns: list[dict] = Field(default_factory=list)
     creditCustomers: list[dict] = Field(default_factory=list)

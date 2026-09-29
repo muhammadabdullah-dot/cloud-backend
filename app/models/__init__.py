@@ -11,6 +11,7 @@ from app.models.accounts import (
 )
 from app.models.activity import BranchActivity
 from app.models.branch import Branch
+from app.models.promotion import BranchPromotionStat, Promotion
 from app.models.branch_staff import BranchRoleTemplate, BranchStaff, BranchStaffAssignment
 from app.models.downstream import BranchManifest, BranchMessage
 from app.models.catalog import Bin, Product, ProductAlias, ProductAttachment, ProductPriceChange, ProductSupplier, Rack, Supplier
@@ -99,7 +100,9 @@ __all__ = [
     "BranchReturn",
     "BranchSnapshotRun",
     "BranchStockAlert",
+    "BranchPromotionStat",
     "BranchTenderStat",
+    "Promotion",
     "BranchStaffDuty",
     "BranchTillClose",
     "Counter",

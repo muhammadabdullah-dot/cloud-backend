@@ -31,6 +31,7 @@ from app.routes.health import router as health_router
 from app.routes.rbac import router as rbac_router
 from app.routes.rbac import users_router
 from app.routes.warehouse import router as warehouse_router
+from app.routes.promotions import router as promotions_router
 from app.routes.suppliers import router as suppliers_router
 from app.services.seed_service import seed_branches_if_empty, seed_if_empty, sync_role_resource_grants
 from app.services.warehouse_seed import seed_warehouse_if_empty
@@ -84,6 +85,7 @@ app.include_router(loyalty_router)
 app.include_router(racks_router)
 app.include_router(putaway_router)
 app.include_router(warehouse_router)
+app.include_router(promotions_router)
 app.include_router(suppliers_router)
 app.include_router(executive_router)
 app.include_router(accounts_router)

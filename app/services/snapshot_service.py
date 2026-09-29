@@ -40,6 +40,7 @@ from app.models import (
     BranchReturn,
     BranchSnapshotRun,
     BranchStockAlert,
+    BranchPromotionStat,
     BranchTenderStat,
     BranchStaffDuty,
     BranchTillClose,
@@ -55,7 +56,7 @@ D0 = Decimal("0")
 # window at a time; the others are right-now facts with no day at all, so they are always replaced entirely.
 DAY_MODELS = (
     BranchDailyStat, BranchCashierStat, BranchProductStat, BranchProductCashierStat,
-    BranchHourlyStat, BranchTillClose, BranchTenderStat, BranchDiscountOverride,
+    BranchHourlyStat, BranchTillClose, BranchTenderStat, BranchPromotionStat, BranchDiscountOverride,
     BranchReturn, BranchStaffDuty,
 )
 POINT_IN_TIME_MODELS = (BranchStockAlert, BranchCreditCustomer)
@@ -173,6 +174,7 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
     till_closes = usable(data.get("tillCloses"), "day")
     duties = usable(data.get("duties"), "day")
     tenders = usable(data.get("tenders"), "day")
+    promotions = usable(data.get("promotions"), "day")
     overrides = usable(data.get("overrides"), "day")
     returns = usable(data.get("returns"), "day")
     # Credit customers and alerts are keyed off nothing but their own values, which are all coerced,
@@ -264,6 +266,15 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
                 branch=branch, day=r["day"], code=r.get("code") or "?", name=r.get("name") or r.get("code") or "?",
                 uses=_int(r.get("uses")), amount=dec(r.get("amount")),
             ) for r in tenders
+        ], batch_size=500)
+
+        await BranchPromotionStat.bulk_create([
+            BranchPromotionStat(
+                branch=branch, day=r["day"], promotion_code=r.get("promotionCode") or "?",
+                promotion_name=r.get("promotionName"), product_sku=r.get("productSku"),
+                lines=_int(r.get("lines")), qty=dec(r.get("qty")), given=dec(r.get("given")),
+                net_sales=dec(r.get("netSales")),
+            ) for r in promotions
         ], batch_size=500)
 
         await BranchDiscountOverride.bulk_create([

@@ -64,6 +64,10 @@ RESOURCES: list[str] = [
     # The company's supplier list: seeing it, and adding / changing / importing suppliers (every branch gets them).
     "warehouse.suppliers",
     "warehouse.suppliers.manage",
+    # Campaigns: writing one, and the separate right to approve and send it. Two rights because an approval one
+    # person holds both halves of is not an approval.
+    "warehouse.promotions",
+    "warehouse.promotions.approve",
     # Departments, categories, brands, units and GST rates the godown's Items choose from.
     "warehouse.item-lists",
     "executive.dashboard",
@@ -130,6 +134,7 @@ ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
             "warehouse.items.manage",
             "warehouse.price-changes",        # prices and costs over time: the manager's
             "warehouse.suppliers.manage",
+            "warehouse.promotions.approve",   # writing a campaign is one right, sending it to the tills is another
             "warehouse.bins.manage",
             "warehouse.item-lists",
         ],
