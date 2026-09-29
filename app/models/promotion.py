@@ -33,11 +33,9 @@ class Promotion(models.Model):
     disc_percent = fields.DecimalField(max_digits=6, decimal_places=2, default=0)
     disc_flat = fields.DecimalField(max_digits=12, decimal_places=2, default=0)
     promo_price = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
+    # 1 means every one, which is what all 11,364 of theirs are. Kept because "three for the price of two" is the
+    # first thing a shop asks for, not because they used it.
     min_qty = fields.DecimalField(max_digits=12, decimal_places=3, default=1)
-    bonus_qty = fields.DecimalField(max_digits=12, decimal_places=3, default=0)
-    # What it may give away across every branch. Null is no limit. Their own campaigns never used either.
-    qty_limit = fields.DecimalField(max_digits=14, decimal_places=3, null=True)
-    amount_limit = fields.DecimalField(max_digits=14, decimal_places=2, null=True)
     state = fields.CharField(max_length=10, default="draft")
     remarks = fields.CharField(max_length=255, null=True)
     # Every send bumps this, and a branch ignores a message older than the one it already applied, so a message that

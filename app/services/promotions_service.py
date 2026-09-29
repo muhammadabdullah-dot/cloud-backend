@@ -45,9 +45,7 @@ def payload(promo: Promotion) -> dict:
         "startsOn": promo.starts_on.isoformat(), "endsOn": promo.ends_on.isoformat(), "kind": promo.kind,
         "discPercent": str(promo.disc_percent), "discFlat": str(promo.disc_flat),
         "promoPrice": str(promo.promo_price) if promo.promo_price is not None else None,
-        "minQty": str(promo.min_qty), "bonusQty": str(promo.bonus_qty),
-        "qtyLimit": str(promo.qty_limit) if promo.qty_limit is not None else None,
-        "amountLimit": str(promo.amount_limit) if promo.amount_limit is not None else None,
+        "minQty": str(promo.min_qty),
         # A stopped campaign travels switched off rather than being deleted, so a branch stops selling under it and
         # can still say what it gave while it ran.
         "active": promo.state == "live",
@@ -107,9 +105,6 @@ async def _check(data: dict, code: str | None = None) -> dict:
         "disc_flat": flat if kind == "flat" else ZERO,
         "promo_price": price if kind == "price" else None,
         "min_qty": _money(data.get("minQty") or 1, "The smallest quantity"),
-        "bonus_qty": _money(data.get("bonusQty"), "The free quantity"),
-        "qty_limit": _money(data["qtyLimit"], "The quantity limit") if data.get("qtyLimit") not in (None, "") else None,
-        "amount_limit": _money(data["amountLimit"], "The spend limit") if data.get("amountLimit") not in (None, "") else None,
         "remarks": (data.get("remarks") or "").strip()[:255] or None,
     }
 
@@ -244,10 +239,7 @@ def out(promo: Promotion) -> dict:
         "startsOn": promo.starts_on.isoformat(), "endsOn": promo.ends_on.isoformat(),
         "kind": promo.kind, "discPercent": str(promo.disc_percent), "discFlat": str(promo.disc_flat),
         "promoPrice": str(promo.promo_price) if promo.promo_price is not None else None,
-        "minQty": str(promo.min_qty), "bonusQty": str(promo.bonus_qty),
-        "qtyLimit": str(promo.qty_limit) if promo.qty_limit is not None else None,
-        "amountLimit": str(promo.amount_limit) if promo.amount_limit is not None else None,
-        "state": promo.state, "remarks": promo.remarks, "rev": promo.rev,
+        "minQty": str(promo.min_qty), "state": promo.state, "remarks": promo.remarks, "rev": promo.rev,
         "createdBy": promo.created_by_name, "approvedBy": promo.approved_by_name,
         "approvedAt": promo.approved_at.isoformat() if promo.approved_at else None,
         "publishedAt": promo.published_at.isoformat() if promo.published_at else None,
