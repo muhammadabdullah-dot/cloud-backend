@@ -23,6 +23,13 @@ ACCOUNTS_RESOURCES: list[str] = [
     "accounts.tax",
     "accounts.settings",
     "accounts.period",
+    # The registers: the reports an accountant runs, as against the statements the books produce. One tick for the
+    # family, because they are read together and nobody is given the cash flow and refused the voucher detail.
+    "accounts.registers",
+    # Cheques and the post dated cheque register, and agreeing a bank account with its statement. Both were the
+    # branch server's alone; the accountant works here, so they are here.
+    "accounts.cheques",
+    "accounts.bank-reconciliation",
     # Every branch's books, and the whole company's added together.
     "accounts.branch-books",
 ]

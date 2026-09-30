@@ -11,6 +11,7 @@ from app.core import logs
 from app.middlewares.error_handler import register_error_handlers
 from app.routes.client_errors import router as client_errors_router
 from app.routes.accounts import router as accounts_router
+from app.routes.accounts_registers import router as accounts_registers_router
 from app.routes.activity import router as activity_router
 from app.routes.alerts import router as alerts_router
 from app.routes.purchasing import router as purchasing_router
@@ -89,6 +90,8 @@ app.include_router(promotions_router)
 app.include_router(suppliers_router)
 app.include_router(executive_router)
 app.include_router(accounts_router)
+# After accounts_router: both mount under /accounts, and the registers add paths beside its own.
+app.include_router(accounts_registers_router)
 from app.routes import fixed_assets, tax_reports  # noqa: E402
 app.include_router(fixed_assets.router)
 app.include_router(tax_reports.router)
@@ -145,6 +148,11 @@ async def _seed() -> None:
         print(f"  accounts: {added} chart row(s) added to head office's books", flush=True)
     await accounts_chart_service.ensure_supplier_accounts()
     await accounts_chart_service.ensure_branch_accounts()
+    # A branch's supplier account arrives carrying its supplier's own details; head office's own has to read them
+    # off its Supplier list, or the payable register ages every head office supplier against zero credit days.
+    refreshed = await accounts_chart_service.refresh_own_party_facts()
+    if refreshed:
+        print(f"  accounts: {refreshed} head office supplier account(s) took their supplier's details", flush=True)
     from app.services import projector
     applied, failing = await projector.replay_failed()
     if applied or failing:

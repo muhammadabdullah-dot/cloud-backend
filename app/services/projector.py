@@ -22,6 +22,9 @@ PROJECTED = (
     # The documents. Until head office had tables for these they stayed `stored`, which is what the note above
     # describes: 634 bills were already here waiting for somewhere to land.
     "SaleRecord", "ReturnRecord", "FbrInvoice",
+    # Cheques. The post dated register and the bank reconciliation live here now, so every state a branch's cheque
+    # passes through has to arrive, not only the day it was written.
+    "Cheque",
 )
 # How long an event of a kind head office applies may read 'stored' before the replay takes it as
 # left behind. A push stores and applies each event within moments; minutes means head office stopped
@@ -45,6 +48,12 @@ def _supplier_error():
     from app.services.supplier_sync_service import SupplierSyncError
 
     return SupplierSyncError
+
+
+def _cheque_error():
+    from app.services.cheques_service import ChequeError
+
+    return ChequeError
 
 
 async def project(branch: Branch, event: SyncInboxEvent) -> None:
@@ -95,6 +104,10 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
                 from app.services import branch_documents_service
 
                 await branch_documents_service.apply_fbr_invoice(branch, (event.payload or {}).get("invoice") or event.payload or {})
+            elif event.aggregate_type == "Cheque":
+                from app.services import cheques_service
+
+                await cheques_service.apply_from_branch(branch.code, (event.payload or {}).get("cheque") or event.payload or {})
             else:
                 payload = dict(event.payload or {})
                 payload.setdefault("transferId", event.aggregate_id)
@@ -109,6 +122,7 @@ async def project(branch: Branch, event: SyncInboxEvent) -> None:
         staff_sync_service.StaffError, transfer_sync_service.TransferSyncError, loyalty_service.LoyaltyError, _mirror_error(),
         _document_error(),
         _supplier_error(),
+        _cheque_error(),
     ) as exc:
         event.status = "failed"
         event.apply_error = exc.message

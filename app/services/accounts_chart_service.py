@@ -5,7 +5,7 @@ added together. Head office's own book is "HO"; a branch's accounts, groups and 
 code and are only ever changed by the branch.
 """
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from tortoise.transactions import atomic
 
@@ -241,11 +241,21 @@ class Resolver:
                 account = await Account.create(
                     book=self.book, code=await next_account_code(self.book, SUPPLIERS_GROUP), name=supplier.name[:160],
                     group_id=gid(self.book, SUPPLIERS_GROUP), sub_group_id=gid(self.book, f"{SUPPLIERS_GROUP}01"), kind="supplier",
-                    system_key=key, party_ref=str(supplier.id),
+                    system_key=key, party_ref=str(supplier.id), **own_party_facts(supplier),
                 )
-            elif account.name != supplier.name[:160]:
-                account.name = supplier.name[:160]
-                await account.save(update_fields=["name", "updated_at"])
+            else:
+                # A branch's account arrives with its party's details on it; head office's own has to read them off
+                # its own Supplier, or the payable register would age head office's suppliers against nothing.
+                changed = {}
+                if account.name != supplier.name[:160]:
+                    changed["name"] = supplier.name[:160]
+                for field, value in own_party_facts(supplier).items():
+                    if getattr(account, field) != value:
+                        changed[field] = value
+                if changed:
+                    for field, value in changed.items():
+                        setattr(account, field, value)
+                    await account.save(update_fields=[*changed, "updated_at"])
             self._by_key[key] = account
         return self._by_key[key]
 
@@ -266,6 +276,21 @@ class Resolver:
         return self._by_key[key]
 
 
+def own_party_facts(supplier) -> dict:
+    """A head office supplier's own details, in the columns the registers read.
+
+    A branch sends these up beside the account it is describing. Head office's own accounts have no branch to send
+    them, so they are read here off the Supplier this account stands for. Without them the payable summary shows no
+    city and the invoice detail ages every head office supplier against zero credit days, which quietly marks
+    everything overdue on the day it is raised.
+    """
+    return {
+        "party_code": (supplier.code or None), "party_phone": (supplier.phone or None),
+        "party_address": (supplier.address or None), "party_contact": (supplier.contact_person or None),
+        "party_city": (supplier.city or None), "party_due_days": supplier.due_days or 0,
+    }
+
+
 async def ensure_supplier_accounts() -> int:
     from app.models import Supplier
 
@@ -276,6 +301,27 @@ async def ensure_supplier_accounts() -> int:
             await resolver.supplier(supplier)
             made += 1
     return made
+
+
+async def refresh_own_party_facts() -> int:
+    """Bring head office's own supplier accounts in step with its Supplier list. Runs every startup; cheap, and it
+    finds nothing to do once everything agrees."""
+    from app.models import Supplier
+
+    suppliers = {str(s.id): s for s in await Supplier.all()}
+    changed = 0
+    for account in await Account.filter(book=HEAD_OFFICE_BOOK, kind="supplier"):
+        supplier = suppliers.get(account.party_ref or "")
+        if supplier is None:
+            continue
+        wanted = own_party_facts(supplier)
+        gone = {f: v for f, v in wanted.items() if getattr(account, f) != v}
+        if gone:
+            for field, value in gone.items():
+                setattr(account, field, value)
+            await account.save(update_fields=[*gone, "updated_at"])
+            changed += 1
+    return changed
 
 
 async def ensure_branch_accounts() -> int:
@@ -565,6 +611,33 @@ async def _group_for(book: str, group_code: str) -> str:
     raise ChartError(f"An account from the branch is in group {group_code}, which head office doesn't have for that branch yet.")
 
 
+def _party_fields(data: dict) -> dict:
+    """The customer's or supplier's own facts, as the branch sends them beside the account.
+
+    An older branch sends none of them. `_cut` keeps a long value inside its column rather than failing the whole
+    account over a field nothing is keyed on.
+    """
+    def _cut(key: str, size: int) -> str | None:
+        value = data.get(key)
+        return str(value)[:size] if value not in (None, "") else None
+
+    try:
+        limit = Decimal(str(data["partyCreditLimit"])) if data.get("partyCreditLimit") not in (None, "") else None
+    except (InvalidOperation, ValueError):
+        limit = None
+    try:
+        due_days = int(data.get("partyDueDays") or 0)
+    except (TypeError, ValueError):
+        due_days = 0
+    return {
+        "party_code": _cut("partyCode", 20), "party_phone": _cut("partyPhone", 30),
+        "party_address": _cut("partyAddress", 255), "party_contact": _cut("partyContact", 120),
+        "party_city": _cut("partyCity", 80), "party_area": _cut("partyArea", 120),
+        "party_sub_area": _cut("partySubArea", 120), "party_category": _cut("partyCategory", 80),
+        "party_due_days": due_days, "party_credit_limit": limit,
+    }
+
+
 async def apply_account(book: str, data: dict) -> None:
     account_id = data.get("id")
     if not account_id:
@@ -588,6 +661,8 @@ async def apply_account(book: str, data: dict) -> None:
         kind=str(data.get("kind") or "general")[:12], system_key=key, party_ref=data.get("partyRef"), active=bool(data.get("active", True)),
         restricted=bool(data.get("restricted")), bank_name=data.get("bankName"), bank_account_no=data.get("bankAccountNo"),
         standard=bool(data.get("standard")),
+        # A branch that has not yet been upgraded sends none of these; the account still lands, with them empty.
+        **_party_fields(data),
     )
     if await Account.exists(id=account_id):
         await Account.filter(id=account_id).update(**fields)

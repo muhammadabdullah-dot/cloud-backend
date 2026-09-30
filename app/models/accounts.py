@@ -84,6 +84,19 @@ class Account(models.Model):
     manual_code = fields.CharField(max_length=30, null=True)
     remarks = fields.CharField(max_length=255, null=True)
     standard = fields.BooleanField(default=False)
+    # The party behind a customer or supplier account, copied up with the account itself. Head office keeps no Party
+    # or Supplier of a branch's, and the receivable and payable registers group by these and age against the credit
+    # days, so they have to be here. Null on every other kind of account.
+    party_code = fields.CharField(max_length=20, null=True)
+    party_phone = fields.CharField(max_length=30, null=True)
+    party_address = fields.CharField(max_length=255, null=True)
+    party_contact = fields.CharField(max_length=120, null=True)
+    party_city = fields.CharField(max_length=80, null=True)
+    party_area = fields.CharField(max_length=120, null=True)
+    party_sub_area = fields.CharField(max_length=120, null=True)
+    party_category = fields.CharField(max_length=80, null=True)
+    party_due_days = fields.IntField(default=0)
+    party_credit_limit = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 
@@ -146,8 +159,58 @@ class VoucherLine(models.Model):
     description = fields.CharField(max_length=255, null=True)
     reference_no = fields.CharField(max_length=60, null=True)
 
+    # The reconciliation this line was ticked onto, meaning it appeared on the bank's statement. Null is not yet
+    # reconciled, which is what every line is until somebody reconciles the account. This is the Clear / UnClear
+    # column of their Bank Reconciliation Statement.
+    reconciliation: fields.ForeignKeyNullableRelation["BankReconciliation"] = fields.ForeignKeyField(
+        "models.BankReconciliation", related_name="lines", null=True, on_delete=fields.SET_NULL
+    )
+
     class Meta:
         table = "acc_voucher_lines"
+
+
+class BankReconciliation(models.Model):
+    """Agreeing a bank account's own books with the bank's statement, as at a date. Head office's, or a branch's.
+
+    The arithmetic is the whole feature. Everything the books say about the account up to that date is its book
+    balance. What the bank's statement says is the statement balance. The difference is the entries the books know
+    about and the statement does not: cheques written that nobody has presented, and money paid in that has not
+    landed. Tick what is on the statement, and when the ticked entries come to the statement balance the account is
+    reconciled and what is left is a list somebody can read.
+
+    Book-scoped like everything else here, because the accountant sits at head office and reconciles whichever
+    book's bank account is in front of them.
+
+    Their own software has this screen and its table is empty: not one of their 1,330 accounts was ever reconciled
+    in it, while its statement report runs to 4,727 pages of UnClear card sales. That is the problem this exists to
+    make visible, not a feature nobody asked for.
+    """
+
+    id = fields.UUIDField(pk=True)
+    book = fields.CharField(max_length=20, default=HEAD_OFFICE_BOOK)
+    number = fields.CharField(max_length=20, unique=True)
+    account: fields.ForeignKeyRelation[Account] = fields.ForeignKeyField(
+        "models.Account", related_name="reconciliations", on_delete=fields.RESTRICT
+    )
+    # Everything dated on or before this day is in scope; anything later waits for the next one.
+    up_to = fields.DateField()
+    # What the bank says the account held on that day.
+    statement_balance = fields.DecimalField(max_digits=16, decimal_places=2)
+    # What the books said, written down when it was closed so a later posting cannot change history.
+    book_balance = fields.DecimalField(max_digits=16, decimal_places=2, null=True)
+    # open · closed
+    status = fields.CharField(max_length=10, default="open")
+    closed_at = fields.DatetimeField(null=True)
+    closed_by_name = fields.CharField(max_length=120, null=True)
+    note = fields.CharField(max_length=255, null=True)
+    created_by_name = fields.CharField(max_length=120, null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "acc_bank_reconciliations"
+        indexes = (("book", "status"),)
 
 
 class AccountsSettings(models.Model):

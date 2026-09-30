@@ -76,6 +76,7 @@ ABILITIES: list[tuple[str, str, str, str, str]] = [
     ("accounts-books", "accounts.payables", "R", "Payables", "What each supplier is owed, and for how long."),
     ("accounts-books", "accounts.tax", "R", "Tax reports", "GST and withholding tax."),
     ("accounts-books", "accounts.branch-books", "R", "Every branch's books and the whole company", "Without it, only head office's own books."),
+    ("accounts-books", "accounts.registers", "R", "Registers", "Cash flow, account summary, voucher detail, date wise payment and receipt, receivable and payable summaries, supplier balance detail and the daily operation report."),
     # ── accounts: vouchers ──
     ("accounts-vouchers", "accounts.vouchers", "R", "See vouchers", "Only vouchers whose every account they can see."),
     ("accounts-vouchers", "accounts.vouchers", "W", "Write and change draft vouchers", "Every line must be an account they can use. Drafts can be cancelled too."),
@@ -86,6 +87,11 @@ ABILITIES: list[tuple[str, str, str, str, str]] = [
     ("accounts-vouchers", "accounts.fixed-assets", "R", "Fixed asset register", "Furniture, equipment and vehicles, and what they are worth now."),
     ("accounts-vouchers", "accounts.fixed-assets", "W", "Add, change and dispose of fixed assets", ""),
     ("accounts-vouchers", "accounts.fixed-assets", "X", "Prepare the depreciation run", ""),
+    ("accounts-vouchers", "accounts.cheques", "R", "Cheques and the post dated cheque register", "Every cheque taken in or written out, when it falls due and whether it has cleared."),
+    ("accounts-vouchers", "accounts.cheques", "W", "Record and change cheques", ""),
+    ("accounts-vouchers", "accounts.cheques", "X", "Clear, bounce, cancel and deposit a cheque again", ""),
+    ("accounts-vouchers", "accounts.bank-reconciliation", "R", "Bank reconciliation and its statement", "What the books say against what the bank says, and everything never agreed."),
+    ("accounts-vouchers", "accounts.bank-reconciliation", "W", "Agree a bank account with its statement", "Open one, tick what is on the statement, and finish it when the two agree."),
     # ── accounts: setting the books up and closing months ──
     ("accounts-setup", "accounts.chart", "R", "Chart of Accounts", "Only the accounts they can see."),
     ("accounts-setup", "accounts.chart", "W", "Change the chart of accounts", "Add account groups, expense heads and bank accounts."),
