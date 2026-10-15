@@ -28,12 +28,15 @@ pattern is `accounts_reports_service._sums`, and these follow it.
 software shows payables negative. The two say the same thing and the crosswalk records the difference, so nobody
 reconciles one against the other and finds a fault that is not there.
 """
+import asyncio
 from datetime import date
 from decimal import Decimal
 
+from app.core import dialect, when
 from app.models import HEAD_OFFICE_BOOK  # noqa: F401  (imported from here by the routes)
 from app.services.accounts_chart_service import money
-from app.services.accounts_reports_service import _d, _query, _s, chart_map
+from app.services.accounts_reports_service import (WIDE_WINDOW_DAYS, sums_by_kind, _d, _query, _s,
+                                                   chart_map)
 
 ZERO = Decimal("0")
 
@@ -94,57 +97,134 @@ def _passes(value: Decimal, operator: str | None, target: Decimal | None) -> boo
     }[operator]
 
 
-def _chunks(values: list, size: int = 400):
-    for i in range(0, len(values), size):
-        yield values[i:i + size]
+def _join(start, end) -> str:
+    """Which join a windowed read of the ledger should use, by how wide its window is.
+
+    With both ends pinned the planner seeks the vouchers by date and looks their lines up one voucher at a time,
+    which is right for a month and wrong for a year: the cash flow over twelve months took 44.0s against a browser
+    that gives up at 15. Same rule, same crossover and the same measurements as `accounts_reports_service._sums`;
+    the table is in `dialect.hash_join`. A window with an open end keeps the plain join, which is already the good
+    plan for it.
+    """
+    if start is None or end is None or (end - start).days <= WIDE_WINDOW_DAYS:
+        return "JOIN"
+    return dialect.hash_join()
 
 
 async def _voucher_lines(books: list[str], start: date | None, end: date | None,
-                         touching: list[str] | None = None, vtypes: tuple[str, ...] | None = None) -> list[dict]:
-    """Every posted line of every voucher in the window, optionally only vouchers that touch certain accounts.
+                         vtypes: tuple[str, ...] | None = None) -> list[dict]:
+    """Every posted line of every voucher in the window.
 
-    The whole voucher comes back, not only the line that matched, because most of these reports need the *other*
-    side: a cash flow is meaningless without knowing who the cash came from, and that is another line of the same
-    voucher.
+    The whole voucher comes back, not only one side of it, because `voucher_detail` needs the *other* side: it names
+    the counterparty of each payment, and that is another line of the same voucher.
+
+    **There is no longer a `touching` argument, and that is the fix for four registers that never returned.** It took
+    a list of party accounts and asked for every line of every voucher touching any of them, which is a different
+    question from the one its two callers asked: both threw away every line that was not on a party account. On head
+    office's book that meant fetching the whole other side of every supplier voucher ever written, fifteen columns
+    wide, to use the supplier half. Over the 2,100 parameter ceiling it was worse: the list was cut into chunks and
+    the same scan re-run per chunk. `date-wise-payment`, `date-wise-receipt`, `balance-detail` and `daily-operation`
+    all timed out past 40 seconds on it. They ask `_party_lines` below instead, which fetches the party lines and
+    nothing else. Measured on head office's book, the old call against the new one, same answer byte for byte:
+
+        date wise payment     108.2s -> 0.15s
+        date wise receipt      58.8s -> 0.13s
+        balance detail        871.4s -> 2.50s     (5.7 MB of invoices; 359.5s -> 0.69s for customers)
+        daily operation       the same walk, cut to a window afterwards
     """
     if not books:
         return []
-    where = ["v.status = 'posted'", f"v.book IN ({','.join('?' for _ in books)})"]
+    where = ["v.status = 'posted'", f"v.book IN ({dialect.codes(books)})"]
     params: list = list(books)
-    if start:
-        where.append("v.date >= ?")
-        params.append(start.isoformat())
-    if end:
-        where.append("v.date <= ?")
-        params.append(end.isoformat())
+    # `when.voucher_bound` picks the column: `v.date` for a whole day, `v.at` when a time was chosen. A voucher
+    # with no moment drops out of a timed window, which is why only the registers that LIST entries are marked as
+    # honouring a time; see the note on that helper and on `core/when.GRAIN`.
+    for op, value in (( ">=", start), ("<=", end)):
+        bound = when.voucher_bound(op, value)
+        if bound:
+            where.append(bound[0])
+            params.append(bound[1])
     if vtypes:
-        where.append(f"v.vtype IN ({','.join('?' for _ in vtypes)})")
+        where.append(f"v.vtype IN ({dialect.codes(vtypes)})")
         params.extend(vtypes)
-    sql = (
+    return await _query(
         "SELECT v.id AS voucher_id, v.book AS book, v.number AS number, v.vtype AS vtype, v.date AS day, "
         "v.reference_no AS reference_no, v.description AS description, v.cheque_no AS cheque_no, "
         "v.header_account_id AS header_id, v.created_by_name AS created_by, v.source AS source, "
         "l.account_id AS account_id, l.debit AS debit, l.credit AS credit, l.description AS line_note "
-        "FROM acc_vouchers v JOIN acc_voucher_lines l ON l.voucher_id = v.id "
-        f"WHERE {' AND '.join(where)}"
+        f"FROM acc_vouchers v {_join(start, end)} acc_voucher_lines l ON l.voucher_id = v.id "
+        f"WHERE {' AND '.join(where)} ORDER BY v.date, v.number, l.line_no", params,
     )
-    if touching is None:
-        return await _query(sql + " ORDER BY v.date, v.number, l.line_no", params)
-    rows: list[dict] = []
-    seen: set[str] = set()
-    for chunk in _chunks(touching):
-        marks = ",".join("?" for _ in chunk)
-        for row in await _query(
-            f"{sql} AND v.id IN (SELECT voucher_id FROM acc_voucher_lines WHERE account_id IN ({marks})) "
-            "ORDER BY v.date, v.number, l.line_no", [*params, *chunk],
-        ):
-            key = f"{row['voucher_id']}:{row['account_id']}:{row['debit']}:{row['credit']}:{row.get('line_note')}"
-            if key in seen:
-                continue  # a voucher touching two accounts of the chunked set comes back once per chunk
-            seen.add(key)
-            rows.append(row)
-    rows.sort(key=lambda r: (str(r["day"]), str(r["number"])))
-    return rows
+
+
+async def _party_lines(books: list[str], kind: str, start: date | None, end: date,
+                       vtypes: tuple[str, ...] | None = None) -> list[dict]:
+    """Every posted line that sits on a customer's or a supplier's own account, with its voucher's own details.
+
+    The two registers that read a party's movements -- the date wise pair, and the invoice by invoice walk behind
+    balance detail and daily operation -- only ever look at lines on party accounts. They never read the cash or
+    expense side, so there is no reason to fetch it. Before this they went through `_voucher_lines(touching=...)`,
+    which fetched the whole voucher and then dropped most of it: on head office's book it read every line of every
+    voucher touching any of 956 suppliers to keep the 25,811 lines that are actually on one. `_voucher_lines` above
+    carries the four measurements.
+
+    The parties are found the way `ageing` and `sums_by_kind` find theirs: `kind` and `book` are columns on
+    acc_accounts, so the database picks them. Naming the 956 suppliers as parameters is what made it slow rather
+    than what made it work, and past 2,100 of them it could not be done at all, so the old code chunked the list and
+    re-ran the same scan once per chunk.
+
+    **Ordered exactly as `_voucher_lines` was**, by voucher date, voucher number and line number, because both
+    callers sort what comes back with a stable sort and so depend on the order inside each tie. `number` is unique
+    on acc_vouchers, so a voucher's lines are contiguous in that order, which is what lets the callers stop grouping
+    by voucher first.
+    """
+    if not books:
+        return []
+    marks = dialect.codes(books)
+    where = ["v.status = 'posted'", f"v.book IN ({marks})", f"a.book IN ({marks})", f"a.kind = {dialect.mark('varchar(20)')}", "v.date <= ?"]
+    params: list = [*books, *books, kind, end.isoformat()]
+    if start:
+        where.append("v.date >= ?")
+        params.append(start.isoformat())
+    if vtypes:
+        where.append(f"v.vtype IN ({dialect.codes(vtypes)})")
+        params.extend(vtypes)
+    return await _query(
+        "SELECT v.id AS voucher_id, v.book AS book, v.number AS number, v.vtype AS vtype, v.date AS day, "
+        "v.reference_no AS reference_no, v.description AS description, v.cheque_no AS cheque_no, "
+        "v.created_by_name AS created_by, v.source AS source, "
+        "l.account_id AS account_id, l.debit AS debit, l.credit AS credit "
+        f"FROM acc_vouchers v {_join(start, end)} acc_voucher_lines l ON l.voucher_id = v.id "
+        "JOIN acc_accounts a ON a.id = l.account_id "
+        f"WHERE {' AND '.join(where)} ORDER BY v.date, v.number, l.line_no", params,
+    )
+
+
+async def _window_lines(books: list[str], start: date, end: date) -> list[dict]:
+    """Every line of every posted voucher in the window, five columns wide and in whatever order they come.
+
+    A cash flow reads five things off a line: which voucher it belongs to, which account it is, the debit, the
+    credit, and where the line sits in its voucher. `_voucher_lines` hands back fifteen columns, three of them free
+    text, because the registers that need the voucher's own story share it; over September that is a quarter of a
+    million rows of description and reference fetched through ODBC and dropped on the floor.
+
+    **Nothing narrows this to the vouchers that touch money.** The caller skips every line that is not on a money
+    account, so a voucher with none of them contributes nothing either way. Finding those vouchers took a second
+    pass over the same lines -- 4.33s against 1.90s -- to leave out 4,282 rows of 263,682, which is 1.6% of them.
+
+    **And nothing orders them.** `ORDER BY` over a quarter of a million rows is a sort the server has to be granted
+    memory for, and when another session has the memory it spills to tempdb instead: the same statement answered in
+    1.90s unordered and 27.44s ordered. The caller needs the order inside each voucher and nowhere else, which is a
+    handful of rows at a time, so it sorts each voucher itself.
+    """
+    marks = dialect.codes(books)
+    return await _query(
+        "SELECT l.voucher_id AS voucher_id, l.account_id AS account_id, l.debit AS debit, l.credit AS credit, "
+        "l.line_no AS line_no "
+        f"FROM acc_vouchers v {_join(start, end)} acc_voucher_lines l ON l.voucher_id = v.id "
+        f"WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date >= ? AND v.date <= ?",
+        [*books, start.isoformat(), end.isoformat()],
+    )
 
 
 def _by_voucher(rows: list[dict]) -> dict[str, list[dict]]:
@@ -174,53 +254,91 @@ async def cash_flow(books: list[str], start: date, end: date, mode: str = "both"
     """
     if mode not in MONEY_KINDS:
         raise RegisterError(f"A cash flow is over cash, bank or both, not '{mode}'.")
-    chart = await chart_map(books)
     kinds = MONEY_KINDS[mode]
+    marks = dialect.codes(books)
+    # The opening balances came back four hundred accounts at a time, and naming the accounts is what made that slow
+    # rather than what made it work: 333 account ids as parameters had SQL Server seek idx_avl_account once per id
+    # and then look each line's voucher up a row at a time, which over 3.5M cash lines is 3.5M lookups and 51.96
+    # seconds for one figure per account. `kind` and `book` are columns on acc_accounts, so the database picks the
+    # money accounts itself and the whole thing is one pass: 4.21s, the way `ageing` and `sums_by_kind` do it.
+    where = ["v.status = 'posted'", f"v.book IN ({marks})", "v.date < ?",
+             f"a.book IN ({marks})", f"a.kind IN ({dialect.codes(kinds)})"]
+    params: list = [*books, start.isoformat(), *books, *kinds]
+    if account_ids:
+        # Narrowed to the screen's own pick, which is short enough to name and cheaper named. The caller's own list
+        # goes in rather than the money accounts among it, because the chart is being read at the same moment as
+        # this; `a.kind` and `a.book` beside it already cut the answer down to exactly the accounts kept below.
+        where.append(f"l.account_id IN ({dialect.marks(account_ids)})")
+        params.extend(account_ids)
+    # Three reads that do not need each other: the chart, the opening balances, and the window's lines. Asked for
+    # one after another they cost 6.80s and asked for at once 4.87s, because the server runs the two scans side by
+    # side. The opening balances are the slowest of the three and the last thing wanted -- nothing but the running
+    # balance at the bottom of this function reads them -- so they are asked for first and collected last, and the
+    # attribution below runs while the server is still adding them up.
+    opening_asked = asyncio.ensure_future(
+        _query("SELECT l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
+               f"FROM acc_voucher_lines l {_join(start, end)} acc_vouchers v ON v.id = l.voucher_id "
+               "JOIN acc_accounts a ON a.id = l.account_id "
+               f"WHERE {' AND '.join(where)} GROUP BY l.account_id", params))
+    try:
+        chart, line_rows = await asyncio.gather(chart_map(books), _window_lines(books, start, end))
+    except BaseException:
+        # Waited for and then dropped, never cancelled. Cancelling a query in flight returns its connection to the
+        # pool while the server is still writing an answer down it, and the next caller gets that connection.
+        await asyncio.gather(opening_asked, return_exceptions=True)
+        raise
     picked = {aid for aid, m in chart.items() if m["kind"] in kinds}
     if account_ids:
         picked &= set(account_ids)
     if not picked:
+        # Past the reads rather than before them, which costs nothing real: no money account in these books means
+        # the opening query's account side is empty and it answers at once, and a book with no till has no vouchers
+        # to read either. Collected and dropped rather than cancelled, for the reason above.
+        await opening_asked
         return {"start": start.isoformat(), "end": end.isoformat(), "mode": mode, "accounts": [],
                 "totals": {k: _s(ZERO) for k in ("inFlow", "outFlow", "net")}}
 
     ids = sorted(picked)
-    opening: dict[str, Decimal] = {aid: ZERO for aid in ids}
-    for chunk in _chunks(ids):
-        marks = ",".join("?" for _ in chunk)
-        for row in await _query(
-            "SELECT l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
-            "FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
-            f"WHERE v.status = 'posted' AND v.book IN ({','.join('?' for _ in books)}) AND v.date < ? "
-            f"AND l.account_id IN ({marks}) GROUP BY l.account_id",
-            [*books, start.isoformat(), *chunk],
-        ):
-            opening[str(row["account_id"])] = money(_d(row["dr"]) - _d(row["cr"]))
-
     flows: dict[str, dict[str, list[Decimal]]] = {aid: {} for aid in ids}
-    for lines in _by_voucher(await _voucher_lines(books, start, end, touching=ids)).values():
-        others = [l for l in lines if str(l["account_id"]) not in picked]
-        for line in lines:
-            aid = str(line["account_id"])
+    for lines in _by_voucher(line_rows).values():
+        # In voucher order, because the last counterparty of a voucher takes the rounding remainder when its money
+        # is split, so which line is last has to be the same answer every time. Sorting a voucher's handful of lines
+        # here is what lets the query leave out an ORDER BY over a quarter of a million rows.
+        lines.sort(key=lambda line: line["line_no"])
+        # `_net` builds two Decimals and rounds, and the loop below used to ask it again for every pair of lines in
+        # a voucher: four times over for a counterparty, millions of times over 263,682 lines. The account id was
+        # re-stringified just as often. Both are facts about a line, so they are read once per line.
+        aids = [str(l["account_id"]) for l in lines]
+        nets = [_net(l) for l in lines]
+        others = [at for at, aid in enumerate(aids) if aid not in picked]
+        for at, aid in enumerate(aids):
             if aid not in picked:
                 continue
-            movement = _net(line)
+            movement = nets[at]
             if movement == ZERO:
                 continue
             # The counterparties are the lines facing the other way. A contra between two money accounts counts the
             # other money account as the counterparty, which is exactly how it should read.
-            facing = [l for l in (others or [l for l in lines if l is not line])
-                      if (_net(l) < ZERO) == (movement > ZERO) and _net(l) != ZERO]
-            total = sum((abs(_net(l)) for l in facing), ZERO)
+            facing = [i for i in (others or [i for i in range(len(lines)) if i != at])
+                      if (nets[i] < ZERO) == (movement > ZERO) and nets[i] != ZERO]
+            total = sum((abs(nets[i]) for i in facing), ZERO)
             if total == ZERO:
                 bucket = flows[aid].setdefault("", [ZERO, ZERO])
                 bucket[0 if movement > ZERO else 1] += abs(movement)
                 continue
             left = abs(movement)
             for i, other in enumerate(facing):
-                share = left if i == len(facing) - 1 else money(abs(movement) * abs(_net(other)) / total)
+                share = left if i == len(facing) - 1 else money(abs(movement) * abs(nets[other]) / total)
                 left -= share
-                bucket = flows[aid].setdefault(str(other["account_id"]), [ZERO, ZERO])
+                bucket = flows[aid].setdefault(aids[other], [ZERO, ZERO])
                 bucket[0 if movement > ZERO else 1] += share
+
+    # Collected here rather than above, so the whole attribution happened while the server was still summing them.
+    opening: dict[str, Decimal] = {aid: ZERO for aid in ids}
+    for row in await opening_asked:
+        aid = str(row["account_id"])
+        if aid in opening:
+            opening[aid] = money(_d(row["dr"]) - _d(row["cr"]))
 
     accounts = []
     grand_in = grand_out = ZERO
@@ -270,7 +388,6 @@ async def account_summary(books: list[str], start: date | None, end: date, pivot
     """
     if pivot not in PIVOTS:
         raise RegisterError(f"A summary is by {', '.join(PIVOTS)}, not '{pivot}'.")
-    chart = await chart_map(books)
     wanted = set(account_ids) if account_ids else None
 
     def key_of(meta: dict) -> tuple[str, str]:
@@ -281,13 +398,27 @@ async def account_summary(books: list[str], start: date | None, end: date, pivot
             "type": (meta["typeCode"], f"{meta['typeCode']} {meta['typeName']}"),
         }[pivot]
 
-    from app.services.accounts_reports_service import _sums
+    from app.services.accounts_reports_service import _opening_and_period, _sums
+
+    if wanted is None:
+        # Naming the accounts meant naming all 7,301 of them. SQL Server takes 2,100 parameters, so `_sums` cut the
+        # list into five chunks -- and each chunk re-ran the same scan over 5.4M lines, five times for the opening
+        # and five more for the period. Ten passes to answer one question: 596.7 seconds for all five books over
+        # September, and 777.2s while another session had the machine. Nothing needs naming when the filter is
+        # every account, because `v.book IN (...)` has already said which books; and the figures do not need the
+        # chart, so both are asked for at once. This is the trial balance's own one-pass helper, which is also what
+        # keeps the claim above true: the pivot cannot disagree with a statement it is computed from.
+        chart, (before, during) = await asyncio.gather(chart_map(books), _opening_and_period(books, start, end))
+    else:
+        # A named set is the screen's own handful, and naming a handful is the cheap way round: each id seeks
+        # idx_avl_account instead of the whole table being read.
+        chart = await chart_map(books)
+        named = sorted(wanted)
+        before = await _sums(books, before=start, account_ids=named) if start else {}
+        during = await _sums(books, start=start, end=end, account_ids=named) if start else \
+            await _sums(books, end=end, account_ids=named)
 
     ids = [aid for aid in chart if wanted is None or aid in wanted]
-    before = await _sums(books, before=start, account_ids=ids) if start else {}
-    during = await _sums(books, start=start, end=end, account_ids=ids)
-    opening_only = await _sums(books, end=end, account_ids=ids) if not start else {}
-
     buckets: dict[str, dict] = {}
     for aid in ids:
         meta = chart[aid]
@@ -297,7 +428,7 @@ async def account_summary(books: list[str], start: date | None, end: date, pivot
             "opening": ZERO, "debit": ZERO, "credit": ZERO, "accounts": 0,
         })
         o_dr, o_cr = before.get(aid, (ZERO, ZERO))
-        d_dr, d_cr = (during if start else opening_only).get(aid, (ZERO, ZERO))
+        d_dr, d_cr = during.get(aid, (ZERO, ZERO))
         row["opening"] += o_dr - o_cr
         row["debit"] += d_dr
         row["credit"] += d_cr
@@ -403,7 +534,7 @@ async def date_wise_money(books: list[str], start: date, end: date, direction: s
     if not parties:
         return {"start": start.isoformat(), "end": end.isoformat(), "direction": direction, "rows": [],
                 "totals": {k: _s(ZERO) for k in ("cash", "cheque", "bank", "amount")}}
-    facts = await _party_facts(list(parties))
+    facts = await _party_facts(books, kind)
     if area or sub_area or category:
         parties = {
             aid: m for aid, m in parties.items()
@@ -414,32 +545,33 @@ async def date_wise_money(books: list[str], start: date, end: date, direction: s
 
     rows = []
     cash_total = cheque_total = bank_total = ZERO
-    for lines in _by_voucher(await _voucher_lines(books, start, end, touching=list(parties), vtypes=vtypes)).values():
-        head = lines[0]
-        for line in lines:
-            aid = str(line["account_id"])
-            if aid not in parties:
-                continue
-            amount = abs(_net(line))
-            if amount == ZERO:
-                continue
-            cheque_no = head.get("cheque_no")
-            column = "cash" if head["vtype"] in ("CPV", "CRV") else ("cheque" if cheque_no else "bank")
-            rows.append({
-                "book": head["book"], "date": str(head["day"])[:10], "number": head["number"],
-                "accountId": aid, "code": chart[aid]["code"], "name": chart[aid]["name"],
-                "partyCode": facts.get(aid, {}).get("code"),
-                "area": facts.get(aid, {}).get("area"), "subArea": facts.get(aid, {}).get("subArea"),
-                "category": facts.get(aid, {}).get("category"),
-                "chequeNo": cheque_no, "reference": head.get("reference_no"), "user": head.get("created_by"),
-                "cash": _s(amount if column == "cash" else ZERO),
-                "cheque": _s(amount if column == "cheque" else ZERO),
-                "bank": _s(amount if column == "bank" else ZERO),
-                "amount": _s(amount),
-            })
-            cash_total += amount if column == "cash" else ZERO
-            cheque_total += amount if column == "cheque" else ZERO
-            bank_total += amount if column == "bank" else ZERO
+    # The party lines themselves, not the whole voucher. Every line this loop keeps is on a party account and every
+    # field it reads off `head` is a column of `v`, the same on every line of a voucher, so the line *is* its own
+    # head. Grouping by voucher first and then dropping the other side was the whole of this register's 40 seconds.
+    for line in await _party_lines(books, kind, start, end, vtypes=vtypes):
+        aid = str(line["account_id"])
+        if aid not in parties:
+            continue  # the screen's own pick of parties, or its area filter, narrows what the kind let through
+        amount = abs(_net(line))
+        if amount == ZERO:
+            continue
+        cheque_no = line.get("cheque_no")
+        column = "cash" if line["vtype"] in ("CPV", "CRV") else ("cheque" if cheque_no else "bank")
+        rows.append({
+            "book": line["book"], "date": str(line["day"])[:10], "number": line["number"],
+            "accountId": aid, "code": chart[aid]["code"], "name": chart[aid]["name"],
+            "partyCode": facts.get(aid, {}).get("code"),
+            "area": facts.get(aid, {}).get("area"), "subArea": facts.get(aid, {}).get("subArea"),
+            "category": facts.get(aid, {}).get("category"),
+            "chequeNo": cheque_no, "reference": line.get("reference_no"), "user": line.get("created_by"),
+            "cash": _s(amount if column == "cash" else ZERO),
+            "cheque": _s(amount if column == "cheque" else ZERO),
+            "bank": _s(amount if column == "bank" else ZERO),
+            "amount": _s(amount),
+        })
+        cash_total += amount if column == "cash" else ZERO
+        cheque_total += amount if column == "cheque" else ZERO
+        bank_total += amount if column == "bank" else ZERO
     rows.sort(key=lambda r: (r["date"], r["name"], r["number"]))
     return {
         "start": start.isoformat(), "end": end.isoformat(), "direction": direction, "rows": rows,
@@ -450,42 +582,56 @@ async def date_wise_money(books: list[str], start: date, end: date, direction: s
 
 # ── who owes what ────────────────────────────────────────────────────────────────────────────────
 
-async def _party_facts(account_ids: list[str]) -> dict[str, dict]:
-    """The customer's or supplier's own details, off the account they ride on (models/accounts.py)."""
+async def _party_facts(books: list[str], kind: str) -> dict[str, dict]:
+    """The customer's or supplier's own details, off the account they ride on (models/accounts.py).
+
+    Every party of that kind in one query, not four hundred at a time. It used to take a list of ids and ask once per
+    chunk of it: three queries and 1.6s of the payable summary's 11.3s, for a table of 7,301 rows. `kind` and `book`
+    are columns, so the database picks them, and callers that then narrow to a shorter list read this by id anyway --
+    a key they do not ask for costs nothing.
+    """
     from app.models import Account
 
     out: dict[str, dict] = {}
-    for chunk in _chunks(account_ids):
-        for a in await Account.filter(id__in=chunk).values(
-            "id", "party_code", "party_phone", "party_address", "party_contact", "party_city",
-            "party_area", "party_sub_area", "party_category", "party_due_days", "party_credit_limit",
-        ):
-            out[str(a["id"])] = {
-                "code": a["party_code"], "phone": a["party_phone"], "address": a["party_address"],
-                "contact": a["party_contact"], "city": a["party_city"], "area": a["party_area"],
-                "subArea": a["party_sub_area"], "category": a["party_category"],
-                "dueDays": a["party_due_days"] or 0,
-                "creditLimit": a["party_credit_limit"],
-            }
+    for a in await Account.filter(book__in=books, kind=kind).values(
+        "id", "party_code", "party_phone", "party_address", "party_contact", "party_city",
+        "party_area", "party_sub_area", "party_category", "party_due_days", "party_credit_limit",
+    ):
+        out[str(a["id"])] = {
+            "code": a["party_code"], "phone": a["party_phone"], "address": a["party_address"],
+            "contact": a["party_contact"], "city": a["party_city"], "area": a["party_area"],
+            "subArea": a["party_sub_area"], "category": a["party_category"],
+            "dueDays": a["party_due_days"] or 0,
+            "creditLimit": a["party_credit_limit"],
+        }
     return out
 
 
-async def _post_dated(books: list[str], account_ids: list[str], as_of: date) -> dict[str, Decimal]:
+async def _post_dated(books: list[str], kind: str, as_of: date) -> dict[str, Decimal]:
     """Post dated cheques in hand against each party: written, not yet cleared, and dated after the day asked about.
 
     This is the column their receivable and payable summaries carry beside the balance, and the reason they carry it
     is that a balance covered by a cheque already in the drawer is not the same debt as one that is not.
-    """
-    from app.models import Cheque
 
-    out: dict[str, Decimal] = {}
-    for chunk in _chunks(account_ids):
-        for row in await Cheque.filter(
-            book__in=books, party_account_id__in=chunk, status="pending", cheque_date__gt=as_of,
-        ).values("party_account_id", "amount"):
-            key = str(row["party_account_id"])
-            out[key] = out.get(key, ZERO) + money(_d(row["amount"]))
-    return out
+    One query joined to acc_accounts on `kind`, and the amounts added in SQL, where the party ids used to be named
+    four hundred at a time. Measured, the chunked version cost 0.03s, so it was **not** what made the two party
+    summaries slow -- `sums_by_kind` was -- but it is the same shape as the loops that were, and it is the one that
+    grows: asked for the whole company it named thousands of ids and re-read ho_cheques once per chunk.
+
+    **The column this fills is zero for every party today, and that is the data rather than this function.** All
+    4,055 rows in ho_cheques arrived with status `cleared` (2 are `cancelled`) and not one is `pending`, so nothing
+    is in the drawer to subtract and Net Balance always equals Balance. Anybody checking that this still works
+    should run it against `cleared` instead, which matches 574 parties and Rs 463,863,247 -- that is how the rewrite
+    was checked against the old one, since comparing two empty dicts proves nothing.
+    """
+    marks = dialect.codes(books)
+    rows = await _query(
+        "SELECT c.party_account_id AS account_id, SUM(c.amount) AS amount FROM ho_cheques c "
+        "JOIN acc_accounts a ON a.id = c.party_account_id "
+        f"WHERE c.book IN ({marks}) AND a.kind = {dialect.mark('varchar(20)')} AND c.status = 'pending' AND c.cheque_date > ? "
+        "GROUP BY c.party_account_id", [*books, kind, as_of.isoformat()],
+    )
+    return {str(r["account_id"]): money(_d(r["amount"])) for r in rows}
 
 
 async def party_summary(books: list[str], kind: str, as_of: date, group_by: str = "none",
@@ -512,15 +658,16 @@ async def party_summary(books: list[str], kind: str, as_of: date, group_by: str 
     if not picked:
         return {"asOf": as_of.isoformat(), "kind": kind, "groupBy": group_by, "groups": [], "count": 0,
                 "totals": {k: _s(ZERO) for k in ("balance", "pdCheques", "netBalance")}}
-    facts = await _party_facts(picked)
+    facts = await _party_facts(books, kind)
     if area or sub_area:
         picked = [
             aid for aid in picked
             if (not area or (facts.get(aid, {}).get("area") or "") == area)
             and (not sub_area or (facts.get(aid, {}).get("subArea") or "") == sub_area)
         ]
-    sums = await _sums(books, end=as_of, account_ids=picked)
-    pdc = await _post_dated(books, picked, as_of)
+    # Every account of this kind in one pass; `picked` is thousands of ids and naming them was the cost.
+    sums = await sums_by_kind(books, kind, as_of)
+    pdc = await _post_dated(books, kind, as_of)
 
     grouped: dict[str, list[dict]] = {}
     totals = {"balance": ZERO, "pdCheques": ZERO, "netBalance": ZERO}
@@ -600,12 +747,20 @@ def _walk(entries: list[dict], kind: str) -> list[dict]:
     return items
 
 
-async def _party_entries(books: list[str], account_ids: list[str], as_of: date) -> dict[str, list[dict]]:
+async def _party_entries(books: list[str], kind: str, account_ids: list[str], as_of: date) -> dict[str, list[dict]]:
+    """Each party's own movements up to a date, in the order a payment should be applied in.
+
+    Two things were wrong here and both cost minutes. It asked `_voucher_lines(touching=...)` for every line of every
+    voucher touching a party and then dropped every line that was not on one, which on head office's book is most of
+    them; and `set(account_ids)` was built inside the loop, so 956 ids were re-hashed once per row over millions of
+    rows. The set is built once and the database is asked only for the party lines.
+    """
+    wanted = set(account_ids)
     entries: dict[str, list[dict]] = {}
-    for line in await _voucher_lines(books, None, as_of, touching=account_ids):
+    for line in await _party_lines(books, kind, None, as_of):
         aid = str(line["account_id"])
-        if aid not in set(account_ids):
-            continue
+        if aid not in wanted:
+            continue  # the kind let every party through; this is the screen's own pick within it
         movement = _net(line)
         if movement == ZERO:
             continue
@@ -635,8 +790,8 @@ async def supplier_balance_detail(books: list[str], as_of: date, account_ids: li
     if not picked:
         return {"asOf": as_of.isoformat(), "kind": kind, "parties": [], "count": 0,
                 "totals": {k: _s(ZERO) for k in ("invoiced", "paid", "outstanding")}}
-    facts = await _party_facts(picked)
-    entries = await _party_entries(books, picked, as_of)
+    facts = await _party_facts(books, kind)
+    entries = await _party_entries(books, kind, picked, as_of)
 
     parties = []
     grand = {"invoiced": ZERO, "paid": ZERO, "outstanding": ZERO}

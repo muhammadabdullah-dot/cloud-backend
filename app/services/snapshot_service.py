@@ -142,7 +142,8 @@ async def _place_stock_value(branch: Branch, value: Decimal) -> None:
         await BranchDailyStat.filter(id=newest.id).update(stock_value=value)
 
 
-async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", window: tuple[date, date] | None = None) -> dict:
+async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", window: tuple[date, date] | None = None,
+                           whole_picture: bool | None = None) -> dict:
     """Replace this branch's aggregate picture with what it just sent.
 
     One transaction: a half-applied snapshot — yesterday's product rows against today's daily
@@ -152,9 +153,20 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
     `window` narrows what is replaced to a range of days, for a branch whose figures are rebuilt from a copy of
     another system's database and whose history runs to years: rewriting days that cannot change costs an hour and
     a database that keeps its high-water mark. Inside a window, only those days are cleared and only rows for those
-    days are written; the right-now tables (alerts, credit customers) are replaced either way, because that is what
-    they are. Left out, a snapshot replaces everything, which is what a branch server's own two-hourly push does.
+    days are written.
+
+    **The right-now tables are the exception, and getting it wrong destroys data.** Alerts and credit customers carry
+    no day: they are what is true at this moment, so a full push replaces them entirely. A WINDOWED run cannot
+    produce them. A two-day window sees only the bills rung in those two days, so its credit list is whoever happens
+    to owe on one of them, and replacing with it deletes every customer who owes on an older bill. So a windowed run
+    leaves them alone unless the caller states it really does hold the whole picture.
+
+    `whole_picture` says which it is. Left as None it follows the window, which is right for every caller today: a
+    branch's own push sends everything and passes no window; a windowed top-up sends a slice. Pass it explicitly only
+    when a windowed payload genuinely carries a complete right-now picture as well.
     """
+    if whole_picture is None:
+        whole_picture = window is None
     skipped = 0
 
     def usable(rows: list[dict], *keys: str) -> list[dict]:
@@ -189,8 +201,9 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
             if window is not None:
                 rows = rows.filter(day__gte=window[0], day__lte=window[1])
             await rows.delete()
-        for model in POINT_IN_TIME_MODELS:
-            await model.filter(branch=branch).delete()
+        if whole_picture:
+            for model in POINT_IN_TIME_MODELS:
+                await model.filter(branch=branch).delete()
 
         await BranchDailyStat.bulk_create([
             BranchDailyStat(
@@ -293,7 +306,8 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
             ) for r in returns
         ], batch_size=200)
 
-        await BranchCreditCustomer.bulk_create([
+        # Only written when they were cleared. Adding to a list that was not emptied would double every customer.
+        await BranchCreditCustomer.bulk_create([] if not whole_picture else [
             BranchCreditCustomer(
                 branch=branch, code=r.get("code") or "-", name=r.get("name") or "-", phone=r.get("phone"),
                 tier=r.get("tier"), credit_limit=dec(r.get("creditLimit")),
@@ -304,7 +318,7 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
         # Alerts arrive already trimmed and ranked by the branch — it is the only side that can
         # see the whole catalog, and shipping 47,000 rows so the Cloud can keep 200 of them would
         # be a lot of branch link for no extra truth. `totalOfKind` carries the real count.
-        await BranchStockAlert.bulk_create([
+        await BranchStockAlert.bulk_create([] if not whole_picture else [
             BranchStockAlert(
                 branch=branch, kind=r.get("kind") or "low-stock", product_sku=r.get("sku") or "-",
                 product_name=r.get("name") or "-", qty=dec(r.get("qty")), expiry=_dt(r.get("expiry")),
@@ -316,6 +330,18 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
 
         branch.last_seen_at = datetime.now(timezone.utc)
         await branch.save(update_fields=["last_seen_at"])
+
+    # Figures have changed, so the dashboard's read memo must not keep serving the old ones, and the month rollups
+    # that are derived from them are now behind. Only the months this run touched are rebuilt: a window of two days
+    # rebuilds one or two months, not four hundred thousand rows.
+    from app.services import query_cache, rollup_service
+
+    query_cache.clear()
+    try:
+        await rollup_service.refresh(branch=branch, since=(window[0] if window else None))
+    except Exception:  # noqa: BLE001
+        # A stale rollup makes a screen slow; a failed refresh must not lose the figures that just arrived.
+        logs.log.exception("rollups could not be rebuilt for %s; they are now behind", branch.code)
 
     if skipped:
         # Worth a line even though the snapshot went through: it means the branch is sending
@@ -329,6 +355,8 @@ async def apply_aggregates(branch: Branch, data: dict, source: str = "sync", win
     # Counts are of what was stored, not of what arrived — a figure an operator compares against the
     # branch's own report has to be the number of rows that actually landed.
     return {
+        "wholePicture": whole_picture,
+        "creditCustomers": len(credit_customers) if whole_picture else 0,
         "tradingDays": len(daily),
         "productDays": len(products),
         "cashierDays": len(cashiers),
@@ -376,11 +404,39 @@ async def add_stock_chunk(branch: Branch, snapshot_id: str, rows: list[dict]) ->
     rows, skipped = _identifiable(rows, "sku")
     if skipped:
         logs.log.warning("stock list from %s: %s row(s) with no sku were skipped", branch.code, skipped)
+    rows = await _not_already_there(branch, snapshot_id, rows)
     await BranchProductStock.bulk_create([
         BranchProductStock(branch=branch, snapshot_id=snapshot_id, product_sku=r["sku"], **_stock_fields(r))
         for r in rows
-    ], batch_size=1000, ignore_conflicts=True)
+    ], batch_size=1000)
     return len(rows)
+
+
+async def _not_already_there(branch: Branch, snapshot_id: str, rows: list[dict]) -> list[dict]:
+    """The rows whose sku is not in this snapshot yet, with repeats inside the batch dropped too.
+
+    This replaces `bulk_create(..., ignore_conflicts=True)`. Tortoise turns that into SQLite's
+    `INSERT ... ON CONFLICT DO NOTHING`, which SQL Server has no form of and cannot even parse: the whole stock stage
+    failed with "Incorrect syntax near the keyword 'ON'". The rule being protected is
+    `(branch, snapshot_id, product_sku)`, so the duplicates are found and left out rather than inserted and ignored.
+
+    Doing it this way says how many were dropped, which the database silently swallowing them never did.
+    """
+    if not rows:
+        return rows
+    have = set(await BranchProductStock.filter(branch=branch, snapshot_id=snapshot_id)
+               .values_list("product_sku", flat=True))
+    keep, seen, dropped = [], set(), 0
+    for r in rows:
+        sku = r["sku"]
+        if sku in have or sku in seen:
+            dropped += 1
+            continue
+        seen.add(sku)
+        keep.append(r)
+    if dropped:
+        logs.log.info("stock list from %s: %s row(s) were already in this snapshot", branch.code, dropped)
+    return keep
 
 
 async def apply_stock_changes(branch: Branch, rows: list[dict]) -> dict:
@@ -409,7 +465,16 @@ async def apply_stock_changes(branch: Branch, rows: list[dict]) -> dict:
                 new.append(BranchProductStock(branch=branch, snapshot_id=snapshot_id, product_sku=r["sku"], **fields))
             applied += 1
         if new:
-            await BranchProductStock.bulk_create(new, batch_size=1000, ignore_conflicts=True)
+            # Same reason as in `add_stock_chunk`: no ON CONFLICT on SQL Server. `existing` above already told us
+            # which skus are in this snapshot, so anything in `new` is new by construction and a plain insert is
+            # right; the guard is against a repeat inside this one payload.
+            once, seen = [], set()
+            for row in new:
+                if row.product_sku in seen:
+                    continue
+                seen.add(row.product_sku)
+                once.append(row)
+            await BranchProductStock.bulk_create(once, batch_size=1000)
         await BranchSnapshotRun.filter(branch=branch, snapshot_id=snapshot_id).update(last_change_at=now)
     return {"applied": applied, "needsFull": False}
 

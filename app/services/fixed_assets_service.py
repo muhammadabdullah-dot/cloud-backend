@@ -22,6 +22,7 @@ from decimal import Decimal
 from tortoise import Tortoise
 from tortoise.transactions import atomic
 
+from app.core import dialect
 from app.models import (
     HEAD_OFFICE_BOOK,
     Account,
@@ -298,7 +299,7 @@ async def _ledger(account_ids: list[str]) -> dict[str, Decimal]:
         return {}
     rows = await Tortoise.get_connection("default").execute_query_dict(
         "SELECT l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
-        f"WHERE v.status = 'posted' AND l.account_id IN ({','.join('?' for _ in account_ids)}) GROUP BY l.account_id", account_ids,
+        f"WHERE v.status = 'posted' AND l.account_id IN ({dialect.marks(account_ids)}) GROUP BY l.account_id", account_ids,
     )
     return {str(r["account_id"]): money(Decimal(str(r["dr"] or 0))) - money(Decimal(str(r["cr"] or 0))) for r in rows}
 

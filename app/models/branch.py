@@ -14,6 +14,8 @@ this same row later (a shared secret and a verified flag) rather than as a secon
 """
 from tortoise import fields, models
 
+from app.models.accounts import HEAD_OFFICE_BOOK
+
 # 'active' is the only status cloud-app models today; 'suspended' is the one real operational need
 # beyond it — stop syncing/reporting a branch without deleting its history.
 BRANCH_STATUSES = ("active", "suspended")
@@ -81,3 +83,30 @@ class Branch(models.Model):
 
     def __str__(self) -> str:
         return f"{self.code}: {self.name}"
+
+
+def selling_branches():
+    """The branches that sell, which is every branch except head office.
+
+    Head office has a row in this table because it needs one: it owns the HO book in Accounts, it is the origin
+    stamped on a centrally added supplier or Item, and the godown's stock is held against it. What it is not is a
+    shop. It has no till, no cashier, no bills, and nothing has ever reported sales or stock as head office --
+    zero snapshot runs, zero trading days, zero stock lines, against four to twenty-two thousand for each real
+    branch. Its stock IS the godown, counted by `executive_service.godown_stock_value` and shown on its own.
+
+    So a screen that ranks, compares or lists *branches* has to leave it out, and two tiles were visibly wrong
+    because they did not. Sync Health read "5/5, all branches reporting" -- counting head office as a healthy
+    branch, because the nightly Multi-Tec run touches `last_seen_at` on every book it feeds, head office
+    included. Branch Comparison read "4 of 5 branch(es) reporting" off the same list, so the dashboard
+    contradicted itself. Branch Ranking carried a fifth row of zeros labelled "Never reported", which reads as a
+    branch that has gone quiet rather than one that was never a branch.
+
+    Use this wherever the answer is about branches. Use `Branch.all()` where head office genuinely belongs:
+    the books list (`accounts_reports_service.all_books`), a code-to-name lookup that has to label the HO book,
+    and the admin Branches screen, where somebody has to be able to see and edit the row itself.
+
+    It is `exclude`, not a `verified_at` test. Those are different questions: none of these five branches is
+    verified today, because none of them runs a branch server -- they are all fed by the Multi-Tec import. A
+    verified-only filter would empty every one of these screens.
+    """
+    return Branch.exclude(code=HEAD_OFFICE_BOOK)

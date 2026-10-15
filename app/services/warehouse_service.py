@@ -6,9 +6,11 @@ balance and the rows explaining it can never disagree.
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from tortoise import Tortoise
 from tortoise.functions import Sum
 from tortoise.transactions import atomic
 
+from app.core import dialect
 from app.core.pk_time import pk_day
 from app.models import (
     GRN,
@@ -65,6 +67,12 @@ async def all_balances() -> list[dict]:
 
 
 # ── masters ─────────────────────────────────────────────────────────────────
+# Every list below sorts on a time or a name and then on `id`. The second key is not decoration: a page is
+# OFFSET plus LIMIT over a sort, and rows that tie on the first key have no defined order between them, so a
+# page boundary landing inside a tie may hand back a row the previous page already showed and silently skip
+# another. Measured on 6 October 2026: stock movements are 1,945 rows on ONE timestamp, every row tied with
+# every other, and transfers have a tied pair in 6,446. A paged screen over either of those without a
+# tiebreaker shows a different list each time it is asked.
 async def list_products(q: str | None, limit: int, offset: int) -> tuple[list[Product], int]:
     qs = Product.all()
     term = (q or "").strip()
@@ -72,7 +80,7 @@ async def list_products(q: str | None, limit: int, offset: int) -> tuple[list[Pr
         from tortoise.expressions import Q
         qs = qs.filter(Q(name__icontains=term) | Q(sku__icontains=term))
     total = await qs.count()
-    return await qs.order_by("name").offset(offset).limit(limit), total
+    return await qs.order_by("name", "id").offset(offset).limit(limit), total
 
 
 async def list_suppliers() -> list[Supplier]:
@@ -103,7 +111,7 @@ async def list_movements(
     if bin_id:
         qs = qs.filter(bin_id=bin_id)
     total = await qs.count()
-    return await qs.order_by("-at").offset(offset).limit(limit), total
+    return await qs.order_by("-at", "id").offset(offset).limit(limit), total
 
 
 async def list_batches(product_id: str | None, limit: int, offset: int) -> tuple[list[Batch], int]:
@@ -111,7 +119,7 @@ async def list_batches(product_id: str | None, limit: int, offset: int) -> tuple
     if product_id:
         qs = qs.filter(product_id=product_id)
     total = await qs.count()
-    return await qs.order_by("expiry").offset(offset).limit(limit), total
+    return await qs.order_by("expiry", "id").offset(offset).limit(limit), total
 
 
 # ── receiving ───────────────────────────────────────────────────────────────
@@ -153,7 +161,7 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
         from app.services import purchasing_service
 
         try:
-            await purchasing_service.receive_against(
+            _mismatches, for_branch = await purchasing_service.receive_against(
                 payload.purchaseOrderId, payload.supplierId, [(l.productId, l.qty, l.unitPrice) for l in payload.lines], grn.grn_number,
             )
         except purchasing_service.PurchasingError as exc:
@@ -202,14 +210,127 @@ async def receive_grn(user: User, payload: GRNCreateRequest) -> GRN:
                 product_id=line.productId, lot_number=None, expiry=line.expiry,
                 received_qty=line.qty + line.bonusQty,
             )
+    # ── what was bought for a branch goes straight on ───────────────────────────────────────────
+    #
+    # Agreed 12 October 2026, the pharmacy short road. A one day item cannot afford branch asks, head office
+    # buys, godown receives and someone remembers to transfer, so the receipt sends it itself. Nothing waits for
+    # a person, which is the whole point: a receipt that makes godown stock and waits for a transfer puts the
+    # third hop back and gains nothing.
+    #
+    # WHY A TRANSFER AND NOT A WRITE TO THE BRANCH'S STOCK
+    #
+    # Head office cannot write a branch's stock. `branch_product_stock` is what the branch REPORTED in its last
+    # snapshot; the branch owns its count, and anything written here would be overwritten by the next one. So the
+    # stock reaches the branch the only way it ever does: the branch receives a transfer, counts it, and reports
+    # it back up. `transfer_sync_service` already sends every change down as `transfer.inbound`, with lines by
+    # Item code and the Item described in full, so a branch that has never carried it can take it.
+    #
+    # The godown is net zero on these quantities -- received into a bin and dispatched straight out, both
+    # recorded -- so the ledger is complete and godown on-hand is not inflated. `dispatch_transfer` picks from
+    # the bins the receipt just filled, which is why this runs after the movements above and not before.
+    # ONLY THE SHORT ROAD SENDS ITSELF ON, AND A RECORDED SPLIT IS NOT THE SHORT ROAD
+    #
+    # These were conflated and it mattered. An ordinary central order can carry a split on its LINES -- 100
+    # bought, 40 for one branch, 40 for another, 20 kept -- and that split is attribution: who the buyer thinks
+    # it is for, so head office can see which branches an order serves. It is a record, not an instruction. The
+    # godown is deliberately in the middle of that flow: it holds the stock and allocates on need as it stands
+    # when it dispatches, which may be weeks after the order was raised and may not match what was written down.
+    #
+    # The pharmacy short road is the exception, and its mark is the ORDER's own branch, not its lines':
+    # `create_order` fills `po.for_branch` from a branch-scoped account's own scope, so an order raised by a
+    # pharmacy buyer is wholly for one branch and says so on the header. A normal split order has a null header.
+    #
+    # Keying this on the lines sent every recorded split straight out on receipt -- turning an intention into a
+    # commitment, freezing the allocation at order time, and skipping the branch's acknowledgement, which the
+    # normal flow has on purpose. Keying it on the header is the difference between the two flows.
+    # `sent_on` is hung on the object rather than stored: the transfers themselves are the record, and this is
+    # only so the answer to THIS request can say what happened. A receiver must never have stock leave the
+    # godown without the screen in front of them saying where it went.
+    grn.sent_on = []
+    if for_branch and payload.purchaseOrderId:
+        from app.services import purchasing_service
+
+        order = await purchasing_service.get_order(payload.purchaseOrderId)
+        if order.for_branch_id:
+            grn.sent_on = await _send_on_what_was_bought_for_branches(user, grn, for_branch)
     await grn.fetch_related("lines")
     return grn
+
+
+async def _send_on_what_was_bought_for_branches(user: User, grn: GRN, for_branch: dict) -> list[dict]:
+    """One transfer per branch, created and dispatched, for what this delivery brought them.
+
+    Only ever called for an order whose HEADER names a branch -- the pharmacy short road. See the note at the
+    call site for why a split recorded on the lines of an ordinary order must not come through here.
+
+    The branch is NOT asked to acknowledge first. `create_transfer` asks a branch that runs a branch server,
+    which is right when head office decides to push stock at it; it is wrong here, because the order was raised
+    for that branch and whoever raised it already knows what is coming. Waiting for the answer would be the hop
+    this exists to remove. The transfer says so in its note, so nobody reading it later thinks the step was
+    skipped by accident.
+
+    A failure to send on does NOT fail the receipt. The stock has arrived and that fact is already recorded;
+    losing the GRN because a transfer could not be raised would be the worse outcome by far. It is reported
+    instead, to the people who would have to act on it.
+    """
+    from app.services import alerts_service, transfer_sync_service
+
+    sent: list[dict] = []
+    for branch_id, products in for_branch.items():
+        lines = [(pid, qty) for pid, qty in products.items() if qty > ZERO]
+        if not lines:
+            continue
+        branch = await Branch.get_or_none(id=branch_id)
+        if branch is None:
+            continue
+        try:
+            transfer = await create_transfer(
+                user, str(branch_id), lines,
+                f"Bought for {branch.name} on {grn.grn_number}; sent on as it was received.",
+            )
+            # It was bought for them, so there is nothing to agree to.
+            if transfer.ack_status == "awaiting":
+                transfer.ack_status = "skipped"
+                transfer.ack_note = (f"Bought for {branch.name} on its own order, so it was sent on without "
+                                     f"asking. Receiving it is the branch's count of what arrived.")
+                await transfer.save(update_fields=["ack_status", "ack_note"])
+            # A dispatch needs a vehicle and a driver, and there is no van: the goods were received and booked
+            # straight to the branch without leaving the building. So the two fields carry the truth instead of a
+            # dash -- which delivery sent it on, and who was receiving -- and the log reads correctly later.
+            await dispatch_transfer(user, str(transfer.id), DispatchRequest(
+                vehicle=f"sent on from {grn.grn_number}"[:40],
+                driver=(user.name or "head office")[:120],
+            ))
+            sent.append({
+                "transferId": str(transfer.id), "transferNumber": transfer.transfer_number,
+                "branchId": str(branch_id), "branchCode": branch.code, "branchName": branch.name,
+                "qty": sum(products.values(), ZERO), "lines": len(lines),
+            })
+        except Exception as exc:  # noqa: BLE001 -- the receipt stands; see the docstring
+            await alerts_service.notify(
+                "grn.send-on-failed",
+                f"{grn.grn_number} arrived for {branch.name} and could not be sent on",
+                body=(f"The delivery is received and in the godown. Raise the transfer to {branch.name} by hand. "
+                      f"{type(exc).__name__}: {str(exc)[:200]}"),
+                link="/warehouse/transfers", audience_any=[("warehouse.transfers", "W"), ("executive.dashboard", "R")],
+                tone="warning", subject=("grn", str(grn.id)),
+            )
+            sent.append({
+                "transferId": None, "transferNumber": None,
+                "branchId": str(branch_id), "branchCode": branch.code, "branchName": branch.name,
+                "qty": sum(products.values(), ZERO), "lines": len(lines),
+                "failed": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+    return sent
 
 
 async def list_grns(limit: int, offset: int) -> tuple[list[GRN], int]:
     qs = GRN.all()
     total = await qs.count()
-    items = await qs.order_by("-at").offset(offset).limit(limit).prefetch_related("lines")
+    items = await qs.order_by("-at", "id").offset(offset).limit(limit)
+    # The same uncast IN list as the transfers board; see `_attach_lines`. `warehouse_grn_lines` already carries an
+    # index on grn_id, which NVARCHAR parameters stop the planner from using.
+    await _attach_lines(items, GRNLine, "warehouse_grn_lines", "grn_id")
     return items, total
 
 
@@ -219,7 +340,7 @@ async def list_requisitions(status: str | None, limit: int, offset: int) -> tupl
     if status:
         qs = qs.filter(status=status)
     total = await qs.count()
-    return await qs.order_by("-requested_at").offset(offset).limit(limit), total
+    return await qs.order_by("-requested_at", "id").offset(offset).limit(limit), total
 
 
 @atomic()
@@ -342,12 +463,39 @@ async def reject_requisition(user: User, requisition_id: str, reason: str | None
 
 
 # ── transfers ───────────────────────────────────────────────────────────────
+async def _attach_lines(parents: list, model, table: str, fk: str = "transfer_id", relation: str = "lines") -> None:
+    """Fill each parent's child relation ourselves, with the cast Tortoise will not write.
+
+    `prefetch_related("lines")` asks `WHERE transfer_id IN (...)` with one parameter per transfer, and pyodbc
+    sends a Python str as NVARCHAR. NVARCHAR outranks char(36), so SQL Server converts the COLUMN instead of the
+    parameter and the index on transfer_id stops being usable. A board of 200 transfers measured **2.88 seconds**
+    for its 3,395 lines; the identical rows with `CAST(? AS char(36))` take **0.11** -- twenty-seven times.
+
+    The rows are turned back into real TransferLine objects and handed to the relation, so everything downstream
+    reads `t.lines` exactly as it did when Tortoise filled it.
+    """
+    if not parents:
+        return
+    ids = [str(p.id) for p in parents]
+    conn = Tortoise.get_connection("default")
+    _, rows = await conn.execute_query(
+        f'SELECT * FROM "{table}" WHERE "{fk}" IN ({dialect.marks(ids)}) ORDER BY "id"', ids)
+    children: dict[str, list] = {}
+    for row in rows:
+        children.setdefault(str(row[fk]), []).append(model._init_from_db(**row))
+    for parent in parents:
+        relation_on = getattr(parent, relation)
+        relation_on.related_objects = children.get(str(parent.id), [])
+        relation_on._fetched = True
+
+
 async def list_transfers(status: str | None, limit: int, offset: int) -> tuple[list[Transfer], int]:
     qs = Transfer.all()
     if status:
         qs = qs.filter(status=status)
     total = await qs.count()
-    items = await qs.order_by("-requested_at").offset(offset).limit(limit).prefetch_related("lines")
+    items = await qs.order_by("-requested_at", "id").offset(offset).limit(limit)
+    await _attach_lines(items, TransferLine, "transfer_lines", "transfer_id")
     return items, total
 
 
@@ -569,7 +717,7 @@ async def resolve_dispute(user: User, transfer_id: str, note: str | None) -> Tra
 async def list_counts(limit: int, offset: int) -> tuple[list[CycleCount], int]:
     qs = CycleCount.all()
     total = await qs.count()
-    return await qs.order_by("-at").offset(offset).limit(limit), total
+    return await qs.order_by("-at", "id").offset(offset).limit(limit), total
 
 
 @atomic()

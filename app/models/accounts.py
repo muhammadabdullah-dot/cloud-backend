@@ -69,8 +69,11 @@ class Account(models.Model):
     code = fields.CharField(max_length=12)
     name = fields.CharField(max_length=160)
     group: fields.ForeignKeyRelation[AccountGroup] = fields.ForeignKeyField("models.AccountGroup", related_name="accounts")
+    # NO ACTION rather than SET NULL: a group reaches an account directly and through a sub group, and SQL Server
+    # will not have two cascade paths to one table. Nothing is lost, because `delete_sub_group` already refuses to
+    # remove a sub group that still holds accounts, so the SET NULL could never have fired.
     sub_group: fields.ForeignKeyNullableRelation[AccountSubGroup] = fields.ForeignKeyField(
-        "models.AccountSubGroup", related_name="accounts", null=True, on_delete=fields.SET_NULL
+        "models.AccountSubGroup", related_name="accounts", null=True, on_delete=fields.NO_ACTION
     )
     kind = fields.CharField(max_length=12, default="general")
     system_key = fields.CharField(max_length=80, null=True)
@@ -111,6 +114,17 @@ class Voucher(models.Model):
     number = fields.CharField(max_length=30, unique=True)
     vtype = fields.CharField(max_length=4)
     date = fields.DateField()
+    # The moment the entry was made, where it is known, so a date range on the books can carry a time.
+    #
+    # `date` stays the field every report keys on and every total is grouped by: a voucher belongs to a business
+    # day, and a day is the unit a trial balance balances over. This is beside it, never instead of it, and it is
+    # null wherever the moment was never recorded -- our own automatic postings, and anything typed here by hand.
+    #
+    # It exists because their software records one and we were throwing it away. `dbo.AccountLedger.Date` is a
+    # timestamp, and 5,340,870 of their 5,343,432 rows carry a real clock time, peaking between 17:00 and 22:00
+    # like the trade does; `load_legacy_ledger.a_date` kept `str(value)[:10]` because the column it landed in was
+    # a DateField. So "the books are dated, not timed" was true of our table and never of their data.
+    at = fields.DatetimeField(null=True)
     status = fields.CharField(max_length=10, default="draft")
     auto = fields.BooleanField(default=False)
     # Head office's own: "grn:<id>", "transfer-out:<id>". A branch's: "<book>:<its source>".
@@ -128,8 +142,11 @@ class Voucher(models.Model):
         "models.User", related_name="vouchers_created", null=True, on_delete=fields.SET_NULL
     )
     created_by_name = fields.CharField(max_length=120, null=True)
+    # NO ACTION, not SET NULL: this table already reaches `users` through created_by, and SQL Server allows one
+    # such path per table. `posted_by_name` beside it is what every screen reads, so nothing on a voucher depends
+    # on the account still existing.
     posted_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
-        "models.User", related_name="vouchers_posted", null=True, on_delete=fields.SET_NULL
+        "models.User", related_name="vouchers_posted", null=True, on_delete=fields.NO_ACTION
     )
     posted_by_name = fields.CharField(max_length=120, null=True)
     posted_at = fields.DatetimeField(null=True)
@@ -153,7 +170,7 @@ class VoucherLine(models.Model):
     id = fields.UUIDField(pk=True)
     voucher: fields.ForeignKeyRelation[Voucher] = fields.ForeignKeyField("models.Voucher", related_name="lines", on_delete=fields.CASCADE)
     line_no = fields.IntField(default=0)
-    account: fields.ForeignKeyRelation[Account] = fields.ForeignKeyField("models.Account", related_name="voucher_lines", on_delete=fields.RESTRICT)
+    account: fields.ForeignKeyRelation[Account] = fields.ForeignKeyField("models.Account", related_name="voucher_lines", on_delete=fields.NO_ACTION)
     debit = fields.DecimalField(max_digits=16, decimal_places=2, default=0)
     credit = fields.DecimalField(max_digits=16, decimal_places=2, default=0)
     description = fields.CharField(max_length=255, null=True)
@@ -191,7 +208,7 @@ class BankReconciliation(models.Model):
     book = fields.CharField(max_length=20, default=HEAD_OFFICE_BOOK)
     number = fields.CharField(max_length=20, unique=True)
     account: fields.ForeignKeyRelation[Account] = fields.ForeignKeyField(
-        "models.Account", related_name="reconciliations", on_delete=fields.RESTRICT
+        "models.Account", related_name="reconciliations", on_delete=fields.NO_ACTION
     )
     # Everything dated on or before this day is in scope; anything later waits for the next one.
     up_to = fields.DateField()

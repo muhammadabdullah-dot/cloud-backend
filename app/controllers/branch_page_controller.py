@@ -19,6 +19,7 @@ from app.models import BranchDailyStat, BranchSnapshotRun, BranchStockAlert, Tra
 from app.services import analytics_service as an
 from app.services import executive_service as ex
 from app.services.rbac_service import has_permission
+from app.core import dialect
 
 D0 = Decimal("0")
 CENTS = Decimal("0.01")
@@ -83,13 +84,13 @@ async def _stock_run(branch_id) -> BranchSnapshotRun | None:
 async def _stock_totals(branch_id, run: BranchSnapshotRun | None) -> dict:
     if not run:
         return {"lines": 0, "units": "0", "valueCost": "0.00", "valueRetail": "0.00", "outOfStock": 0}
-    rows = await _q("""
+    rows = await _q(f"""
         SELECT SUM(CASE WHEN CAST(qty AS REAL) > 0 THEN 1 ELSE 0 END) AS lines,
                SUM(CASE WHEN CAST(qty AS REAL) > 0 THEN CAST(qty AS REAL) ELSE 0 END) AS units,
                SUM(CASE WHEN CAST(qty AS REAL) > 0 THEN CAST(qty AS REAL) * CAST(avg_cost AS REAL) ELSE 0 END) AS cost,
                SUM(CASE WHEN CAST(qty AS REAL) > 0 THEN CAST(qty AS REAL) * CAST(price AS REAL) ELSE 0 END) AS retail,
                SUM(CASE WHEN CAST(qty AS REAL) <= 0 THEN 1 ELSE 0 END) AS out_lines
-        FROM branch_product_stock WHERE branch_id = ? AND snapshot_id = ?
+        FROM branch_product_stock WHERE branch_id = {dialect.mark()} AND snapshot_id = {dialect.mark('varchar(60)')}
     """, str(branch_id), run.snapshot_id)
     r = rows[0] if rows else {}
     return {"lines": int(r.get("lines") or 0), "units": _qty(r.get("units")), "valueCost": _s(r.get("cost") or 0),
@@ -138,7 +139,7 @@ async def overview(scope: xc.Scope) -> dict:
         _figure("returns", "Returns", now.returns_value, w("returns_value"), "money", "down", kpi="returns",
                 sub=f"{now.returns_count:,} return(s)"),
         _figure("discounts", "Discounts", now.disc_total, w("disc_total"), "money", "down", kpi="discount-overrides",
-                sub=f"{len(overrides):,} above a salesperson's own limit", hint="Every discount given on bills in the period."),
+                sub=f"{len(overrides):,} above a cashier's own limit", hint="Every discount given on bills in the period."),
         _figure("stockValue", "Stock value", retail, None, "money", None, tab="stock",
                 sub=f"Rs {Decimal(stock['valueCost']):,.0f} at cost, {stock['lines']:,} Item(s)", hint="As last reported, at sale price."),
         _figure("cash", "Cash position", now.net_cash, w("net_cash"), "money", "up", kpi="cash-position",
@@ -226,7 +227,7 @@ async def people(scope: xc.Scope) -> dict:
         "notes": [
             "Top and lowest are ranked by net sales per day worked, so someone who worked fewer days isn't marked low for that alone.",
             "A person's sales are the bills they rang at this branch. Units are the Items on those bills.",
-            "Discounts on their bills and discounts they approved are the ones above a salesperson's own limit, which a manager signed off.",
+            "Discounts on their bills and discounts they approved are the ones above a cashier's own limit, which a manager signed off.",
             "Returns are the refunds they took. Till variance is counted cash less what the till expected, on the tills they closed.",
             "Someone who only approved discounts or took returns shows in the full list with no sales of their own.",
         ],
@@ -252,23 +253,23 @@ async def stock(scope: xc.Scope) -> dict:
     not_sold: list[dict] = []
     not_sold_summary = await an.dead_stock_summary(b.code)
     if run:
-        cover_rows = await _q("""
+        cover_rows = await _q(f"""
             WITH sold AS (
                 SELECT product_sku AS sku, SUM(CAST(qty AS REAL)) AS units
-                FROM branch_product_stats WHERE branch_id = ? AND day >= ? AND day <= ? GROUP BY product_sku
+                FROM branch_product_stats WHERE branch_id = {dialect.mark()} AND day >= ? AND day <= ? GROUP BY product_sku
             )
             SELECT s.product_sku AS sku, s.product_name AS name, s.category AS category, CAST(s.qty AS REAL) AS qty,
                    CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL) AS value_cost, sold.units AS units, s.last_sold_at AS last_sold_at
             FROM branch_product_stock s JOIN sold ON sold.sku = s.product_sku
-            WHERE s.branch_id = ? AND s.snapshot_id = ? AND sold.units > 0
+            WHERE s.branch_id = {dialect.mark()} AND s.snapshot_id = {dialect.mark('varchar(60)')} AND sold.units > 0
         """, bid, str(p.start), str(p.end), bid, run.snapshot_id)
         not_sold = await _q(f"""
             SELECT s.product_sku AS sku, s.product_name AS name, s.category AS category, CAST(s.qty AS REAL) AS qty,
                    CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL) AS value_cost, s.last_sold_at AS last_sold_at
             FROM branch_product_stock s
-            WHERE s.branch_id = ? AND s.snapshot_id = ? AND CAST(s.qty AS REAL) > 0
-              AND (s.last_sold_at IS NULL OR julianday('now') - julianday(s.last_sold_at) >= {an.STALE_DAYS})
-            ORDER BY value_cost DESC LIMIT 50
+            WHERE s.branch_id = {dialect.mark()} AND s.snapshot_id = {dialect.mark('varchar(60)')} AND CAST(s.qty AS REAL) > 0
+              AND (s.last_sold_at IS NULL OR {dialect.days_since('s.last_sold_at')} >= {an.STALE_DAYS})
+            ORDER BY value_cost DESC {dialect.limit_offset(50, 0)}
         """, bid, run.snapshot_id)
 
     per_item = []
@@ -372,7 +373,42 @@ def _local_day(at: datetime | None):
 
 
 async def _transfer_rows(branch_id: str) -> list[Transfer]:
-    return await Transfer.filter(Q(branch_id=branch_id) | Q(source_branch_id=branch_id)).prefetch_related("lines", "branch", "source_branch")
+    """Every transfer this branch is at either end of, WITHOUT its lines or its two branch rows.
+
+    There is deliberately no `prefetch_related` here. Tortoise prefetches a reverse relation with
+    `WHERE transfer_id IN (...)`, one parameter per parent row, and Garden Town is at one end of 3,587
+    transfers -- past SQL Server's 2,100 parameter ceiling. So this tab did not merely slow down on the biggest
+    branch, it answered 500: `('07002', 'COUNT field incorrect or syntax error')`, which names neither transfers
+    nor a limit and so reads like a bug anywhere but here. Garden Town failed; Fort Colony at 1,393 did not, which
+    is why it survived this long.
+
+    Nothing wanted the line objects anyway. The page shows four figures per transfer and they are all sums, which
+    `_line_totals` reads in one GROUP BY, and the two branch names, which come from a five row lookup.
+    """
+    return await Transfer.filter(Q(branch_id=branch_id) | Q(source_branch_id=branch_id))
+
+
+async def _line_totals(branch_id: str) -> dict[str, dict]:
+    """Per transfer, the four figures the page shows: lines, units sent, units received, and value at cost.
+
+    One grouped read instead of 117,510 line objects, of which at most 300 transfers' worth is ever displayed.
+    `received_n` is counted because "no line has been received yet" and "received zero" are different answers:
+    the page shows a blank for the first and a figure for the second.
+
+    The casts are the usual ones. pyodbc sends a Python str as NVARCHAR, which outranks char(36), so without them
+    SQL Server converts the column rather than the parameter and stops seeking.
+    """
+    rows = await _q(
+        f'SELECT l."transfer_id" AS tid, COUNT(*) AS lines_, '
+        f'       SUM(COALESCE(l."qty_sent", 0)) AS sent, '
+        f'       SUM(CASE WHEN l."qty_received" IS NULL THEN 0 ELSE l."qty_received" END) AS received, '
+        f'       SUM(CASE WHEN l."qty_received" IS NULL THEN 0 ELSE 1 END) AS received_n, '
+        f'       SUM(COALESCE(l."qty_sent", 0) * COALESCE(l."unit_cost", 0)) AS value_cost '
+        f'FROM "transfer_lines" l '
+        f'JOIN "transfers" t ON t."id" = l."transfer_id" '
+        f'WHERE t."branch_id" = {dialect.mark()} OR t."source_branch_id" = {dialect.mark()} '
+        f'GROUP BY l."transfer_id"', branch_id, branch_id)
+    return {str(r["tid"]): r for r in rows}
 
 
 async def _transfer_counts(branch_id: str, p: ex.Period, rows: list[Transfer] | None = None) -> dict:
@@ -391,21 +427,29 @@ async def transfers(scope: xc.Scope) -> dict:
     p, bid = scope.period, scope.branch_id
     rows = await _transfer_rows(bid)
     counts = await _transfer_counts(bid, p, rows)
+    totals = await _line_totals(bid)
+    names = {str(b.id): b.name for b in await ex.Branch.all()}
     out = []
     for t in sorted(rows, key=lambda t: t.requested_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True):
         day = _local_day(t.requested_at)
         if not ((day and p.start <= day <= p.end) or t.status in OPEN or t.dispute_open):
             continue
         incoming = str(t.branch_id) == bid
-        other = (t.source_branch.name if t.source_branch_id and t.source_branch else "Central Godown") if incoming else t.branch.name
-        sent = sum((line.qty_sent or D0 for line in t.lines), D0)
-        received = [line.qty_received for line in t.lines if line.qty_received is not None]
+        if incoming:
+            other = names.get(str(t.source_branch_id), "Central Godown") if t.source_branch_id else "Central Godown"
+        else:
+            other = names.get(str(t.branch_id), "Central Godown")
+        totes = totals.get(str(t.id)) or {}
+        sent = Decimal(str(totes.get("sent") or 0))
+        received = Decimal(str(totes.get("received") or 0))
+        any_received = int(totes.get("received_n") or 0) > 0
         out.append({
             "id": str(t.id), "number": t.transfer_number, "direction": "In" if incoming else "Out", "other": other,
             "status": t.status, "statusLabel": STATUS_LABEL.get(t.status, t.status.replace("_", " ")), "ack": t.ack_status,
             "requestedAt": _iso(t.requested_at), "dispatchedAt": _iso(t.dispatched_at), "receivedAt": _iso(t.received_at),
-            "lines": len(t.lines), "units": _qty(sent), "unitsReceived": _qty(sum(received, D0)) if received else None,
-            "valueCost": _s(sum(((line.qty_sent or D0) * (line.unit_cost or D0) for line in t.lines), D0)),
+            "lines": int(totes.get("lines_") or 0), "units": _qty(sent),
+            "unitsReceived": _qty(received) if any_received else None,
+            "valueCost": _s(totes.get("value_cost") or 0),
             "dispute": t.dispute_open, "disputeNote": t.dispute_note, "notes": t.notes,
         })
     return {

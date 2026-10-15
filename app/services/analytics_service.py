@@ -26,13 +26,14 @@ one that refuses.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from tortoise import Tortoise
 
-from app.models import Branch, BranchSnapshotRun
+from app.models import Branch, BranchSnapshotRun, selling_branches
 from app.services.executive_service import months_back
+from app.core import dialect
 
 D0 = Decimal("0")
 
@@ -66,7 +67,15 @@ DEAD_DAYS = 180
 
 
 async def _q(sql: str, *args) -> list[dict]:
-    return await Tortoise.get_connection("default").execute_query_dict(sql, list(args))
+    """A read, answered from the short-lived memo when the same screen has already asked it.
+
+    Drawing the year view issues 128 statements of which only 57 are distinct; see `query_cache`.
+    """
+    from app.services import query_cache
+
+    values = list(args)
+    return await query_cache.remember(
+        sql, values, lambda: Tortoise.get_connection("default").execute_query_dict(sql, values))
 
 
 def _d(v) -> Decimal:
@@ -113,7 +122,7 @@ async def _stock_filter() -> tuple[str, list]:
     latest = await current_snapshots()
     if not latest:
         return "1 = 0", []  # nothing complete has arrived; better to return empty than to lie
-    pairs = " OR ".join("(s.branch_id = ? AND s.snapshot_id = ?)" for _ in latest)
+    pairs = " OR ".join(f"(s.branch_id = {dialect.mark()} AND s.snapshot_id = {dialect.mark('varchar(60)')})" for _ in latest)
     params: list = []
     for branch_id, snapshot_id in latest.items():
         params += [branch_id, snapshot_id]
@@ -137,11 +146,151 @@ def abc_class(share_before: Decimal) -> str:
 
 def _scope(where: list[str], params: list, branch_code: str | None) -> None:
     if branch_code:
-        where.append("b.code = ?")
+        where.append(f"b.code = {dialect.mark('varchar(20)')}")
         params.append(branch_code.upper())
 
 
+def _join(branch_code: str | None, table: str, alias: str, always: bool = False) -> str:
+    """The join to `branches`, only when a branch is actually being filtered on.
+
+    `_scope` adds a WHERE on b.code and nothing else, so with no branch chosen the join contributes nothing and
+    costs a lookup into `branches` for every row scanned. On the Company Dashboard, which is the case with no
+    branch chosen, that was 1,818,232 needless lookups per query across about fifty queries.
+
+    `always=True` for a statement that reads a branch's own columns rather than only filtering on them. Two do:
+    the dead stock and sold least listings show which branch each line is at. Dropping their join left `b.code` in
+    the SELECT with no `b` in scope, so both screens failed with "no such column: b.code" for exactly the case the
+    optimisation was for, the one with no branch chosen. The flag is on the call so the requirement sits next to
+    the statement that has it.
+    """
+    return f" JOIN branches b ON b.id = {alias}.branch_id" if (branch_code or always) else ""
+
+
+async def _ranked(start: date, end: date, branch_code: str | None) -> list[dict]:
+    """Each Item summed over the period: whole months from the rollup, the ragged ends from the days.
+
+    A year is eleven whole months and two part-months. The eleven are already summed in `branch_product_months`,
+    413,489 rows against 1,818,232; the two ends are about 60 days and use the day index. The two are added here.
+
+    Falls back to the day-level table when the rollup has not been built, because an empty derived table must not
+    read as nothing sold.
+    """
+    from app.services import rollup_service
+
+    whole, edges = rollup_service.months_in(start, end)
+    use_rollup = bool(whole) and not await rollup_service.is_stale()
+
+    totals: dict[str, dict] = {}
+
+    def add(sku, name, category, brand, department, net, cogs, qty, days):
+        row = totals.get(sku)
+        if row is None:
+            row = totals[sku] = {"sku": sku, "name": name, "category": category, "brand": brand,
+                                 "department": department, "net_sales": 0.0, "cogs": 0.0, "qty": 0.0,
+                                 "selling_days": 0}
+        row["net_sales"] += float(net or 0)
+        row["cogs"] += float(cogs or 0)
+        row["qty"] += float(qty or 0)
+        row["selling_days"] += int(days or 0)
+        for key, value in (("name", name), ("category", category), ("brand", brand), ("department", department)):
+            if row[key] is None and value is not None:
+                row[key] = value
+
+    if use_rollup:
+        marks = ", ".join("?" * len(whole))
+        mwhere = [f"m.ym IN ({marks})"]
+        mparams: list = list(whole)
+        if branch_code:
+            mwhere.append(f"b.code = {dialect.mark('varchar(20)')}")
+            mparams.append(branch_code.upper())
+        join = " JOIN branches b ON b.id = m.branch_id" if branch_code else ""
+        for r in await _q(f"""
+            SELECT m.product_sku AS sku, MAX(m.product_name) AS name, MAX(m.category) AS category,
+                   MAX(m.brand) AS brand, MAX(m.department) AS department,
+                   SUM(CAST(m.net_sales AS REAL)) AS net_sales, SUM(CAST(m.cogs AS REAL)) AS cogs,
+                   SUM(CAST(m.qty AS REAL)) AS qty, SUM(m.days_sold) AS selling_days
+            FROM branch_product_months m{join}
+            WHERE {' AND '.join(mwhere)}
+            GROUP BY m.product_sku
+        """, *mparams):
+            add(r["sku"], r["name"], r["category"], r["brand"], r["department"],
+                r["net_sales"], r["cogs"], r["qty"], r["selling_days"])
+        spans = edges
+    else:
+        spans = [(start, end)]
+
+    for lo, hi in spans:
+        where = ["ps.day >= ?", "ps.day <= ?"]
+        params: list = [lo.isoformat(), hi.isoformat()]
+        _scope(where, params, branch_code)
+        for r in await _q(f"""
+            SELECT ps.product_sku AS sku, MAX(ps.product_name) AS name,
+                   MAX(ps.category) AS category, MAX(ps.brand) AS brand, MAX(ps.department) AS department,
+                   SUM(CAST(ps.net_sales AS REAL)) AS net_sales,
+                   SUM(CAST(ps.cogs AS REAL))      AS cogs,
+                   SUM(CAST(ps.qty AS REAL))       AS qty,
+                   COUNT(DISTINCT CASE WHEN CAST(ps.qty AS REAL) > 0 THEN ps.day END) AS selling_days
+            FROM branch_product_stats ps{_join(branch_code, '', 'ps')}
+            WHERE {' AND '.join(where)}
+            GROUP BY ps.product_sku
+        """, *params):
+            add(r["sku"], r["name"], r["category"], r["brand"], r["department"],
+                r["net_sales"], r["cogs"], r["qty"], r["selling_days"])
+
+    # `days_sold` in the rollup is per branch, so summing it across branches counts one day three times when three
+    # shops sold the same Item that day. Exact when a branch is named; otherwise asked of the day-level table, which
+    # is the only place that can say how many DISTINCT days an Item sold on company-wide. Measured at 1.19s for a
+    # year, against getting 6,052 Items' selling days wrong.
+    if use_rollup and not branch_code:
+        where = ["ps.day >= ?", "ps.day <= ?", "CAST(ps.qty AS REAL) > 0"]
+        params = [start.isoformat(), end.isoformat()]
+        for r in await _q(f"""
+            SELECT ps.product_sku AS sku, COUNT(DISTINCT ps.day) AS d
+            FROM branch_product_stats ps
+            WHERE {' AND '.join(where)}
+            GROUP BY ps.product_sku
+        """, *params):
+            row = totals.get(r["sku"])
+            if row is not None:
+                row["selling_days"] = int(r["d"] or 0)
+
+    return [r for r in totals.values() if r["qty"] > 0 or r["net_sales"] > 0]
+
+
+async def _folded(key: str, args: list, build) -> tuple[list[dict], Coverage]:
+    """A classification folded once per screen rather than once per tile that wants it.
+
+    `query_cache` already stops the same SQL being asked twice, and that was enough while every repeat was a query.
+    These two are not queries, they are folds over one: ABC ranks 11,721 Items, sorts them and walks the running
+    total in Python, and the SQL underneath it is the cheap half.
+
+    One render of the Company Dashboard grid asks for ABC **three** times -- the Stock section's tile, `movement`
+    (velocity is ABC's rows banded by units a day, by design, see its note), and the Stock charts -- and for XYZ
+    twice. The query memo made the second and third free at the database and left the fold to run again each time.
+    Measured on their 1,838,739 Item-days, folded cold: ABC 1.42s, XYZ 2.04s, velocity 1.46s.
+
+    Same memo, so the same guarantees: seconds not minutes, cleared the moment figures land, bounded. And the same
+    correctness argument, one step further on: a pure fold of rows that are safe to reuse is itself safe to reuse.
+
+    **A copy per caller.** `movement` writes `perDay` and `band` onto the rows it is handed, and a shared list would
+    give the next caller someone else's banding. Copying 11,721 small dicts costs a few milliseconds against the
+    second and a half it saves.
+    """
+    from app.services import query_cache
+
+    rows, coverage = await query_cache.remember(key, args, build)
+    return [dict(r) for r in rows], coverage
+
+
 async def abc(start, end, branch_code: str | None = None, basis: str = "sales") -> tuple[list[dict], Coverage]:
+    """Rank every Item that sold in the window by the chosen basis, then cut the running total. Folded once per
+    screen; see `_folded`."""
+    basis = basis_of(basis)
+    return await _folded("analytics.abc", [_day(start), _day(end), branch_code, basis],
+                         lambda: _abc(start, end, branch_code, basis))
+
+
+async def _abc(start, end, branch_code: str | None = None, basis: str = "sales") -> tuple[list[dict], Coverage]:
     """Rank every Item that sold in the window by the chosen basis, then cut the running total.
 
     Value by default, not volume. A pharmacy line selling four boxes a week at Rs 3,000 matters more than
@@ -155,19 +304,7 @@ async def abc(start, end, branch_code: str | None = None, basis: str = "sales") 
     params: list = [str(start), str(end)]
     _scope(where, params, branch_code)
 
-    rows = await _q(f"""
-        SELECT ps.product_sku AS sku, MAX(ps.product_name) AS name,
-               MAX(ps.category) AS category, MAX(ps.brand) AS brand, MAX(ps.department) AS department,
-               SUM(CAST(ps.net_sales AS REAL)) AS net_sales,
-               SUM(CAST(ps.cogs AS REAL))      AS cogs,
-               SUM(CAST(ps.qty AS REAL))       AS qty,
-               COUNT(DISTINCT ps.day)          AS selling_days
-        FROM branch_product_stats ps
-        JOIN branches b ON b.id = ps.branch_id
-        WHERE {' AND '.join(where)}
-        GROUP BY ps.product_sku
-        HAVING SUM(CAST(ps.qty AS REAL)) > 0 OR SUM(CAST(ps.net_sales AS REAL)) > 0
-    """, *params)
+    rows = await _ranked(_day(start), _day(end), branch_code)
 
     days = await _trading_days(start, end, branch_code)
     if not rows:
@@ -257,7 +394,40 @@ def _day(v) -> date:
     return v if isinstance(v, date) else date.fromisoformat(str(v)[:10])
 
 
+def bucket_bounds(start: date, end: date, kind: str) -> list[tuple[int, date]]:
+    """Each bucket and the first day that falls in it, oldest first.
+
+    `bucket_index` is monotonic in the day: a later day is never in an older bucket. So every bucket is a contiguous
+    run of days, and the whole mapping is described by where each run starts. This walks the period a day at a time
+    and asks `bucket_index` itself, so the day-of-month correction and every other rule stay exactly where they are.
+    At most 731 calls, against the 1,818,232 rows the alternative moves.
+    """
+    bounds: dict[int, date] = {}
+    day = start
+    while day <= end:
+        i = bucket_index(day, end, kind)
+        if i not in bounds or day < bounds[i]:
+            bounds[i] = day
+        day += timedelta(days=1)
+    return sorted(bounds.items(), key=lambda kv: kv[1])
+
+
+def bucket_case(bounds: list[tuple[int, date]], column: str) -> tuple[str, list]:
+    """The same mapping as a SQL expression: a CASE over the boundaries, newest first so the first match wins."""
+    whens, args = [], []
+    for index, first_day in sorted(bounds, key=lambda kv: kv[1], reverse=True):
+        whens.append(f"WHEN {column} >= ? THEN ?")
+        args += [first_day.isoformat(), index]
+    return "CASE " + " ".join(whens) + " ELSE NULL END", args
+
+
 async def xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage]:
+    """Classify each Item by how steadily it sells. Folded once per screen; see `_folded`."""
+    return await _folded("analytics.xyz", [_day(start), _day(end), branch_code],
+                         lambda: _xyz(start, end, branch_code))
+
+
+async def _xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], Coverage]:
     """Classify each Item by how steadily it sells.
 
     Demand is summed into buckets (see `bucket_kind`), counted from the later of the period's first day
@@ -271,44 +441,93 @@ async def xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], C
     kind = bucket_kind(start, end)
     days = await _trading_days(start, end, branch_code)
 
+    # The bucket a day belongs to, decided by `bucket_index` and handed to SQL as boundaries, so the grouping
+    # happens in the database and the rule stays in Python where it is already right.
+    bounds = bucket_bounds(start, end, kind)
+    case_sql, case_args = bucket_case(bounds, "ps.day")
+
     where = ["ps.day >= ?", "ps.day <= ?"]
     params: list = [str(start), str(end)]
     _scope(where, params, branch_code)
-    daily = await _q(f"""
-        SELECT ps.product_sku AS sku, ps.day AS day,
-               MAX(ps.product_name) AS name, MAX(ps.category) AS category, MAX(ps.brand) AS brand,
-               SUM(CAST(ps.qty AS REAL)) AS qty, SUM(CAST(ps.net_sales AS REAL)) AS net_sales
-        FROM branch_product_stats ps
-        JOIN branches b ON b.id = ps.branch_id
-        WHERE {' AND '.join(where)}
-        GROUP BY ps.product_sku, ps.day
-    """, *params)
-    if not daily:
+    # One row per Item per bucket, not per Item per day. The names come separately, one row per Item, because
+    # MAX() over three text columns across 1.8 million rows is most of what the old query spent its time on.
+    # The bucket is worked out in a derived table and grouped in the outer query, rather than named in the SELECT
+    # and grouped by that name. SQLite lets `GROUP BY b` mean the alias above it; SQL Server does not and answers
+    # "Invalid column name 'b'". Repeating the CASE in the GROUP BY would work on both but would need its
+    # parameters passed twice, in an order nothing in the statement makes obvious, and a bucket boundary bound to
+    # the wrong placeholder misclassifies goods silently. A derived table needs neither.
+    bucketed = await _q(f"""
+        SELECT sku, b, SUM(qty) AS qty, SUM(net_sales) AS net_sales
+        FROM (
+            SELECT ps.product_sku AS sku, {case_sql} AS b,
+                   CAST(ps.qty AS REAL) AS qty, CAST(ps.net_sales AS REAL) AS net_sales
+            FROM branch_product_stats ps{_join(branch_code, '', 'ps')}
+            WHERE {' AND '.join(where)}
+        ) per_day
+        GROUP BY sku, b
+    """, *(case_args + params))
+    if not bucketed:
         return [], Coverage(days, 0, 0, 0, "Nothing sold in this period.", kind)
+
+    # How many buckets each Item actually sold in, and its names. Both one row per Item.
+    #
+    # Two queries on purpose, and it was checked rather than assumed. Folding this into the one above as conditional
+    # aggregates on (sku, bucket) gives byte for byte the same 62,903 bucket rows and 11,721 Item rows, and is slower:
+    # 2.40s against 1.84s over four interleaved rounds. Both read nothing but idx_bps_day_covering, so the second pass
+    # costs little, while COUNT(DISTINCT day) at the finer grain and four more CASE columns cost more than it saves.
+    sold_days = {r["sku"]: r for r in await _q(f"""
+        SELECT ps.product_sku AS sku, COUNT(DISTINCT ps.day) AS days,
+               MAX(ps.product_name) AS name, MAX(ps.category) AS category, MAX(ps.brand) AS brand
+        FROM branch_product_stats ps{_join(branch_code, '', 'ps')}
+        WHERE {' AND '.join(where)} AND CAST(ps.qty AS REAL) > 0
+        GROUP BY ps.product_sku
+    """, *params)}
 
     # The first day each Item sold anywhere in the data (or at this branch), not just in the window.
     first_where = ["ps.day <= ?", "CAST(ps.qty AS REAL) > 0"]
     first_params: list = [str(end)]
     _scope(first_where, first_params, branch_code)
-    first_sale = {r["sku"]: _day(r["first_day"]) for r in await _q(f"""
-        SELECT ps.product_sku AS sku, MIN(ps.day) AS first_day
-        FROM branch_product_stats ps
-        JOIN branches b ON b.id = ps.branch_id
-        WHERE {' AND '.join(first_where)}
-        GROUP BY ps.product_sku
-    """, *first_params)}
+    # From the materialised table when it exists. The query it replaces has no lower bound, so it read the whole
+    # history on every render whatever period was asked for: 2.57 seconds, twice, even on the one-day view.
+    from app.services import rollup_service
 
+    if not await rollup_service.is_stale():
+        fs_where = ["f.first_day <= ?"]
+        fs_params: list = [str(end)]
+        fs_join = ""
+        if branch_code:
+            fs_join = " JOIN branches b ON b.id = f.branch_id"
+            fs_where.append(f"b.code = {dialect.mark('varchar(20)')}")
+            fs_params.append(branch_code.upper())
+        first_sale = {r["sku"]: _day(r["first_day"]) for r in await _q(f"""
+            SELECT f.product_sku AS sku, MIN(f.first_day) AS first_day
+            FROM branch_product_first_sale f{fs_join}
+            WHERE {' AND '.join(fs_where)}
+            GROUP BY f.product_sku
+        """, *fs_params)}
+    else:
+        first_sale = {r["sku"]: _day(r["first_day"]) for r in await _q(f"""
+            SELECT ps.product_sku AS sku, MIN(ps.day) AS first_day
+            FROM branch_product_stats ps{_join(branch_code, '', 'ps')}
+            WHERE {' AND '.join(first_where)}
+            GROUP BY ps.product_sku
+        """, *first_params)}
+
+    # Floats while adding up, Decimal once at the end. A quantity is a small number and float64 carries fifteen
+    # significant digits; these are printed to three decimal places, and `cv` and `avgPerBucket` are floats already.
     items: dict[str, dict] = {}
-    for r in daily:
-        item = items.setdefault(r["sku"], {"sku": r["sku"], "name": r["name"], "category": r["category"],
-                                           "brand": r["brand"], "qty": D0, "net": D0, "days": 0, "points": {}})
-        qty = _d(r["qty"])
+    for r in bucketed:
+        item = items.get(r["sku"])
+        if item is None:
+            info = sold_days.get(r["sku"]) or {}
+            item = items[r["sku"]] = {"sku": r["sku"], "name": info.get("name"), "category": info.get("category"),
+                                      "brand": info.get("brand"), "qty": 0.0, "net": 0.0,
+                                      "days": int((info.get("days") or 0)), "points": {}}
+        qty = float(r["qty"] or 0)
         item["qty"] += qty
-        item["net"] += _d(r["net_sales"])
-        if qty > 0:
-            item["days"] += 1
-            i = bucket_index(_day(r["day"]), end, kind)
-            item["points"][i] = item["points"].get(i, D0) + qty
+        item["net"] += float(r["net_sales"] or 0)
+        if qty > 0 and r["b"] is not None:
+            item["points"][int(r["b"])] = item["points"].get(int(r["b"]), 0.0) + qty
 
     out: list[dict] = []
     for item in items.values():
@@ -316,20 +535,22 @@ async def xyz(start, end, branch_code: str | None = None) -> tuple[list[dict], C
             continue
         since = max(start, first_sale.get(item["sku"], start))
         n = bucket_index(since, end, kind) + 1
-        series = [item["points"].get(i, D0) for i in range(n)]
+        # Back to Decimal here, where there are n values per Item rather than a row per Item per day.
+        series = [Decimal(str(item["points"].get(i, 0.0))) for i in range(n)]
         klass, cv = xyz_class(series)
         sold_in = sum(1 for x in series if x > 0)
+        total_qty = Decimal(str(item["qty"]))
         out.append({
             "sku": item["sku"], "name": item["name"], "category": item["category"], "brand": item["brand"],
-            "netSales": str(item["net"].quantize(Decimal("0.01"))),
-            "totalQty": str(item["qty"].quantize(Decimal("0.001")).normalize()),
+            "netSales": str(Decimal(str(item["net"])).quantize(Decimal("0.01"))),
+            "totalQty": str(total_qty.quantize(Decimal("0.001")).normalize()),
             "sellingDays": item["days"],
             "since": since.isoformat(),
             "bucket": kind,
             "buckets": n,
             "bucketsSold": sold_in,
             "coveragePct": float(Decimal(sold_in) / n * 100) if n else 0.0,
-            "avgPerBucket": float(item["qty"] / n) if n else 0.0,
+            "avgPerBucket": (item["qty"] / n) if n else 0.0,
             "cv": float(cv) if cv is not None else None,
             "xyzClass": klass,
         })
@@ -439,9 +660,8 @@ async def sold_least(start, end, branch_code: str | None = None, basis: str = "s
                SUM(CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)) AS value_cost,
                SUM(CAST(s.qty AS REAL) * CAST(s.price AS REAL)) AS value_retail,
                MAX(s.last_sold_at) AS last_sold_at,
-               GROUP_CONCAT(DISTINCT b.code) AS branches
-        FROM branch_product_stock s
-        JOIN branches b ON b.id = s.branch_id
+               {dialect.group_concat_distinct('b.code')} AS branches
+        FROM branch_product_stock s{_join(branch_code, '', 's', always=True)}
         WHERE {' AND '.join(where)}
         GROUP BY s.product_sku
     """, *params)}
@@ -496,8 +716,7 @@ async def unsold_on_shelf(start, end, branch_code: str | None = None) -> tuple[i
         )
         SELECT COUNT(DISTINCT s.product_sku) AS items,
                SUM(CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)) AS value_cost
-        FROM branch_product_stock s
-        JOIN branches b ON b.id = s.branch_id
+        FROM branch_product_stock s{_join(branch_code, '', 's')}
         LEFT JOIN sold ON sold.sku = s.product_sku {same_branch}
         WHERE {' AND '.join(where)}
     """, str(start), str(end), *params)
@@ -518,21 +737,24 @@ async def dead_stock_summary(branch_code: str | None = None) -> dict:
     clause, params = await _stock_filter()
     where = [clause, "CAST(s.qty AS REAL) > 0"]
     if branch_code:
-        where.append("b.code = ?")
+        where.append(f"b.code = {dialect.mark('varchar(20)')}")
         params = params + [branch_code.upper()]
 
+    # The band is named in a derived table and grouped in the outer query. `GROUP BY band` reads better, and works
+    # on SQLite, but SQL Server does not let a GROUP BY see a SELECT alias and answers "Invalid column name 'band'".
     rows = await _q(f"""
-        SELECT CASE
-                 WHEN s.last_sold_at IS NULL THEN 'never-sold'
-                 WHEN julianday('now') - julianday(s.last_sold_at) >= {DEAD_DAYS} THEN 'dead'
-                 WHEN julianday('now') - julianday(s.last_sold_at) >= {STALE_DAYS} THEN 'stale'
-                 ELSE 'live'
-               END AS band,
-               COUNT(*) AS lines,
-               SUM(CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL)) AS value_cost
-        FROM branch_product_stock s
-        JOIN branches b ON b.id = s.branch_id
-        WHERE {' AND '.join(where)}
+        SELECT band, COUNT(*) AS lines, SUM(value_cost) AS value_cost
+        FROM (
+            SELECT CASE
+                     WHEN s.last_sold_at IS NULL THEN 'never-sold'
+                     WHEN {dialect.days_since('s.last_sold_at')} >= {DEAD_DAYS} THEN 'dead'
+                     WHEN {dialect.days_since('s.last_sold_at')} >= {STALE_DAYS} THEN 'stale'
+                     ELSE 'live'
+                   END AS band,
+                   CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL) AS value_cost
+            FROM branch_product_stock s{_join(branch_code, '', 's')}
+            WHERE {' AND '.join(where)}
+        ) banded
         GROUP BY band
     """, *params)
 
@@ -557,7 +779,7 @@ async def dead_stock(branch_code: str | None = None) -> tuple[list[dict], dict]:
     clause, params = await _stock_filter()
     where = [clause, "CAST(s.qty AS REAL) > 0"]
     if branch_code:
-        where.append("b.code = ?")
+        where.append(f"b.code = {dialect.mark('varchar(20)')}")
         params = params + [branch_code.upper()]
 
     rows = await _q(f"""
@@ -568,8 +790,7 @@ async def dead_stock(branch_code: str | None = None) -> tuple[list[dict], dict]:
                CAST(s.qty AS REAL) * CAST(s.avg_cost AS REAL) AS value_cost,
                CAST(s.qty AS REAL) * CAST(s.price AS REAL)    AS value_retail,
                s.last_sold_at, s.last_received_at, s.days_with_sales
-        FROM branch_product_stock s
-        JOIN branches b ON b.id = s.branch_id
+        FROM branch_product_stock s{_join(branch_code, '', 's', always=True)}
         WHERE {' AND '.join(where)}
         ORDER BY value_cost DESC
     """, *params)
@@ -646,15 +867,16 @@ async def _trading_days(start, end, branch_code: str | None) -> int:
     where = ["day >= ?", "day <= ?"]
     params: list = [str(start), str(end)]
     if branch_code:
-        where.append("b.code = ?")
+        where.append(f"b.code = {dialect.mark('varchar(20)')}")
         params.append(branch_code.upper())
     rows = await _q(f"""
         SELECT COUNT(DISTINCT d.day) AS days
-        FROM branch_daily_stats d JOIN branches b ON b.id = d.branch_id
+        FROM branch_daily_stats d{_join(branch_code, '', 'd')}
         WHERE {' AND '.join(w.replace('day', 'd.day') if w.startswith('day') else w for w in where)}
     """, *params)
     return int(rows[0]["days"] or 0) if rows else 0
 
 
 async def branch_options() -> list[dict]:
-    return [{"code": b.code, "name": b.name} for b in await Branch.all().order_by("name")]
+    """What the branch picker offers. Head office is not one of them -- see `selling_branches`."""
+    return [{"code": b.code, "name": b.name} for b in await selling_branches().order_by("name")]

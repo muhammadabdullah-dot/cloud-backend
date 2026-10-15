@@ -11,12 +11,20 @@ from decimal import Decimal
 
 from tortoise import Tortoise
 
+from app.core import dialect, when
 from app.core.pk_time import PKT, pk_day  # noqa: F401  (PKT is imported from here by other services)
 from app.models import HEAD_OFFICE_BOOK, Account, AccountCategory, AccountGroup, AccountType, Voucher
 from app.services.accounts_chart_service import money
 
 ZERO = Decimal("0")
 ALL = "ALL"
+# Where a windowed sum stops being cheaper to seek than to hash. Measured, not guessed: see `dialect.hash_join`.
+WIDE_WINDOW_DAYS = 60
+
+# Earlier than any voucher that can exist, so that "no start date" becomes a date range the materialised view can
+# answer. It is the first of a month on purpose: `sp_ledger_sums` reads the days before the first whole month from
+# the voucher lines, and a floor on the 1st makes that piece empty rather than a scan from 1900.
+LEDGER_FLOOR = date(1900, 1, 1)
 
 
 def shop_day(at: datetime | None = None) -> date:
@@ -39,7 +47,10 @@ async def _query(sql: str, params: list) -> list[dict]:
 async def all_books() -> list[str]:
     from app.models import Branch
 
-    codes = [HEAD_OFFICE_BOOK] + [b.code for b in await Branch.all().order_by("code")]
+    # Head office is a Branch row of its own as well as HEAD_OFFICE_BOOK, so it arrives twice and used to be
+    # returned twice: ['HO', 'FC', 'GG', 'GT', 'HO', 'MT']. Harmless inside `book IN (...)`, and not harmless
+    # anywhere that walks the list a book at a time, which would count head office's figures twice.
+    codes = list(dict.fromkeys([HEAD_OFFICE_BOOK] + [b.code for b in await Branch.all().order_by("code")]))
     seen = set(await Account.all().distinct().values_list("book", flat=True))
     return codes + sorted(seen - set(codes))
 
@@ -87,9 +98,53 @@ def _label(meta: dict, together: bool, merged: bool) -> str:
     return meta["name"] if (not together or merged) else f"{meta['book']} · {meta['name']}"
 
 
+def month_end(day: date) -> date:
+    """The last day of that day's month."""
+    return (day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+
+
+def whole_months_in(start: date, end: date) -> tuple[date, date] | None:
+    """The stretch of complete calendar months inside a range, or None when it holds none.
+
+    `vw_ledger_month` is grained to a calendar month and the periods people pick are not: "last 12 months" runs
+    6 October to 5 October, eleven whole months with a ragged piece at each end. Only the whole months can be
+    answered from the view; the ends have to be read from the lines whatever happens.
+    """
+    first = start if start.day == 1 else (start.replace(day=1) + timedelta(days=32)).replace(day=1)
+    last = end if end == month_end(end) else month_end(end.replace(day=1) - timedelta(days=1))
+    return (first, last) if first <= last else None
+
+
 async def _sums(books: list[str], start: date | None = None, end: date | None = None, before: date | None = None,
                 account_ids: list[str] | None = None) -> dict[str, tuple[Decimal, Decimal]]:
-    where, params = ["v.status = 'posted'", f"v.book IN ({','.join('?' for _ in books)})"], list(books)
+    # THE FAST ROAD: the months are already added up in dbo.vw_ledger_month, so ask for them rather than add
+    # 5.4 million voucher lines again. A year of all five books is 0.07s this way against 3.57s, and the Net
+    # Profit tile on the Company Dashboard -- which asks this twice, for the period and the one before it --
+    # takes the Sales section from 7.93s to 2.60s with every tile identical.
+    #
+    # Three conditions, and each one is load-bearing:
+    #
+    #   * SQL Server only. The view and the procedure do not exist on SQLite, which is what every branch server
+    #     and thirteen of the checks in ops/checks run on.
+    #   * only the plain windowed question. `before=` and an account filter have their own plans and are
+    #     already quick; sending them here would be slower, not faster.
+    #   * only when a whole calendar month is in the range. Without a whole month the procedure reads the same
+    #     lines this function would have read and charges its own overhead on top: 0.53s against 0.27s for a
+    #     30 day window, 0.05s against 0.04s for one day. Speeding up the twelve month view by slowing down
+    #     today and this month is the wrong trade, and those are what people look at most.
+    #   * `start=None` means "everything there has ever been, up to `end`", which is the shape the Accounts Desk
+    #     asks for and which used to take the slow road because the guard insisted on a start date. A floor date
+    #     earlier than any voucher makes it the same question: every month before this one comes from the view and
+    #     only the ragged end is read from the lines. Measured on the whole company, everything to today: 4.64s
+    #     against 0.16s, identical account for account across all 2,582 of them.
+    floor = start if start is not None else LEDGER_FLOOR
+    if (dialect.engine() == dialect.MSSQL and end is not None
+            and before is None and account_ids is None and whole_months_in(floor, end)):
+        rows = await _query("EXEC dbo.sp_ledger_sums @books = ?, @from = ?, @to = ?",
+                            [",".join(books), floor.isoformat(), end.isoformat()])
+        return {str(r["account_id"]): (money(_d(r["dr"])), money(_d(r["cr"]))) for r in rows}
+
+    where, params = ["v.status = 'posted'", f"v.book IN ({dialect.codes(books)})"], list(books)
     if start:
         where.append("v.date >= ?")
         params.append(start.isoformat())
@@ -99,14 +154,88 @@ async def _sums(books: list[str], start: date | None = None, end: date | None = 
     if before:
         where.append("v.date < ?")
         params.append(before.isoformat())
+    if account_ids is not None and not account_ids:
+        return {}
     if account_ids:
-        where.append(f"l.account_id IN ({','.join('?' for _ in account_ids)})")
+        # SQL Server takes 2,100 parameters and no more. A party summary asks this for every customer or supplier
+        # at once, which is thousands, and the whole call failed with "COUNT field incorrect" -- an error that
+        # names the symptom and not the cause. Over the ceiling the list is asked for in pieces and the pieces
+        # added up; each piece seeks on idx_avl_account, so the cost is the rows, not the number of queries.
+        ceiling = 1800 - len(params)
+        if len(account_ids) > ceiling:
+            merged: dict[str, tuple[Decimal, Decimal]] = {}
+            for at in range(0, len(account_ids), ceiling):
+                part = await _sums(books, start, end, before, account_ids[at:at + ceiling])
+                for key, (dr, cr) in part.items():
+                    was_dr, was_cr = merged.get(key, (ZERO, ZERO))
+                    merged[key] = (was_dr + dr, was_cr + cr)
+            return merged
+        where.append(f"l.account_id IN ({dialect.marks(account_ids)})")
         params.extend(account_ids)
+    # Which join, by how wide the window is. With both ends pinned, the planner seeks acc_vouchers by date and
+    # looks the lines up a voucher at a time: right for a month, wrong for a year, and the cost is a straight line
+    # in the number of vouchers. A year of all five books took 13.91s that way and 3.22s as a hash join, which is
+    # the difference between the dashboard's twelve month view answering and timing out. Below the crossover the
+    # hint is the slower choice, so it is not asked for. The measurements are in `dialect.hash_join`.
+    wide = start is not None and end is not None and (end - start).days > WIDE_WINDOW_DAYS
+    join = dialect.hash_join() if wide else "JOIN"
     rows = await _query(
         f"SELECT l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr FROM acc_voucher_lines l "
-        f"JOIN acc_vouchers v ON v.id = l.voucher_id WHERE {' AND '.join(where)} GROUP BY l.account_id", params,
+        f"{join} acc_vouchers v ON v.id = l.voucher_id WHERE {' AND '.join(where)} GROUP BY l.account_id", params,
     )
     return {str(r["account_id"]): (money(_d(r["dr"])), money(_d(r["cr"]))) for r in rows}
+
+
+async def _opening_and_period(books: list[str], start: date | None, end: date,
+                              ) -> tuple[dict[str, tuple[Decimal, Decimal]], dict[str, tuple[Decimal, Decimal]]]:
+    """Both halves of a trial balance in one pass over the lines.
+
+    `_sums(before=start)` then `_sums(start, end)` reads everything up to `end` twice: once for the opening
+    balances and once for the period. The rows are the same rows, so one pass splits them on the way past, which
+    halves the work for every report that needs an opening balance -- trial balance and balance sheet, the two
+    that sat closest to the client's 15 second limit.
+
+    **Which side a line falls on is a column to group by, not a CASE inside four separate sums.** Four sums each
+    testing the date means four comparisons per line, 21.6 million of them over the 5.4M lines up to September,
+    and three of every four then add nothing. Deciding the side once and grouping by the answer costs one
+    comparison and two sums: 9.41s against 7.47s on all five books, and 14.30s against 9.05s while another
+    session had the machine. It returns the same two dicts, checked against the old shape over six windows
+    including one book on its own, no start date at all, and a window with nothing in it.
+    """
+    if start is None:
+        return {}, await _sums(books, end=end)
+
+    # On SQL Server the reasoning above is now the wrong way round. One pass was right when both halves had to be
+    # read from the voucher lines, because it read them once instead of twice. They no longer are: "everything
+    # before the start" and "the start to the end" are both shapes `sp_ledger_sums` answers out of the
+    # materialised view, so two cheap calls beat one expensive pass. Over the fiscal year on all five books,
+    # 7.84s against 0.32s -- 24 times -- with both halves identical account for account.
+    #
+    # The one-pass query below is kept for SQLite, which has neither the view nor the procedure, and that is where
+    # it is still the better shape.
+    if dialect.engine() == dialect.MSSQL:
+        return (await _sums(books, end=start - timedelta(days=1)),
+                await _sums(books, start=start, end=end))
+
+    marks = dialect.codes(books)
+    rows = await _query(
+        "SELECT account_id, side, SUM(debit) AS dr, SUM(credit) AS cr FROM ("
+        "  SELECT l.account_id AS account_id, l.debit AS debit, l.credit AS credit, "
+        "         CASE WHEN v.date < ? THEN 0 ELSE 1 END AS side "
+        "    FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
+        f"   WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date <= ?"
+        ") z GROUP BY account_id, side",
+        [start.isoformat(), *books, end.isoformat()],
+    )
+    opening, period = {}, {}
+    for row in rows:
+        dr, cr = money(_d(row["dr"])), money(_d(row["cr"]))
+        # Only where there is something, so the shape matches what two separate _sums calls returned: an account
+        # with no opening entries was simply absent from the opening dict, and callers rely on that.
+        if not (dr or cr):
+            continue
+        (opening if int(row["side"]) == 0 else period)[str(row["account_id"])] = (dr, cr)
+    return opening, period
 
 
 def _merge(chart: dict[str, dict], sums: dict[str, tuple[Decimal, Decimal]], together: bool) -> dict[str, dict]:
@@ -134,6 +263,43 @@ def _merge(chart: dict[str, dict], sums: dict[str, tuple[Decimal, Decimal]], tog
     return out
 
 
+async def sums_by_kind(books: list[str], kind: str, end: date) -> dict[str, tuple[Decimal, Decimal]]:
+    """Every account of one kind, summed to a date, without naming them one by one.
+
+    A party summary covers every customer or every supplier, which is thousands of ids. Passing them as
+    parameters broke SQL Server's 2,100 ceiling, and chunking round it turned one scan into many: the payable
+    summary took 231 seconds. `kind` is a column on acc_accounts, so the database can do the filtering itself
+    and the whole thing is one pass. The same change took ageing from 282 seconds to under one.
+
+    **The join order is pinned on purpose, and it is the only hint in this file** (`dialect.loop_join`,
+    which is a plain INNER JOIN on SQLite because SQLite rejects the word). Written without one, and with
+    statistics freshly rebuilt, the planner read all 5,412,269 ledger lines to find the 25,811 on head office's
+    suppliers: 87,945 page reads, 687 MB. Starting from acc_accounts and seeking idx_avl_account once per party
+    reads 5,442 pages, 43 MB -- sixteen times less -- for the same 388 rows and the same total to the paisa. Warm
+    both are a fraction of a second, because warm pages are nearly free; the reads are what the first screen of
+    the morning pays, and 687 MB of them is what made the receivable and payable summaries take 34 and 33 seconds.
+
+    Naming the party ids instead was measured and is worse than either: 956 parameters sends SQL Server seeking
+    idx_avl_account per id and then looking each line's voucher up a row at a time, and the query had not returned
+    after nine minutes. That is the same trap `cash_flow` records above.
+
+    The hint is safe in the direction this grows. The outer input is the accounts of one kind -- thousands at most,
+    out of 7,301 -- and the inner side is an index seek over a range, so more parties means more seeks of the same
+    cost rather than a plan that falls over.
+    """
+    marks = dialect.codes(books)
+    rows = await _query(
+        "SELECT l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
+        "FROM acc_accounts a "
+        f"{dialect.loop_join()} acc_voucher_lines l ON l.account_id = a.id "
+        "INNER JOIN acc_vouchers v ON v.id = l.voucher_id "
+        f"WHERE a.book IN ({marks}) AND a.kind = {dialect.mark('varchar(20)')} AND v.status = 'posted' AND v.book IN ({marks}) "
+        "AND v.date <= ? "
+        "GROUP BY l.account_id", [*books, kind, *books, end.isoformat()],
+    )
+    return {str(r["account_id"]): (money(_d(r["dr"])), money(_d(r["cr"]))) for r in rows}
+
+
 async def balance_of(account_id, upto: date | None = None, natural: bool = True) -> Decimal:
     account = await Account.get(id=account_id).prefetch_related("group__category__type")
     sums = await _sums([account.book], end=upto, account_ids=[str(account_id)])
@@ -155,8 +321,9 @@ def codes(value: str | None) -> set[str]:
 async def trial_balance(books: list[str], together: bool, start: date | None, end: date, group_code: str | None = None, include_zero: bool = False,
                         category_code: str | None = None) -> dict:
     chart = await chart_map(books)
-    opening = _merge(chart, await _sums(books, before=start) if start else {}, together)
-    period = _merge(chart, await _sums(books, start=start, end=end), together)
+    opening_sums, period_sums = await _opening_and_period(books, start, end)
+    opening = _merge(chart, opening_sums, together)
+    period = _merge(chart, period_sums, together)
     groups_wanted, categories_wanted = codes(group_code), codes(category_code)
     rows = []
     for key, p in period.items():
@@ -205,38 +372,125 @@ async def trial_balance(books: list[str], together: bool, start: date | None, en
             "difference": _s(totals["closingDr"] - totals["closingCr"])}
 
 
-async def ledger(account_id: str, start: date | None, end: date, include_pdc: bool = False) -> dict:
+async def ledger(account_id: str, start: date | None, end: date, include_pdc: bool = False,
+                 books: list[str] | None = None, limit: int | None = None, offset: int = 0) -> dict:
+    """One account's entries. With `books`, the same account across all of them, added together.
+
+    WHY IT PAGES
+    ------------
+    `limit=None` reads the whole ledger, which is what this always did and still does for every caller that does
+    not ask otherwise. It is also why this screen was the one report the browser gave up on. Their busiest
+    account, CASH SALE WALKING CUSTOMER, carries 1,418,437 voucher lines in head office's book alone and
+    2,580,863 across all five, and reading it whole measured 207 seconds: 36 for the entries, 83 for the contra
+    accounts -- 2,659 separate round trips, 400 vouchers at a time -- and the rest building two and a half
+    million dictionaries that a browser was never going to be sent.
+
+    With `limit`, every one of those costs collapses to the page: the entries are fetched by OFFSET/FETCH, the
+    contra lookup has at most `limit` vouchers to ask about rather than 1,063,208, and nothing else is built.
+
+    The three figures that are NOT the page's are read separately, because a page cannot know them: `total`, and
+    `totalDebit`/`totalCredit`, come from one aggregate over the whole range, and `closing` from those. Summing
+    the page would make page three of a ledger report page three's totals as if they were the account's, which is
+    the kind of wrong that gets copied into a return.
+
+    `opening` is the balance before `start`, as before. A page's own running balance starts from `opening` plus
+    everything before `offset`, which is one more aggregate rather than a read of the rows being skipped.
+
+    The chart is per book: head office and each branch hold their own row for the same account, under the same
+    code. So "the whole company" on this screen means every book's copy of the account read as one ledger, which is
+    what the trial balance already does for every account at once. Without it this is the only screen in the
+    accounts section that makes somebody pick a branch before it will say anything.
+    """
     account = await Account.get_or_none(id=account_id)
     if not account:
         raise ValueError("That account doesn't exist.")
-    chart = await chart_map([account.book])
-    meta = chart[str(account_id)]
+    wanted = [str(account_id)]
+    scope = [account.book]
+    if books and len(books) > 1:
+        # The same code in every book the person may read. One row per book at most, so naming them is a handful of
+        # parameters rather than a list that could reach SQL Server's ceiling.
+        siblings = await Account.filter(code=account.code, book__in=books).values_list("id", flat=True)
+        if siblings:
+            wanted = sorted({str(s) for s in siblings} | {str(account_id)})
+            scope = list(books)
+    chart = await chart_map(scope)
+    meta = dict(chart[str(account_id)])
+    if len(wanted) > 1:
+        meta = {**meta, "book": "ALL", "bookCount": len(wanted)}
     opening = ZERO
     if start:
-        dr, cr = (await _sums([account.book], before=start, account_ids=[str(account_id)])).get(str(account_id), (ZERO, ZERO))
-        opening = dr - cr
-    where, params = ["v.status = 'posted'", "l.account_id = ?", "v.date <= ?"], [str(account_id), end.isoformat()]
+        sums = await _sums(scope, before=start, account_ids=wanted)
+        opening = sum((dr - cr for dr, cr in (sums.get(a, (ZERO, ZERO)) for a in wanted)), ZERO)
+    marks = dialect.marks(wanted)
+    where = ["v.status = 'posted'", f"l.account_id IN ({marks})", "v.date <= ?"]
+    params = [*wanted, end.isoformat()]
     if start:
         where.append("v.date >= ?")
         params.append(start.isoformat())
-    rows = await _query(
-        "SELECT v.id AS voucher_id, v.number, v.vtype, v.date, v.description AS vdesc, v.reference_no AS vref, v.cheque_no, v.auto, "
-        "l.description, l.reference_no, l.debit, l.credit, l.line_no FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
-        f"WHERE {' AND '.join(where)} ORDER BY v.date, v.created_at, v.number, l.line_no", params,
-    )
+    frm = "FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id"
+    # `l.id` is a deterministic last key, and it is what makes paging possible at all. Two lines that tie on date,
+    # created_at, number and line_no used to come back in whatever order the engine chose that run: harmless when
+    # the whole ledger is read at once, and not harmless when it is read a page at a time, where a tie split
+    # across a page boundary shows one row twice and another not at all. Added to the unpaged path too, so the two
+    # reads agree with each other rather than only each with itself.
+    order = "ORDER BY v.date, v.created_at, v.number, l.line_no, l.id"
+    columns = ("SELECT v.id AS voucher_id, v.number, v.vtype, v.date, v.description AS vdesc, v.reference_no AS vref, "
+               "v.cheque_no, v.auto, l.description, l.reference_no, l.debit, l.credit, l.line_no")
+    select = f"{columns} {frm} WHERE {' AND '.join(where)}"
+
+    skipped = ZERO
+    if limit is None:
+        rows = await _query(f"{select} {order}", params)
+        total = len(rows)
+        total_dr = sum((money(_d(r["debit"])) for r in rows), ZERO)
+        total_cr = sum((money(_d(r["credit"])) for r in rows), ZERO)
+    else:
+        whole = await _query(
+            f"SELECT COUNT(*) AS n, SUM(l.debit) AS dr, SUM(l.credit) AS cr {frm} "
+            f"WHERE {' AND '.join(where)}", params)
+        total = int(whole[0]["n"] or 0)
+        # Safe as one SUM rather than a sum of rounded rows only because debit and credit are decimal(16, 2): at
+        # two places `money()` is the identity, so rounding each row and rounding the total give the same figure.
+        # It would not be safe on a column with more places, and the ledger would stop balancing by a paisa.
+        total_dr, total_cr = money(_d(whole[0]["dr"])), money(_d(whole[0]["cr"]))
+        if offset > 0:
+            head, head_params = dialect.page(offset, 0)
+            prior = await _query(
+                f"SELECT SUM(x.dr) AS dr, SUM(x.cr) AS cr FROM "
+                f"(SELECT l.debit AS dr, l.credit AS cr {frm} WHERE {' AND '.join(where)} {order} {head}) x",
+                [*params, *head_params])
+            skipped = money(_d(prior[0]["dr"])) - money(_d(prior[0]["cr"]))
+        # Two queries, not one, and this is the whole difference between a page that answers and a page that
+        # does not. Asking for the entry columns and the page in one statement made SQL Server fetch every one of
+        # the 2,580,863 joined rows -- `v.description`, `l.description`, both reference numbers and the cheque
+        # number are in no index, so each row costs a lookup into the table -- sort all of them, and then throw
+        # away all but a hundred. Measured at 53.44 seconds for 100 rows.
+        #
+        # So the order is settled first over narrow columns the indexes already carry, which yields a hundred
+        # line ids, and only those hundred are read in full. The second read is by primary key and costs nothing.
+        clause, page_params = dialect.page(limit, offset)
+        ids = [str(r["id"]) for r in await _query(
+            f"SELECT l.id {frm} WHERE {' AND '.join(where)} {order} {clause}", [*params, *page_params])]
+        if ids:
+            rows = await _query(f"{columns} {frm} WHERE l.id IN ({dialect.marks(ids)}) {order}", ids)
+        else:
+            rows = []
     voucher_ids = sorted({str(r["voucher_id"]) for r in rows})
     others: dict[str, list[tuple[str, Decimal, Decimal]]] = {}
     for chunk_start in range(0, len(voucher_ids), 400):
         chunk = voucher_ids[chunk_start:chunk_start + 400]
-        for line in await _query(f"SELECT voucher_id, account_id, debit, credit FROM acc_voucher_lines WHERE voucher_id IN ({','.join('?' for _ in chunk)})", chunk):
+        for line in await _query(f"SELECT voucher_id, account_id, debit, credit FROM acc_voucher_lines WHERE voucher_id IN ({dialect.marks(chunk)})", chunk):
             others.setdefault(str(line["voucher_id"]), []).append((str(line["account_id"]), _d(line["debit"]), _d(line["credit"])))
-    running = opening
+    # Where this page starts: the balance before the period, plus every entry the page skipped over.
+    running = opening + skipped
     entries = []
     for r in rows:
         debit, credit = money(_d(r["debit"])), money(_d(r["credit"]))
         running += debit - credit
+        # Every copy of the account, not just the one that was clicked: with the books combined, the other books'
+        # rows for the same account are this account too, not the other side of the entry.
         contra_ids = list(dict.fromkeys(a for a, d, c in others.get(str(r["voucher_id"]), [])
-                                        if a != str(account_id) and ((c > 0) if debit > 0 else (d > 0))))
+                                        if a not in wanted and ((c > 0) if debit > 0 else (d > 0))))
         contra = [chart.get(a, {}).get("name", "?") for a in contra_ids]
         description = r["description"] if r["description"] and r["description"] != "__header__" else r["vdesc"]
         entries.append({
@@ -245,10 +499,13 @@ async def ledger(account_id: str, start: date | None, end: date, include_pdc: bo
             "debit": _s(debit), "credit": _s(credit), "balance": _s(running), "against": ", ".join(contra)[:200] if contra else None,
             "againstAccounts": [{"accountId": a, "name": chart.get(a, {}).get("name", "?")} for a in contra_ids[:8]],
         })
-    total_dr = sum((Decimal(e["debit"]) for e in entries), ZERO)
-    total_cr = sum((Decimal(e["credit"]) for e in entries), ZERO)
+    # The account's closing balance, not the page's. Unpaged these are the same number, because `running` ends at
+    # exactly opening plus every debit less every credit; paged they are not, and it is the account's that belongs
+    # on the screen.
+    closing = opening + total_dr - total_cr
     return {"account": meta, "from": start.isoformat() if start else None, "to": end.isoformat(), "opening": _s(opening),
-            "entries": entries, "totalDebit": _s(total_dr), "totalCredit": _s(total_cr), "closing": _s(running), "pdc": []}
+            "entries": entries, "totalDebit": _s(total_dr), "totalCredit": _s(total_cr), "closing": _s(closing),
+            "total": total, "limit": limit, "offset": offset, "pdc": []}
 
 
 SECTION_OF_CATEGORY = {"41": "sales", "51": "cost", "42": "other", "52": "operating", "53": "financial"}
@@ -257,7 +514,44 @@ SECTION_TITLES = {"sales": "Revenue", "cost": "Cost of sales", "other": "Other i
 
 async def income_statement(books: list[str], together: bool, start: date, end: date) -> dict:
     chart = await chart_map(books)
-    merged = _merge(chart, await _sums(books, start=start, end=end), together)
+    return _build_income_statement(chart, await _sums(books, start=start, end=end), books, together, start, end)
+
+
+
+
+async def income_statement_pair(books: list[str], together: bool, start: date, end: date,
+                                prev_start: date, prev_end: date) -> tuple[dict, dict]:
+    """This period's income statement and the period before it, for a tile that shows the change.
+
+    What this saves is the chart: `chart_map` reads the same 7,301 accounts and their groups, categories and types,
+    and calling `income_statement` twice read it twice for nothing.
+
+    WHAT IT DELIBERATELY DOES NOT DO, AND WHY
+    -----------------------------------------
+    The obvious next step is `_opening_and_period`'s trick: one pass over the lines with a CASE per period instead of
+    two passes. It was written, it gave identical figures, and it was **slower**, so it was taken out. Measured over
+    six interleaved rounds on their ledger, two adjacent 30 day periods:
+
+        two passes   3.11s        one pass, plain join   6.16s        one pass, derived table   7.69s
+
+    The reason the opening-balance case wins and this one loses is the shape of the ranges. An opening balance and
+    its period are nested, so one pass reads exactly what two passes read. Two adjacent periods are not: one pass has
+    to widen the date filter to cover both, which doubles the vouchers it seeks and the lines it aggregates, and the
+    four CASEs add per-row work on top. Narrow and twice beats wide and once here.
+
+    A first, careless measurement said the opposite (11.89s against 5.80s). It was one run of each on a machine whose
+    answers for the same query range over 3x, and the ranking inverted as soon as it was run round robin. Hence the
+    numbers above, and hence this note.
+    """
+    chart = await chart_map(books)
+    return (_build_income_statement(chart, await _sums(books, start=start, end=end), books, together, start, end),
+            _build_income_statement(chart, await _sums(books, start=prev_start, end=prev_end), books, together,
+                                    prev_start, prev_end))
+
+
+def _build_income_statement(chart: dict[str, dict], sums: dict[str, tuple[Decimal, Decimal]], books: list[str],
+                            together: bool, start: date, end: date) -> dict:
+    merged = _merge(chart, sums, together)
     sections = {key: {"key": key, "title": title, "groups": {}, "amount": ZERO} for key, title in SECTION_TITLES.items()}
     departments: dict[str, dict] = {}
     for meta in merged.values():
@@ -312,10 +606,13 @@ def fiscal_year_start(day: date, start_month: int) -> date:
     return date(day.year if day.month >= start_month else day.year - 1, start_month, 1)
 
 
-async def _net_profit(books: list[str], start: date | None, end: date) -> Decimal:
-    chart = await chart_map(books)
+def _income_total(chart: dict[str, dict], sums: dict[str, tuple[Decimal, Decimal]]) -> Decimal:
+    """The profit in a set of sums: what the income statement accounts in it came to, credits less debits.
+
+    Takes sums rather than fetching them, because the balance sheet needs this twice over two halves of one pass.
+    """
     total = ZERO
-    for account_id, (dr, cr) in (await _sums(books, start=start, end=end)).items():
+    for account_id, (dr, cr) in sums.items():
         meta = chart.get(account_id)
         if meta and meta["statement"] == "income":
             total += cr - dr
@@ -324,8 +621,19 @@ async def _net_profit(books: list[str], start: date | None, end: date) -> Decima
 
 async def balance_sheet(books: list[str], together: bool, as_of: date, fiscal_start_month: int) -> dict:
     chart = await chart_map(books)
-    merged = _merge(chart, await _sums(books, end=as_of), together)
     fy_start = fiscal_year_start(as_of, fiscal_start_month)
+    # One pass over the lines, not three. This needs the cumulative total per account, the profit before the year
+    # started and the profit since, and those were three separate reads of the same rows: everything up to `as_of`,
+    # everything up to the day before `fy_start`, and `fy_start` onwards. The last two add up to the first, so
+    # splitting one pass at `fy_start` gives all three. 19.5s to 7.0s on all five books, and it is the same helper
+    # the trial balance already uses for the same reason.
+    before_year, since_year = await _opening_and_period(books, fy_start, as_of)
+    totals: dict[str, tuple[Decimal, Decimal]] = {}
+    for half in (before_year, since_year):
+        for account_id, (dr, cr) in half.items():
+            was_dr, was_cr = totals.get(account_id, (ZERO, ZERO))
+            totals[account_id] = (was_dr + dr, was_cr + cr)
+    merged = _merge(chart, totals, together)
     sides = {"1": {"title": "Assets", "categories": {}, "amount": ZERO}, "2": {"title": "Liabilities", "categories": {}, "amount": ZERO},
              "3": {"title": "Equity", "categories": {}, "amount": ZERO}}
     for meta in merged.values():
@@ -344,8 +652,8 @@ async def balance_sheet(books: list[str], together: bool, as_of: date, fiscal_st
         group["amount"] += amount
         category["amount"] += amount
         side["amount"] += amount
-    brought_forward = await _net_profit(books, None, fy_start - timedelta(days=1))
-    current = await _net_profit(books, fy_start, as_of)
+    brought_forward = _income_total(chart, before_year)
+    current = _income_total(chart, since_year)
     equity = sides["3"]
     profit_cat = {"code": "PL", "name": "PROFIT AND LOSS", "groups": {}, "amount": ZERO}
     for code, name, amount in (("PL-BF", "PROFIT BROUGHT FORWARD", brought_forward), ("PL-CY", f"PROFIT FOR THE YEAR FROM {fy_start:%d %b %Y}", current)):
@@ -373,21 +681,25 @@ async def balance_sheet(books: list[str], together: bool, as_of: date, fiscal_st
 
 
 async def day_book(books: list[str], start: date, end: date, vtype: str | None, limit: int, offset: int) -> dict:
-    from app.services.vouchers_service import voucher_out
+    from app.services.vouchers_service import vouchers_out
 
-    qs = Voucher.filter(book__in=books, status="posted", date__gte=start, date__lte=end)
+    # The rows and their totals are two separate reads, so they narrow through the same pair in core/when and must
+    # be changed together: a page whose figures do not add up to its own rows is worse than one without a time.
+    qs = when.narrow_vouchers(Voucher.filter(book__in=books, status="posted"), start, end)
     types = [t.strip().upper() for t in (vtype or "").split(",") if t.strip()]
     if types:
         qs = qs.filter(vtype__in=types)
     total = await qs.count()
     vouchers = await qs.order_by("date", "book", "created_at", "number").offset(offset).limit(limit)
-    params = [*books, start.isoformat(), end.isoformat(), *types]
+    lo, hi = when.voucher_bound(">=", start), when.voucher_bound("<=", end)
+    params = [*books, *(b[1] for b in (lo, hi) if b), *types]
     totals = await _query(
         f"SELECT SUM(l.debit) AS dr, SUM(l.credit) AS cr FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
-        f"WHERE v.status = 'posted' AND v.book IN ({','.join('?' for _ in books)}) AND v.date >= ? AND v.date <= ?"
-        + (f" AND v.vtype IN ({','.join('?' for _ in types)})" if types else ""), params,
+        f"WHERE v.status = 'posted' AND v.book IN ({dialect.codes(books)})"
+        + "".join(f" AND {b[0]}" for b in (lo, hi) if b)
+        + (f" AND v.vtype IN ({dialect.codes(types)})" if types else ""), params,
     )
-    return {"books": books, "from": start.isoformat(), "to": end.isoformat(), "items": [await voucher_out(v) for v in vouchers], "total": total,
+    return {"books": books, "from": start.isoformat(), "to": end.isoformat(), "items": await vouchers_out(vouchers), "total": total,
             "totalDebit": _s(_d(totals[0]["dr"]) if totals else ZERO), "totalCredit": _s(_d(totals[0]["cr"]) if totals else ZERO)}
 
 
@@ -400,15 +712,28 @@ async def ageing(books: list[str], kind: str, as_of: date, account_ids: list[str
     accounts = await (Account.filter(book__in=books, kind=kind, id__in=account_ids) if account_ids is not None else Account.filter(book__in=books, kind=kind))
     ids = [str(a.id) for a in accounts]
     lines: dict[str, list[tuple[date, Decimal, Decimal]]] = {}
-    for chunk_start in range(0, len(ids), 400):
-        chunk = ids[chunk_start:chunk_start + 400]
-        for r in await _query(
-            f"SELECT l.account_id, v.date, l.debit, l.credit FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
-            f"WHERE v.status = 'posted' AND v.date <= ? AND l.account_id IN ({','.join('?' for _ in chunk)}) ORDER BY v.date, v.created_at",
-            [as_of.isoformat(), *chunk],
-        ):
-            day = r["date"] if isinstance(r["date"], date) else date.fromisoformat(str(r["date"])[:10])
-            lines.setdefault(str(r["account_id"]), []).append((day, _d(r["debit"]), _d(r["credit"])))
+    # One query for every party, not one per four hundred of them. The chunked version re-scanned the lines for
+    # each chunk, which is why this took 282 seconds even after the daily grouping: the work was the scanning,
+    # not the rows. `kind` and `book` are conditions the database can apply itself, so it does.
+    marks = dialect.codes(books)
+    where = [f"a.book IN ({marks})", f"a.kind = {dialect.mark('varchar(20)')}", "v.status = 'posted'", "v.date <= ?"]
+    params: list = [*books, kind, as_of.isoformat()]
+    if account_ids is not None:
+        if not account_ids:
+            return {"rows": [], "totals": {k: _s(ZERO) for k in ("balance", "overdue", *[b[0] for b in BUCKETS])},
+                    "buckets": [b[0] for b in BUCKETS]}
+        where.append(f"l.account_id IN ({dialect.marks(account_ids)})")
+        params.extend(account_ids)
+    for r in await _query(
+        "SELECT l.account_id AS account_id, v.date AS date, SUM(l.debit) AS debit, SUM(l.credit) AS credit "
+        "FROM acc_voucher_lines l "
+        "JOIN acc_vouchers v ON v.id = l.voucher_id "
+        "JOIN acc_accounts a ON a.id = l.account_id "
+        f"WHERE {' AND '.join(where)} "
+        "GROUP BY l.account_id, v.date ORDER BY v.date", params,
+    ):
+        day = r["date"] if isinstance(r["date"], date) else date.fromisoformat(str(r["date"])[:10])
+        lines.setdefault(str(r["account_id"]), []).append((day, _d(r["debit"]), _d(r["credit"])))
     rows = []
     totals = {k: ZERO for k in ("balance", "overdue", *[b[0] for b in BUCKETS])}
     for account in accounts:
@@ -475,13 +800,47 @@ async def statement(account_id: str, start: date | None, end: date) -> dict:
     }
 
 
-async def book_summary(book: str, today: date) -> dict:
-    """One book at a glance, for head office's list of books."""
+async def sums_by_book(books: list[str], end: date) -> dict[str, dict[str, tuple[Decimal, Decimal]]]:
+    """Every book's position at `end`, in one pass instead of one scan each.
+
+    `/accounts/books` called `book_summary` per book, and each one summed that book's whole history. Five books
+    took 23 seconds, which is past the client's 15 second limit -- so the request failed, and `BookSwitcher` fell
+    back to its single hardcoded "Head Office" option. The branch filter looked unbuilt when it was only timing
+    out. One query grouped by book answers all of them.
+    """
+    # The same road `_sums` takes, for the same reason: everything up to a date is whole calendar months plus a
+    # ragged tail, so the materialised view answers all but the tail. `sp_ledger_sums` returns the book because an
+    # account belongs to exactly one, which makes this the identical question with one more column. 4.74s to 0.2s,
+    # and it is most of what `/accounts/books` spends.
+    if dialect.engine() == dialect.MSSQL and whole_months_in(LEDGER_FLOOR, end):
+        rows = await _query("EXEC dbo.sp_ledger_sums @books = ?, @from = ?, @to = ?",
+                            [",".join(books), LEDGER_FLOOR.isoformat(), end.isoformat()])
+    else:
+        marks = dialect.codes(books)
+        rows = await _query(
+            "SELECT v.book AS book, l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
+            "FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
+            f"WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date <= ? "
+            "GROUP BY v.book, l.account_id", [*books, end.isoformat()],
+        )
+    out: dict[str, dict[str, tuple[Decimal, Decimal]]] = {book: {} for book in books}
+    for row in rows:
+        out.setdefault(str(row["book"]).strip(), {})[str(row["account_id"])] = (money(_d(row["dr"])), money(_d(row["cr"])))
+    return out
+
+
+async def book_summary(book: str, today: date, sums: dict[str, tuple[Decimal, Decimal]] | None = None) -> dict:
+    """One book at a glance, for head office's list of books.
+
+    `sums` lets a caller that is doing every book hand in that book's figures from one batched query. Left out,
+    it falls back to asking for this book alone, so a single-book caller still works.
+    """
     from app.services.vouchers_service import settings as book_settings
 
     books = [book]
     chart = await chart_map(books)
-    sums = await _sums(books, end=today)
+    if sums is None:
+        sums = await _sums(books, end=today)
     bal = {k: dr - cr for k, (dr, cr) in sums.items()}
 
     def total(kinds, sign=1):
@@ -506,7 +865,8 @@ async def dashboard(book: str | None) -> dict:
     books, together = await resolve_books(book)
     today = shop_day()
     chart = await chart_map(books)
-    bal = {k: dr - cr for k, (dr, cr) in (await _sums(books, end=today)).items()}
+    raw_sums = await _sums(books, end=today)
+    bal = {k: dr - cr for k, (dr, cr) in raw_sums.items()}
     head = await vouchers_service.settings(HEAD_OFFICE_BOOK)
 
     def natural(account_id: str) -> Decimal:
@@ -524,9 +884,30 @@ async def dashboard(book: str | None) -> dict:
     transit = sum((bal.get(k, ZERO) for k, m in chart.items() if m["systemKey"] == "stock.transit"), ZERO)
     godown_value = ZERO
     if HEAD_OFFICE_BOOK in books:
-        rows = await _query("SELECT COALESCE(SUM(b.qty * COALESCE(p.avg_cost, 0)), 0) AS v FROM (SELECT product_id, SUM(qty) AS qty FROM warehouse_stock_movements GROUP BY product_id) b JOIN products p ON p.id = b.product_id", [])
+        # Valued at what each movement itself says a unit cost, which is what `StockMovement.unit_cost` is for, and
+        # only falling back to the product when a movement has none. It used to value everything at
+        # `products.avg_cost`, which `items_service` deliberately leaves alone on an update so that an item import
+        # cannot overwrite a cost that receiving maintains -- so avg_cost is null on 67,803 of 67,804 products and
+        # this check reported the godown as holding Rs 0.00 whatever was in it. Head office holds Rs 9.9 million.
+        rows = await _query(
+            "SELECT COALESCE(SUM(b.value), 0) AS v FROM ("
+            "  SELECT m.product_id,"
+            "         SUM(m.qty * COALESCE(m.unit_cost, COALESCE(p.avg_cost, 0))) AS value"
+            "    FROM warehouse_stock_movements m"
+            "    LEFT JOIN products p ON p.id = m.product_id"
+            "   GROUP BY m.product_id) b", [])
         godown_value = _d(rows[0]["v"]) if rows else ZERO
-    summaries = [await book_summary(b, today) for b in books] if together else []
+    # Hand each book the figures already in `raw_sums`, which is what `book_summary`'s `sums` argument is for and
+    # what its docstring describes. Without it this read the ledger once for all five books and then once more
+    # inside each of the five -- the same 5,439,192 lines, six times, for one screen. Measured on the whole
+    # company view: 6.66 seconds for the five summaries against 1.98 with the figures handed in.
+    #
+    # Filtered per book, not handed the whole dict, because `book_summary` ends with `sum(bal.values())` for that
+    # book's trial-balance difference. Give it every book's accounts and that line quietly reports the company's
+    # difference on each of the five rows.
+    summaries = [await book_summary(b, today, sums={k: v for k, v in raw_sums.items()
+                                                    if chart.get(k, {}).get("book") == b})
+                 for b in books] if together else []
     return {
         "today": today.isoformat(), "books": books, "together": together, "money": sorted(money_rows, key=lambda r: (r["book"], r["code"])),
         "cashTotal": _s(sum((natural(k) for k, m in chart.items() if m["kind"] == "cash"), ZERO)),
@@ -709,14 +1090,87 @@ async def month_by_month(books: list[str], start: date, end: date) -> dict:
     account with head office aren't money, stock or parties, so they never show here."""
     chart = await chart_map(books)
     periods = month_periods(start, end)
-    marks = ",".join("?" for _ in books)
-    figures = []
-    for period_start, period_end in periods:
-        flows = await _query(
-            "SELECT v.vtype AS vtype, a.kind AS kind, SUM(l.debit) AS dr, SUM(l.credit) AS cr FROM acc_voucher_lines l "
-            "JOIN acc_vouchers v ON v.id = l.voucher_id JOIN acc_accounts a ON a.id = l.account_id "
-            f"WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date >= ? AND v.date <= ? AND a.kind IN ('supplier', 'customer') GROUP BY v.vtype, a.kind",
-            [*books, period_start.isoformat(), period_end.isoformat()],
+    marks = dialect.codes(books)
+    window = [*books, start.isoformat(), end.isoformat()]
+    month = dialect.year_month("v.date")
+    # Both ends of the window are pinned, which is the shape the planner gets wrong past about two months: it seeks
+    # the vouchers by date and looks their lines up one voucher at a time. Jan to Mar took 20.2s and a year 80.0s,
+    # against a browser that gives up at 15. Same rule and the same measurements as `_sums`; `dialect.hash_join`.
+    join = dialect.hash_join() if (end - start).days > WIDE_WINDOW_DAYS else "JOIN"
+
+    # This used to run three queries per month: the flows, that month's sums, and the closing balance. The closing
+    # one was `_sums(books, end=period_end)` with no start, so every month re-summed the books from the beginning
+    # of time -- twelve months of a year view meant twelve ever-longer scans of 5.4 million lines, and 63 seconds
+    # against a client that gives up at 15.
+    #
+    # The same numbers come out of three queries in total. A closing balance is just the opening balance plus every
+    # month since, so it is carried forward in `running` rather than asked for again. `month_periods` cuts calendar
+    # months to the range, so each period is one 'YYYY-MM' and the grouping lines up exactly.
+    # The most expensive query in the accounts section, and the one the materialised view was made for: it groups
+    # 5,439,192 voucher lines by month and account. Over the two years this screen opens on, 17.13 seconds against
+    # 0.17 from the view, for the identical 16,191 rows.
+    #
+    # `sp_ledger_by_month` does the same three-way cut as `sp_ledger_sums`: whole calendar months out of the view,
+    # the ragged piece at each end out of the lines. It is NOT a plain read of the view, because the view holds
+    # whole months and this range usually ends mid-month -- reading October's row for a range that stops on the
+    # 5th would quietly add the rest of October, and it would only start being wrong the day somebody picked a
+    # past date. Checked against the lines in seven window shapes, ragged ends included: identical every time.
+    #
+    # Guarded on a whole month being present for the same reason `_sums` is: without one the procedure reads the
+    # very lines this query reads and charges its own overhead, 0.37s against 0.23s.
+    opening = await _sums(books, before=start)
+    by_month: dict[str, dict[str, tuple[Decimal, Decimal]]] = {}
+    flows_by_month: dict[str, list[dict]] = {}
+
+    if dialect.engine() == dialect.MSSQL and whole_months_in(start, end):
+        # One call for both. `sp_ledger_by_month` returns a row per month, voucher type and account, which is the
+        # grain the party flows need; the account movements are the same rows summed over the voucher type. That
+        # is why `vtype` was put in the view's key -- the flows were the one query on this screen still reading
+        # the voucher lines, 5.40s of the 7.15 it took.
+        #
+        # The account kinds come from `chart`, already loaded above, rather than from a third join to
+        # acc_accounts. Anything not in the chart is not in these books, so it cannot be one of their parties.
+        rows = await _query("EXEC dbo.sp_ledger_by_month @books = ?, @from = ?, @to = ?",
+                            [",".join(books), start.isoformat(), end.isoformat()])
+        for row in rows:
+            # `ym` is char(7). Trimmed because it is matched against `f"{period_start:%Y-%m}"` and a trailing
+            # space would not raise -- every month would simply come out empty.
+            ym, account_id = str(row["ym"]).strip(), str(row["account_id"])
+            dr, cr = money(_d(row["dr"])), money(_d(row["cr"]))
+            slot = by_month.setdefault(ym, {})
+            # Added, not assigned: there is now a row per voucher type, so an account appears several times in
+            # one month and assigning would keep whichever came last.
+            was_dr, was_cr = slot.get(account_id, (ZERO, ZERO))
+            slot[account_id] = (was_dr + dr, was_cr + cr)
+            kind = chart.get(account_id, {}).get("kind")
+            if kind in ("supplier", "customer"):
+                flows_by_month.setdefault(ym, []).append(
+                    {"ym": ym, "vtype": row["vtype"], "kind": kind, "dr": dr, "cr": cr})
+    else:
+        per_month = await _query(
+            f"SELECT {month} AS ym, l.account_id AS account_id, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
+            f"FROM acc_voucher_lines l {join} acc_vouchers v ON v.id = l.voucher_id "
+            f"WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date >= ? AND v.date <= ? "
+            f"GROUP BY {month}, l.account_id", window,
         )
-        figures.append({"sums": await _sums(books, start=period_start, end=period_end), "flows": money_flows(flows), "closing": await _sums(books, end=period_end)})
+        flow_rows = await _query(
+            f"SELECT {month} AS ym, v.vtype AS vtype, a.kind AS kind, SUM(l.debit) AS dr, SUM(l.credit) AS cr "
+            f"FROM acc_voucher_lines l {join} acc_vouchers v ON v.id = l.voucher_id JOIN acc_accounts a ON a.id = l.account_id "
+            f"WHERE v.status = 'posted' AND v.book IN ({marks}) AND v.date >= ? AND v.date <= ? "
+            f"AND a.kind IN ('supplier', 'customer') GROUP BY {month}, v.vtype, a.kind", window,
+        )
+        for row in per_month:
+            by_month.setdefault(row["ym"], {})[str(row["account_id"])] = (money(_d(row["dr"])), money(_d(row["cr"])))
+        for row in flow_rows:
+            flows_by_month.setdefault(row["ym"], []).append(row)
+
+    figures, running = [], dict(opening)
+    for period_start, _period_end in periods:
+        key = f"{period_start:%Y-%m}"
+        sums = by_month.get(key, {})
+        for account_id, (dr, cr) in sums.items():
+            was_dr, was_cr = running.get(account_id, (ZERO, ZERO))
+            running[account_id] = (was_dr + dr, was_cr + cr)
+        # A copy, because `running` keeps moving and every month keeps its own closing position.
+        figures.append({"sums": sums, "flows": money_flows(flows_by_month.get(key, [])), "closing": dict(running)})
     return build_month_by_month(chart, periods, figures)

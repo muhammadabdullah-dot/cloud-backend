@@ -65,9 +65,10 @@ class GRN(models.Model):
     distinct from a branch's own GRN sequence."""
     id = fields.UUIDField(pk=True)
     grn_number = fields.CharField(max_length=30, unique=True)
+    # NO ACTION: SQL Server allows one cascade path per table, and a delivery names its supplier; the supplier list outlives any one delivery.
     supplier: fields.ForeignKeyRelation["Supplier"] = fields.ForeignKeyField(
         "models.Supplier", related_name="warehouse_grns"
-    )
+    , on_delete=fields.NO_ACTION)
     party_inv_no = fields.CharField(max_length=60, null=True)
     bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField("models.Bin", related_name="grns")
     gst_mode = fields.CharField(max_length=20, default="normal")
@@ -76,11 +77,20 @@ class GRN(models.Model):
     received_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
         "models.User", related_name="warehouse_grns", null=True
     )
+    # Who signed for it, as their document spelt it, when there is no user row to point at. The 5,968 deliveries
+    # imported from Multi-Tec name 20 of their people (MOHSIN RAZA on 9,468 documents across all shops, ZAIN on
+    # 6,887) and `users` holds six sign-ins, so the name is the only true answer. Null on a delivery received here.
+    received_by_name = fields.CharField(max_length=120, null=True)
     # The order this delivery was received against, if any.
     purchase_order: fields.ForeignKeyNullableRelation["PurchaseOrder"] = fields.ForeignKeyField(
         "models.PurchaseOrder", related_name="grns", null=True, on_delete=fields.SET_NULL
     )
-    at = fields.DatetimeField(auto_now_add=True)
+    # Not auto_now_add: a delivery's date is a fact about the delivery. The imported ones run from 31 August 2024 to
+    # 25 September 2026, and auto_now_add would stamp all 5,968 with the day they were loaded.
+    # `warehouse_service.receive` already passes `at`, so nothing about the live path changes.
+    at = fields.DatetimeField()
+    # "godown" is a delivery received on these screens, "legacy" one imported out of Multi-Tec. See purchasing.SOURCES.
+    source = fields.CharField(max_length=10, default="godown")
 
     class Meta:
         table = "warehouse_grns"
@@ -89,7 +99,11 @@ class GRN(models.Model):
 
 class GRNLine(models.Model):
     id = fields.UUIDField(pk=True)
-    grn: fields.ForeignKeyRelation["GRN"] = fields.ForeignKeyField("models.GRN", related_name="lines")
+    # NO ACTION: a GRN is reached from here and from the batches its lines create, and SQL Server allows one
+    # cascade path per table. A delivery is never deleted; an incorrect one is corrected by a further document.
+    grn: fields.ForeignKeyRelation["GRN"] = fields.ForeignKeyField(
+        "models.GRN", related_name="lines", on_delete=fields.NO_ACTION
+    )
     product: fields.ForeignKeyRelation["Product"] = fields.ForeignKeyField(
         "models.Product", related_name="warehouse_grn_lines"
     )
@@ -145,14 +159,23 @@ class Transfer(models.Model):
         "models.Branch", related_name="transfers"
     )
     source_branch: fields.ForeignKeyNullableRelation["Branch"] = fields.ForeignKeyField(
-        "models.Branch", related_name="outbound_transfers", null=True, on_delete=fields.SET_NULL
+        # NO ACTION, not SET NULL: a transfer reaches `branches` twice, as where it went and where it came from,
+        # and SQL Server allows one such path per table. Deleting a branch that has sent stock should be refused
+        # rather than quietly leaving transfers with no sender.
+        "models.Branch", related_name="outbound_transfers", null=True, on_delete=fields.NO_ACTION
     )
     notes = fields.CharField(max_length=255, null=True)
     received_by_name = fields.CharField(max_length=120, null=True)
+    # Who sent it, as their document spelt it. Their Theader carries PostedBy as a name and no user id we can keep,
+    # and `users` holds six sign-ins against their 90 people, so a name is the only true answer for the 6,332
+    # imported dispatches. Null on a transfer dispatched here, where the ledger movement names the real user.
+    dispatched_by_name = fields.CharField(max_length=120, null=True)
+    # "godown" is a transfer raised on these screens, "legacy" one imported out of Multi-Tec. See purchasing.SOURCES.
+    source = fields.CharField(max_length=10, default="godown")
     # Set when a requisition produced this transfer, so the two stay linked rather than the
     # requisition simply flipping status and the connection living only in someone's memory.
     requisition: fields.ForeignKeyNullableRelation["Requisition"] = fields.ForeignKeyField(
-        "models.Requisition", related_name="transfers", null=True
+        "models.Requisition", related_name="transfers", null=True, on_delete=fields.NO_ACTION
     )
     status = fields.CharField(max_length=20, default="approved")
     vehicle = fields.CharField(max_length=40, null=True)
@@ -221,11 +244,15 @@ class CycleCount(models.Model):
     system_qty = fields.DecimalField(max_digits=16, decimal_places=3)
     counted_qty = fields.DecimalField(max_digits=16, decimal_places=3)
     status = fields.CharField(max_length=20, default="pending")
+    # NO ACTION on both, and this is a correctness fix as much as an engine one: a Tortoise foreign key defaults
+    # to ON DELETE CASCADE, so deleting a user would have deleted the stock counts they had done. A count is a
+    # record of what was on the shelf, and it does not stop being true because the person who did it has left.
+    # SQL Server also refuses two cascade paths from one table to `users`, which is how this was found.
     counted_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
-        "models.User", related_name="cycle_counts", null=True
+        "models.User", related_name="cycle_counts", null=True, on_delete=fields.NO_ACTION
     )
     approved_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(
-        "models.User", related_name="approved_cycle_counts", null=True
+        "models.User", related_name="approved_cycle_counts", null=True, on_delete=fields.NO_ACTION
     )
     at = fields.DatetimeField()
 
@@ -242,7 +269,11 @@ class BinMove(models.Model):
     number = fields.CharField(max_length=20, unique=True)
     product: fields.ForeignKeyRelation["Product"] = fields.ForeignKeyField("models.Product", related_name="bin_moves")
     from_bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField("models.Bin", related_name="moves_out")
-    to_bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField("models.Bin", related_name="moves_in")
+    # A move records where stock went. The bin is a place, not the move's owner, so deleting a bin is refused
+    # rather than taking the history of what moved through it.
+    to_bin: fields.ForeignKeyRelation["Bin"] = fields.ForeignKeyField(
+        "models.Bin", related_name="moves_in", on_delete=fields.NO_ACTION
+    )
     qty = fields.DecimalField(max_digits=16, decimal_places=3)
     note = fields.CharField(max_length=255, null=True)
     moved_by: fields.ForeignKeyNullableRelation["User"] = fields.ForeignKeyField(

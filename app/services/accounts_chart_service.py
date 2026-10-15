@@ -284,10 +284,17 @@ def own_party_facts(supplier) -> dict:
     city and the invoice detail ages every head office supplier against zero credit days, which quietly marks
     everything overdue on the day it is raised.
     """
+    def cut(value, size: int) -> str | None:
+        return str(value)[:size] if value not in (None, "") else None
+
+    # Trimmed the same way `_party_fields` trims what a branch sends, and for the same reason: a Supplier column is
+    # wider than the account column that mirrors it, so a supplier holding three phone numbers in one field
+    # (061-6510408,061-6510407,061-6211548, 35 characters against 30) failed validation here. This runs at startup,
+    # so the whole server refused to start over a phone number nothing is keyed on.
     return {
-        "party_code": (supplier.code or None), "party_phone": (supplier.phone or None),
-        "party_address": (supplier.address or None), "party_contact": (supplier.contact_person or None),
-        "party_city": (supplier.city or None), "party_due_days": supplier.due_days or 0,
+        "party_code": cut(supplier.code, 20), "party_phone": cut(supplier.phone, 30),
+        "party_address": cut(supplier.address, 255), "party_contact": cut(supplier.contact_person, 120),
+        "party_city": cut(supplier.city, 80), "party_due_days": supplier.due_days or 0,
     }
 
 

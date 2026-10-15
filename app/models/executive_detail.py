@@ -37,6 +37,10 @@ class BranchHourlyStat(models.Model):
         table = "branch_hourly_stats"
         unique_together = (("branch", "day", "hour"),)
         ordering = ["day", "hour"]
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchTillClose(models.Model):
@@ -60,6 +64,10 @@ class BranchTillClose(models.Model):
     class Meta:
         table = "branch_till_closes"
         ordering = ["-closed_at"]
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchStaffDuty(models.Model):
@@ -144,6 +152,10 @@ class BranchReturn(models.Model):
     class Meta:
         table = "branch_returns"
         ordering = ["-at"]
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchCreditCustomer(models.Model):

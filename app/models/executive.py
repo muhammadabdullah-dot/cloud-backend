@@ -80,6 +80,10 @@ class BranchCashierStat(models.Model):
     class Meta:
         table = "branch_cashier_stats"
         unique_together = (("branch", "day", "cashier_name"),)
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchProductStat(models.Model):
@@ -103,12 +107,16 @@ class BranchProductStat(models.Model):
     class Meta:
         table = "branch_product_stats"
         unique_together = (("branch", "day", "product_sku"),)
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchProductCashierStat(models.Model):
     """Per item per person per day: who sold how much of what.
 
-    The person is whoever rang the bill (the sale's cashier), the same attribution Best Salesperson uses. Summed over
+    The person is whoever rang the bill (the sale's cashier), the same attribution Best Cashier uses. Summed over
     people it gives back the item's own day in BranchProductStat; summed over items, what that person sold. It is what
     lets an item open onto the people who sold it, and a person onto the items they sold."""
     id = fields.UUIDField(pk=True)
@@ -127,6 +135,10 @@ class BranchProductCashierStat(models.Model):
     class Meta:
         table = "branch_product_cashier_stats"
         unique_together = (("branch", "day", "product_sku", "cashier_name"),)
+        # The unique index above starts with the branch, so it cannot serve the Company Dashboard,
+        # which asks across every branch and filters on the day alone.
+        indexes = (("day",),)
+
 
 
 class BranchStockAlert(models.Model):

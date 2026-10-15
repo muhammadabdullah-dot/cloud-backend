@@ -14,6 +14,14 @@ Sync problems are what the sync tables already hold, nothing worked out beyond t
 - messages head office queued for the branch (`BranchMessage`) not yet confirmed as applied, or refused by the branch.
 Events of kinds head office only keeps on record (sales, till sessions and so on) stay 'stored' by design and are
 not problems.
+
+Branch errors are a third thing, and the one with no local source at all: what went wrong *inside* a branch, which
+head office can only know because the branch sent it. A branch keeps its own log file, but that file sits on a
+machine in a shop nobody can open, so until a branch pushes its failures upward a shop whose sales screen is broken
+all morning looks, from here, exactly like a shop having a quiet day -- the sync is the one thing still working, and
+the sync is all head office could see. They arrive as ordinary activity records, so there is no new table and no new
+contract; what makes them findable is `failed_at_branch`, and what makes them actionable is the reference each one
+carries, which is also the reference in that branch's own log.
 """
 from __future__ import annotations
 
@@ -28,7 +36,10 @@ from tortoise.expressions import Q
 
 from app.core import logs
 from app.core.pk_time import PKT
-from app.models import Branch, BranchMessage, BranchSnapshotRun, SyncInboxEvent, SyncRun
+from app.models import (
+    Branch, BranchActivity, BranchMessage, BranchSnapshotRun, SyncInboxEvent, SyncRun, failed_at_branch,
+    selling_branches,
+)
 
 # ---------------------------------------------------------------------------------------------
 # Errors from the log
@@ -401,6 +412,141 @@ async def _branch_problems(branch: Branch, now: datetime) -> dict:
 
 
 async def sync_problems() -> dict:
+    """Sync trouble, branch by branch. Head office runs no branch server, so it is not one -- see
+    `selling_branches`."""
     now = datetime.now(timezone.utc)
-    branches = await Branch.all().order_by("name")
+    branches = await selling_branches().order_by("name")
     return {"asOf": now.isoformat(), "branches": [await _branch_problems(b, now) for b in branches]}
+
+
+# ---------------------------------------------------------------------------------------------
+# Errors at the branches
+# ---------------------------------------------------------------------------------------------
+
+# How far back this looks by default. A week covers "it started on Tuesday", which is how these arrive.
+ERROR_DAYS = 7
+MAX_ERROR_DAYS = 120
+# A failure in the last day is live: somebody is working around it right now.
+FRESH_WITHIN = timedelta(hours=24)
+# Distinct screens listed per branch. One broken screen hit four hundred times is one line with a count,
+# not four hundred lines -- which is the difference between a report somebody reads and one they close.
+GROUPS_PER_BRANCH = 30
+
+
+def _error_note(detail) -> tuple[str | None, str | None]:
+    """The reference and the one line about what happened, out of the record the branch sent."""
+    if not isinstance(detail, dict):
+        return None, None
+    note = detail.get("note")
+    return (
+        str(detail["errorId"])[:20] if detail.get("errorId") else None,
+        str(note)[:300] if note else None,
+    )
+
+
+async def _branch_error_report(branch: Branch, since: datetime, now: datetime) -> dict:
+    from tortoise.functions import Count
+
+    failures = BranchActivity.filter(branch_id=branch.id, at__gte=since).filter(failed_at_branch())
+    total = await failures.count()
+    fresh = await BranchActivity.filter(
+        branch_id=branch.id, at__gte=now - FRESH_WITHIN).filter(failed_at_branch()).count()
+
+    # Grouped in SQL, with .group_by naming exactly the columns .values does -- an annotate without it groups
+    # by row and hands back one line's count as though it were the set's (see accounts_registers_service).
+    grouped = await (
+        failures.annotate(n=Count("id")).group_by("action", "path", "method", "status_code")
+        .values("action", "path", "method", "status_code", "n")
+    )
+    grouped.sort(key=lambda r: -int(r["n"]))
+
+    # The newest failures, which supply each group its example: the reference to quote and the line saying what
+    # broke. One read for all the groups rather than one per group, and the newest rows are the ones a person
+    # asks about. A group whose newest example fell outside this read is listed with its count and no example.
+    recent = await failures.order_by("-at").limit(ROWS_PER_LIST)
+    example: dict[tuple, BranchActivity] = {}
+    for row in recent:
+        example.setdefault((row.action, row.path, row.method, row.status_code), row)
+
+    screens = []
+    for row in grouped[:GROUPS_PER_BRANCH]:
+        key = (row["action"], row["path"], row["method"], row["status_code"])
+        newest = example.get(key)
+        reference, note = _error_note(newest.detail if newest else None)
+        screens.append({
+            "action": row["action"], "path": row["path"], "method": row["method"],
+            "status": int(row["status_code"] or 0), "count": int(row["n"]),
+            # No method is how a branch marks work nobody was watching -- its scheduler, its nightly jobs.
+            # Worth saying out loud, because those have no screen and no person to notice them.
+            "background": (row["method"] or "-") == "-",
+            "newestAt": _iso(newest.at) if newest else None,
+            "person": (newest.user_name if newest else None) or None,
+            "errorId": reference, "note": note,
+        })
+
+    newest_overall = recent[0] if recent else None
+    if not branch.verified_at and not _aware(branch.last_seen_at):
+        state = "not-connected"
+    elif fresh:
+        state = "problem"
+    elif total:
+        state = "watch"
+    else:
+        state = "clear"
+    return {
+        "id": str(branch.id), "code": branch.code, "name": branch.name, "active": branch.status == "active",
+        "connected": branch.verified_at is not None, "state": state,
+        "total": total, "lastDay": fresh, "newestAt": _iso(newest_overall.at) if newest_overall else None,
+        "screens": screens, "screensShown": len(screens), "screensTotal": len(grouped),
+    }
+
+
+async def failure_tally(*, days: int = ERROR_DAYS) -> dict:
+    """How many failures each branch has reported, in two queries, for the dashboard tile.
+
+    Separate from `branch_errors` on purpose. That one groups per branch and reads an example of each broken
+    screen, which is right for a report somebody opened and wrong for a tile that is built thirty-six times
+    over on every dashboard load. This asks the only two questions a tile can show.
+    """
+    from tortoise.functions import Count
+
+    now = datetime.now(timezone.utc)
+    shops = {str(b.id): b for b in await selling_branches()}
+
+    async def tally(since: datetime) -> dict[str, int]:
+        rows = await (
+            BranchActivity.filter(at__gte=since).filter(failed_at_branch())
+            .annotate(n=Count("id")).group_by("branch_id").values("branch_id", "n")
+        )
+        # Head office has no branch server and so no failures of this kind, but it does have a branches row --
+        # so the figures are read against the shops rather than against whatever the table happens to hold.
+        return {str(r["branch_id"]): int(r["n"]) for r in rows if str(r["branch_id"]) in shops}
+
+    window = await tally(now - timedelta(days=days))
+    fresh = await tally(now - FRESH_WITHIN)
+    return {
+        "days": days, "total": sum(window.values()), "lastDay": sum(fresh.values()),
+        "branches": [{
+            "id": bid, "code": branch.code, "name": branch.name,
+            "total": window.get(bid, 0), "lastDay": fresh.get(bid, 0),
+        } for bid, branch in sorted(shops.items(), key=lambda kv: -window.get(kv[0], 0))],
+    }
+
+
+async def branch_errors(*, days: int = ERROR_DAYS) -> dict:
+    """What has gone wrong at each branch, grouped by what broke, worst first.
+
+    Head office runs no branch server, so it is not one -- see `selling_branches`. A branch with nothing here is
+    either working or not sending: `state` says which, because "clear" and "not-connected" look identical in a
+    list of zeroes and mean opposite things.
+    """
+    days = min(max(days, 1), MAX_ERROR_DAYS)
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    branches = await selling_branches().order_by("name")
+    reports = [await _branch_error_report(b, since, now) for b in branches]
+    return {
+        "asOf": now.isoformat(), "since": since.isoformat(), "days": days,
+        "total": sum(r["total"] for r in reports), "lastDay": sum(r["lastDay"] for r in reports),
+        "branches": reports,
+    }

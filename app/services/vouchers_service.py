@@ -18,6 +18,9 @@ from decimal import Decimal
 
 from tortoise.transactions import atomic
 
+from tortoise import Tortoise
+
+from app.core import dialect, when
 from app.core.pk_time import pk_day
 from app.models import HEAD_OFFICE_BOOK, Account, AccountsSettings, User, Voucher, VoucherLine
 from app.services import accounts_areas, numbering_service
@@ -107,6 +110,82 @@ async def voucher_out(voucher: Voucher, with_lines: bool = True, with_source: bo
             out["reversedById"] = str(reversal.id) if reversal else None
         if with_source and voucher.source:
             out["sourceInfo"] = await source_info(voucher.source, voucher.book)
+    return out
+
+
+async def vouchers_out(vouchers: list[Voucher]) -> list[dict]:
+    """The same answer as `voucher_out` for each, but in a fixed number of queries instead of two per voucher.
+
+    `voucher_out` reads a voucher's lines, and their accounts, when it is asked for one voucher. The Day Book asks
+    for a hundred, and a hundred of those is two hundred round trips: 16.23 seconds against 0.68 for everything
+    else that screen does, 162ms a voucher. Nothing was slow; there were simply too many of them.
+
+    So the lines for the whole page come back in one read, their accounts in another, and the reversal numbers in
+    two more only when a voucher on the page is a reversal or has been reversed -- which is rare, so usually this
+    is three queries for any page size.
+
+    The output is built by `voucher_out(v, with_lines=False)` and then given its lines, so the header fields
+    cannot drift from the single-voucher road. Verified field by field against it.
+    """
+    out = [await voucher_out(v, with_lines=False) for v in vouchers]
+    if not vouchers:
+        return out
+    ids = [str(v.id) for v in vouchers]
+
+    # Raw SQL with CAST, not `filter(voucher_id__in=ids)`. Tortoise sends a Python str as NVARCHAR, which outranks
+    # char(36), so SQL Server converts the COLUMN rather than the parameter and stops seeking. Past about eight
+    # values it costs roughly half a second each: the ORM version of this measured 61.71s for a page of 100
+    # against 7.81s for reading them one at a time, and it returned byte-identical rows while doing it. Slower
+    # than the thing it replaced, and silent about why.
+    conn = Tortoise.get_connection("default")
+    _, rows = await conn.execute_query(
+        f'SELECT l."id", l."voucher_id", l."account_id", l."line_no", l."debit", l."credit", '
+        f'       l."description", l."reference_no", a."code" AS account_code, a."name" AS account_name, '
+        f'       a."kind" AS account_kind '
+        f'FROM "acc_voucher_lines" l '
+        f'LEFT JOIN "acc_accounts" a ON a."id" = l."account_id" '
+        f'WHERE l."voucher_id" IN ({dialect.marks(ids)}) '
+        f'ORDER BY l."line_no"', ids)
+    by_voucher: dict[str, list] = {}
+    for line in rows:
+        by_voucher.setdefault(str(line["voucher_id"]), []).append(line)
+
+    # Only asked for when the page actually holds one, which is almost never.
+    originals, reversals = {}, {}
+    was_reversal = [str(v.reversal_of_id) for v in vouchers if v.reversal_of_id]
+    if was_reversal:
+        _, got = await conn.execute_query(
+            f'SELECT "id", "number" FROM "acc_vouchers" WHERE "id" IN ({dialect.marks(was_reversal)})', was_reversal)
+        originals = {str(r["id"]): r["number"] for r in got}
+    were_reversed = [str(v.id) for v in vouchers if v.reversed]
+    if were_reversed:
+        _, got = await conn.execute_query(
+            f'SELECT "id", "number", "reversal_of_id" FROM "acc_vouchers" '
+            f'WHERE "reversal_of_id" IN ({dialect.marks(were_reversed)})', were_reversed)
+        reversals = {str(r["reversal_of_id"]): r for r in got}
+
+    for voucher, row in zip(vouchers, out):
+        header_id = str(voucher.header_account_id) if voucher.header_account_id else None
+        row["lines"] = []
+        for line in by_voucher.get(str(voucher.id), []):
+            account_id, note = str(line["account_id"]), line["description"]
+            is_header = bool(header_id) and account_id == header_id and note == "__header__"
+            row["lines"].append({
+                "id": str(line["id"]), "accountId": account_id,
+                "accountCode": line["account_code"], "accountName": line["account_name"],
+                "accountKind": line["account_kind"],
+                "debit": format(money(Decimal(str(line["debit"]))), "f"),
+                "credit": format(money(Decimal(str(line["credit"]))), "f"),
+                # `voucher_out` blanks the marker after building the row, so this does the same thing in one step.
+                "description": None if note == "__header__" else note,
+                "referenceNo": line["reference_no"], "isHeader": is_header,
+            })
+        if voucher.reversal_of_id:
+            row["reversalOfNumber"] = originals.get(str(voucher.reversal_of_id))
+        if voucher.reversed:
+            reversal = reversals.get(str(voucher.id))
+            row["reversedBy"] = reversal["number"] if reversal else None
+            row["reversedById"] = str(reversal["id"]) if reversal else None
     return out
 
 
@@ -446,28 +525,36 @@ async def list_vouchers(
         qs = qs.filter(status__in=[s.strip() for s in status.split(",") if s.strip()])
     if auto is not None:
         qs = qs.filter(auto=auto)
-    if from_day:
-        qs = qs.filter(date__gte=from_day)
-    if to_day:
-        qs = qs.filter(date__lte=to_day)
+    # On `at` when a time was picked, on `date` otherwise: core/when.narrow_vouchers.
+    qs = when.narrow_vouchers(qs, from_day, to_day)
     if q and q.strip():
         from tortoise.expressions import Q
 
         term = q.strip()
         qs = qs.filter(Q(number__icontains=term) | Q(description__icontains=term) | Q(reference_no__icontains=term))
+    # Imported once for the whole function. It was imported inside two of the three branches below, which is why
+    # using it in the first one made it an unbound local rather than a name error anybody would spot.
+    from tortoise.expressions import Subquery
+
     if account_id:
-        ids = await VoucherLine.filter(account_id=account_id).distinct().values_list("voucher_id", flat=True)
-        qs = qs.filter(id__in=list(ids))
+        # Several accounts, comma separated, because a report over one account at a time is a folder of files to
+        # read side by side. The screen sends one; the export dialog sends as many as were chosen.
+        wanted = [a.strip() for a in account_id.split(",") if a.strip()]
+        # A subquery, the way the account_kind filter below already does it. Reading the ids out and naming them
+        # back made the statement carry one parameter per voucher, and SQL Server takes 2,100 in all: picking
+        # CASH SALE WALKING CUSTOMER asked for 561,246 of them and the screen answered "COUNT field incorrect or
+        # syntax error" instead of a list. It is the busiest account in the books, so the filter failed hardest on
+        # exactly the account somebody is most likely to pick.
+        lines = VoucherLine.filter(account_id=wanted[0]) if len(wanted) == 1 else VoucherLine.filter(account_id__in=wanted)
+        qs = qs.filter(id__in=Subquery(lines.values("voucher_id")))
     if account_kind:
         # Month by Month's "paid to suppliers" and "collected from customers": vouchers that touch a party of that kind.
-        from tortoise.expressions import Subquery
 
         kinds = [k.strip() for k in account_kind.split(",") if k.strip()]
         qs = qs.filter(id__in=Subquery(VoucherLine.filter(account__kind__in=kinds).values("voucher_id")))
     hidden = await accounts_areas.unreadable_account_ids(access) if access is not None else []
     if hidden:
         # Only vouchers whose every line the person can see.
-        from tortoise.expressions import Subquery
 
         qs = qs.exclude(id__in=Subquery(VoucherLine.filter(account_id__in=hidden).values("voucher_id")))
     total = await qs.count()

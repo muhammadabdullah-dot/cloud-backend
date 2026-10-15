@@ -10,8 +10,10 @@ from tortoise import fields, models
 
 class RequisitionDetail(models.Model):
     id = fields.UUIDField(pk=True)
+    # NO ACTION: a requisition is reached from here, from its lines and from the transfers that fulfil it, and
+    # SQL Server allows one cascade path per table. Nothing in the app deletes a requisition, so this never fired.
     requisition: fields.OneToOneRelation["Requisition"] = fields.OneToOneField(
-        "models.Requisition", related_name="detail", on_delete=fields.CASCADE
+        "models.Requisition", related_name="detail", on_delete=fields.NO_ACTION
     )
     # Null: the central godown sends it. Otherwise the branch asked to send it, which dispatches it itself.
     source_branch: fields.ForeignKeyNullableRelation["Branch"] = fields.ForeignKeyField(
@@ -35,7 +37,7 @@ class RequisitionDetail(models.Model):
 class RequisitionLine(models.Model):
     id = fields.UUIDField(pk=True)
     requisition: fields.ForeignKeyRelation["Requisition"] = fields.ForeignKeyField(
-        "models.Requisition", related_name="lines", on_delete=fields.CASCADE
+        "models.Requisition", related_name="lines", on_delete=fields.NO_ACTION
     )
     product: fields.ForeignKeyRelation["Product"] = fields.ForeignKeyField(
         "models.Product", related_name="requisition_lines"

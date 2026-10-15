@@ -26,13 +26,16 @@ back to suppliers from this system yet, so the return columns stay at zero; the 
 """
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime, time, timezone
+from decimal import Decimal, InvalidOperation
 
 from app.models import GRN, GRNLine, Product
 
 ZERO = Decimal("0")
 HUNDRED = Decimal("100")
+# Ids per IN(...). Well under SQL Server's 2,100 parameter cap, the same figure and the same reason as
+# `warehouse_controller._CHUNK`.
+_CHUNK = 400
 
 GROUPS = ("brand", "category", "department", "itemClass", "manufacturer", "supplier", "item")
 VIEWS = ("summary", "detail", "item")
@@ -208,20 +211,128 @@ async def summary(group_by: str, view: str, from_at: datetime | None, to_at: dat
         grns = grns.filter(approved=False)
     if supplier_id:
         grns = grns.filter(supplier_id=supplier_id)
-    grn_ids = await grns.values_list("id", flat=True)
+    # The same conditions, applied to the lines through their delivery, instead of naming every delivery's id.
+    # Chunking at 400 was a correct answer to the wrong problem: SQL Server's 2,100 parameter ceiling is only
+    # reached because the ids are listed at all. A whole-period report meant 15 chunks of deliveries and then 52
+    # of products, 67 round trips for one screen, and 27 seconds. The relation already carries the conditions.
+    lines = GRNLine.all()
+    if from_at:
+        lines = lines.filter(grn__at__gte=from_at)
+    if to_at:
+        lines = lines.filter(grn__at__lte=to_at)
+    if approved == "yes":
+        lines = lines.filter(grn__approved=True)
+    elif approved == "no":
+        lines = lines.filter(grn__approved=False)
+    if supplier_id:
+        lines = lines.filter(grn__supplier_id=supplier_id)
 
-    purchase_lines = [
-        {**l, "supplier": l["grn__supplier__name"]}
-        for l in await GRNLine.filter(grn_id__in=list(grn_ids)).values(
-            "grn_id", "grn__supplier__name", "product_id", "qty", "bonus_qty", "unit_price", "disc_percent", "tax_rate",
-        )
-    ] if grn_ids else []
-
-    product_ids = {str(l["product_id"]) for l in purchase_lines}
-    products = {str(p["id"]): p for p in await Product.filter(id__in=list(product_ids)).values(
-        "id", "sku", "name", "unit", "brand", "category", "department", "item_class", "manufacturer",
-    )} if product_ids else {}
+    # The Item's own fields come down the same relation, so the second pass over products disappears too.
+    purchase_lines, products = [], {}
+    for l in await lines.values(
+        "grn_id", "grn__supplier__name", "product_id", "qty", "bonus_qty", "unit_price", "disc_percent", "tax_rate",
+        "product__sku", "product__name", "product__unit", "product__brand", "product__category",
+        "product__department", "product__item_class", "product__manufacturer",
+    ):
+        purchase_lines.append({**l, "supplier": l["grn__supplier__name"]})
+        pid = str(l["product_id"])
+        if pid not in products:
+            products[pid] = {
+                "id": l["product_id"], "sku": l["product__sku"], "name": l["product__name"],
+                "unit": l["product__unit"], "brand": l["product__brand"], "category": l["product__category"],
+                "department": l["product__department"], "item_class": l["product__item_class"],
+                "manufacturer": l["product__manufacturer"],
+            }
 
     result = fold(group_by, view, purchase_lines, [], products)
     result["approved"] = approved if approved in ("yes", "no") else "all"
     return result
+
+
+# ── ordered against received ─────────────────────────────────────────────────────────────────────
+
+async def excess_and_short(start: date | None, end: date | None, supplier_id: str | None = None,
+                           only_variances: bool = True, tolerance: str = "0") -> dict:
+    """Their Excess And Short Purchase: what was ordered against what actually arrived, line by line.
+
+    The two figures have always been here; nothing compared them. A purchase order line carries the quantity ordered
+    and the quantity received against it, so a short delivery and an over-delivery are both a subtraction.
+
+    Why anyone runs it: a supplier who is quietly ten per cent short every month costs more than the discount they
+    gave, and nobody notices from a purchase summary, which only ever shows what arrived.
+
+    `tolerance` is there because a delivery is not a bank statement. Loose goods weighed at the gate are never
+    exactly the ordered quantity, and a report that flags every 0.02 kg is a report nobody reads.
+    """
+    from app.models import PurchaseOrder, PurchaseOrderLine
+
+    try:
+        slack = Decimal(str(tolerance or 0))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"'{tolerance}' is not a quantity.") from exc
+
+    orders = PurchaseOrder.filter(status__in=("approved", "sent", "part-received", "received", "closed"))
+    if start:
+        orders = orders.filter(raised_at__gte=datetime.combine(start, time.min, tzinfo=timezone.utc))
+    if end:
+        orders = orders.filter(raised_at__lte=datetime.combine(end, time.max, tzinfo=timezone.utc))
+    if supplier_id:
+        orders = orders.filter(supplier_id=supplier_id)
+    order_rows = await orders.prefetch_related("supplier").order_by("raised_at")
+    if not order_rows:
+        return {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
+                "rows": [], "count": 0, "totals": {"ordered": "0", "received": "0", "short": "0", "excess": "0",
+                                                   "shortValue": "0.00", "excessValue": "0.00"}}
+
+    by_id = {str(o.id): o for o in order_rows}
+    # Chunked for the same 2,100 parameter cap as `summary` above. 809 orders came in with the Multi-Tec godown
+    # import, so this is under the limit today and would cross it silently as head office keeps buying.
+    ids = list(by_id)
+    lines = []
+    for start_at in range(0, len(ids), _CHUNK):
+        lines += await PurchaseOrderLine.filter(
+            purchase_order_id__in=ids[start_at:start_at + _CHUNK]
+        ).prefetch_related("product").order_by("position")
+
+    rows = []
+    totals = {"ordered": ZERO, "received": ZERO, "short": ZERO, "excess": ZERO,
+              "shortValue": ZERO, "excessValue": ZERO}
+    for line in lines:
+        order = by_id[str(line.purchase_order_id)]
+        ordered, received = Decimal(str(line.qty or 0)), Decimal(str(line.received_qty or 0))
+        gap = received - ordered
+        short = -gap if gap < ZERO else ZERO
+        excess = gap if gap > ZERO else ZERO
+        totals["ordered"] += ordered
+        totals["received"] += received
+        totals["short"] += short
+        totals["excess"] += excess
+        cost = Decimal(str(line.unit_cost or 0))
+        totals["shortValue"] += short * cost
+        totals["excessValue"] += excess * cost
+        if only_variances and abs(gap) <= slack:
+            continue
+        rows.append({
+            "poNumber": order.po_number, "orderId": str(order.id), "status": order.status,
+            "raisedAt": order.raised_at.isoformat() if order.raised_at else None,
+            "supplier": order.supplier.name if order.supplier else None,
+            "supplierId": str(order.supplier_id) if order.supplier_id else None,
+            "sku": line.product.sku if line.product else None,
+            "productName": line.product.name if line.product else None,
+            "ordered": _q(ordered), "received": _q(received),
+            "short": _q(short), "excess": _q(excess),
+            # Signed, for sorting and for a chart: negative is short, positive is over.
+            "variance": _q(gap),
+            "unitCost": _m(cost), "varianceValue": _m(gap * cost),
+            # A line nobody has received anything against is not a short delivery yet; an order still open is
+            # simply not finished, and saying otherwise would put every live order on a variance report.
+            "openOrder": order.status in ("approved", "sent", "part-received"),
+        })
+    rows.sort(key=lambda r: Decimal(r["variance"]))
+    return {
+        "start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
+        "rows": rows, "count": len(rows), "orders": len(order_rows),
+        "totals": {"ordered": _q(totals["ordered"]), "received": _q(totals["received"]),
+                   "short": _q(totals["short"]), "excess": _q(totals["excess"]),
+                   "shortValue": _m(totals["shortValue"]), "excessValue": _m(totals["excessValue"])},
+    }

@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from tortoise.exceptions import ValidationError
 from tortoise.functions import Count, Sum
 
 from app.core.pk_time import PKT, today_pk
+from app.core import dialect
 from app.models import (
     Bin,
     Branch,
+    selling_branches,
     BranchCashierStat,
     BranchCreditCustomer,
     BranchDailyStat,
@@ -85,10 +87,20 @@ class Period:
     prev_start: date
     prev_end: date
     compare_label: str
+    # The window as moments, filled only when the caller picked a time. Whole days leave these None and every fold
+    # below behaves exactly as it did before, which is what keeps this change invisible to a screen that sends
+    # dates. See `totals_for` for what a time changes and `core/when.py` for why it can be answered at all.
+    at_start: datetime | None = None
+    at_end: datetime | None = None
 
     @property
     def days(self) -> int:
         return (self.end - self.start).days + 1
+
+    @property
+    def timed(self) -> bool:
+        """Did the caller ask for part of a day? Midnight to midnight is whole days, not a time."""
+        return self.at_start is not None or self.at_end is not None
 
 
 def months_back(d: date, n: int) -> date:
@@ -114,13 +126,39 @@ def date_range_label(start: date, end: date) -> str:
 
 
 def parse_day(value: str | None, which: str) -> date:
+    return parse_moment(value, which)[0]
+
+
+def parse_moment(value: str | date | datetime | None, which: str) -> tuple[date, datetime | None]:
+    """A bound as the day it falls on, and as a moment when one was given.
+
+    `2026-10-12` is a whole day and the second value is None. `2026-10-12T17:30` is a moment. Midnight is read as
+    no time at all, the same rule `core/when.py` applies everywhere else: midnight and nothing-at-all are the same
+    value on the wire, so treating one as a time would sweep a day in or out for anyone asking to stop at it.
+
+    It takes a string or an already-parsed value, because the route declares `datetime` so the OpenAPI schema says
+    a time is accepted, while plenty of callers inside the app still hand it ISO text.
+    """
+    if isinstance(value, datetime):
+        return (value.date(), None) if value.timetz() == time(0, 0) else (value.date(), value)
+    if isinstance(value, date):
+        return value, None
+    text = (value or "").strip()
     try:
-        return date.fromisoformat((value or "").strip())
+        return date.fromisoformat(text), None
+    except ValueError:
+        pass
+    try:
+        moment = datetime.fromisoformat(text)
     except ValueError:
         raise ExecutiveError(f"The {which} date isn't a date this can read. Pick it from the calendar.") from None
+    if moment.timetz() == time(0, 0):
+        return moment.date(), None
+    return moment.date(), moment
 
 
-def resolve_period(period_id: str, today: date | None = None, start: str | None = None, end: str | None = None) -> Period:
+def resolve_period(period_id: str, today: date | None = None, start: str | datetime | None = None,
+                   end: str | datetime | None = None) -> Period:
     t = today or business_today()
     if period_id == "today":
         return Period("today", "Today", t, t, t - timedelta(days=1), t - timedelta(days=1), "yesterday")
@@ -161,13 +199,24 @@ def resolve_period(period_id: str, today: date | None = None, start: str | None 
     if period_id == "custom":
         if not start or not end:
             raise ExecutiveError("Choose both a first and a last day for your own dates.")
-        first, last = parse_day(start, "first"), parse_day(end, "last")
+        first, at_first = parse_moment(start, "first")
+        last, at_last = parse_moment(end, "last")
         if first > last:
             raise ExecutiveError("The first day comes after the last day. Swap them round and try again.")
+        if at_first and at_last and at_first > at_last:
+            raise ExecutiveError("The window starts after it ends. Swap the times round and try again.")
         prev_start, prev_end = _before(first, last)
         n = (last - first).days + 1
-        return Period("custom", date_range_label(first, last), first, last, prev_start, prev_end,
-                      "the day before" if n == 1 else f"the {n} days before")
+        label = date_range_label(first, last)
+        if at_first or at_last:
+            # The times belong in the label: a figure for part of a day, shown under a label that names the whole
+            # day, is a figure somebody will quote at the wrong size.
+            shown = f"{at_first:%H:%M}" if at_first else "the start"
+            until = f"{at_last:%H:%M}" if at_last else "the end"
+            label = f"{label}, {shown} to {until}"
+        return Period("custom", label, first, last, prev_start, prev_end,
+                      "the day before" if n == 1 else f"the {n} days before",
+                      at_start=at_first, at_end=at_last)
     return resolve_period("30d", t)
 
 
@@ -178,6 +227,46 @@ PERIOD_IDS = ["today", "yesterday", "7d", "30d", "month", "last-month", "3m", "6
 def _in(qs, branch_id: str | None):
     """One branch's rows, or every branch's. Every fold below takes the branch the same way."""
     return qs.filter(branch_id=branch_id) if branch_id else qs
+
+
+def _scope_sql(period, branch_id: str | None, alias: str = "ps") -> tuple[str, list]:
+    """The same branch-and-day filter as `_in`, for the folds that group in SQL rather than in Python."""
+    where = [f'{alias}."day" >= ?', f'{alias}."day" <= ?']
+    args: list = [period.start.isoformat(), period.end.isoformat()]
+    if branch_id:
+        where.append(f'{alias}."branch_id" = {dialect.mark()}')
+        args.append(branch_id)
+    return " AND ".join(where), args
+
+
+def _sum(value) -> Decimal:
+    """A SUM() from SQLite, as a Decimal.
+
+    SQLite returns a float for SUM(CAST(x AS REAL)) and `_money` quantizes a Decimal, so the two have to meet
+    somewhere. Here, once, rather than at every call site: str() first so the Decimal is built from the digits the
+    float prints rather than from its binary expansion.
+    """
+    if value is None:
+        return D0
+    return _money(Decimal(str(value)))
+
+
+async def _grouped(sql: str, args: list) -> list[dict]:
+    """A GROUP BY run by the database.
+
+    Every fold that uses this used to select whole rows and add them up in a dict. That cost nothing while a branch
+    sent a few hundred Item-days a day; against 1,818,232 of them it made the Company Dashboard take 34 seconds for a
+    month and 269 for a year, of which 20 seconds was Python doing arithmetic SQLite does in milliseconds.
+
+    Raw SQL rather than `annotate(Sum(...))` because Tortoise's annotate groups by row rather than over the set,
+    which this repository has been caught by before.
+    """
+    from tortoise import Tortoise
+
+    from app.services import query_cache
+
+    return await query_cache.remember(
+        sql, args, lambda: Tortoise.get_connection("default").execute_query_dict(sql, args))
 
 
 # ── snapshot folds ──────────────────────────────────────────────────────────
@@ -222,6 +311,13 @@ class Totals:
     def net_cash(self) -> Decimal:
         return self.cash_collected + self.cash_in - self.cash_out
 
+    # "day"   -- folded from BranchDailyStat, one row per branch per day, as this has always done.
+    # "bills" -- folded from the documents, because the caller picked a time. `whole_day` then names the figures
+    #            that could not follow, so a screen can mark them rather than quietly showing a day's worth of
+    #            cash beside an hour's worth of sales.
+    basis: str = "day"
+    whole_day: tuple[str, ...] = ()
+
 
 _SUM_FIELDS = (
     "gross_sales", "disc_total", "gst", "net_sales", "cogs", "items_sold",
@@ -229,7 +325,24 @@ _SUM_FIELDS = (
 )
 
 
+# The figures a timed window cannot get from the documents, and why. Each was measured rather than assumed, by
+# `ops/checks/executive_grain.py`, which folds the same window both ways and must find them identical.
+#
+#   cash_in, cash_out    a branch sums its cash movements per day before head office ever sees them. There is no
+#                        movement-level row here to filter.
+#   stock_value          a snapshot, stated once a day rather than accumulated through it. "Stock at 14:30" is not
+#                        a number that exists.
+#   cash_collected,      these ARE in the documents, and the documents are not fit to be read: 311,240 of
+#   credit_sales         1,067,857 bills carry a tender row at all, and those that do total 176 times the value of
+#                        the bills they sit on, because a barcode was written into `amount` (8,964,002,874.00 on a
+#                        Rs 45 bill; 8964 is the GS1 prefix on their own products). Fix that import and these two
+#                        move up into the timed fold with no other change here.
+WHOLE_DAY_WHEN_TIMED = ("cash_in", "cash_out", "cash_collected", "credit_sales")
+
+
 async def totals_for(period: Period, branch_id: str | None = None) -> Totals:
+    if period.timed:
+        return await _totals_from_bills(period, branch_id)
     rows = await _in(BranchDailyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
 
     t = Totals(days=len({r.day for r in rows}))
@@ -245,6 +358,106 @@ async def totals_for(period: Period, branch_id: str | None = None) -> Totals:
         if r.first_sale_at and r.last_sale_at:
             hours = Decimal((r.last_sale_at - r.first_sale_at).total_seconds()) / Decimal(3600)
             t.trading_hours += max(hours, Decimal("0.5"))
+    return t
+
+
+async def _totals_from_bills(period: Period, branch_id: str | None) -> Totals:
+    """The same totals, rebuilt from the documents, because the caller asked for part of a day.
+
+    `branch_sales.at` IS LOCAL PAKISTAN TIME, stored naive, so a bound of 17:30 compares against it directly with
+    no conversion. Verified rather than assumed, 14 October 2026: bill 1201743066 is stamped `2026-10-13 01:34:21`
+    and carries `day = 2026-10-12`, which is only true of a shop's own clock running past midnight -- under UTC
+    that bill would have fallen on the 13th. The busiest stored hours are 18:00 to 21:00, which is evening trade
+    locally and implausible as UTC.
+
+    Where it differs from the daily fold, and by how much: a bill's `net_value` is what the customer was charged
+    after rounding to the rupee, while the daily rows carry the unrounded total. So a whole-day window folded here
+    can differ from the same window folded from the daily rows by at most Rs 0.50 a bill, and did differ by
+    Rs 58.59 over 19,020 bills when measured. The bills are the better answer to "what did we take": they are what
+    the receipts in people's hands say.
+    """
+    lo = period.at_start or datetime.combine(period.start, time.min)
+    hi = period.at_end or datetime.combine(period.end, time.max)
+
+    def window(alias: str, column: str = "at") -> tuple[str, list]:
+        # Both the clock window AND the trading days picked. A shop selling past midnight gives the two different
+        # meanings: 52 bills sat inside 12 October by the clock while belonging to trading day the 11th. Taking
+        # those in would contradict the label the screen shows, which names the days; leaving the clock bound off
+        # would ignore what was asked. So: the days asked for, and within them the hours asked for.
+        where = (f"{alias}.{dialect.quote(column)} >= ? AND {alias}.{dialect.quote(column)} <= ?"
+                 f" AND {alias}.day >= ? AND {alias}.day <= ?")
+        args: list = [lo, hi, period.start, period.end]
+        if branch_id:
+            # `dialect.mark()`, not a bare `?`: these keys are char(36) on SQL Server and a plain parameter binds
+            # as nvarchar, so the comparison converts on every row and the index this fold was given cannot be
+            # seeked. Measured elsewhere in this file at nine times on a single comparison.
+            where += f" AND {alias}.branch_id = {dialect.mark()}"
+            args.append(branch_id)
+        return where, args
+
+    sales_where, sales_args = window("s")
+    # Grouped by branch and day so trading hours and named customers keep the per-day meaning the daily rows have:
+    # a customer who came on two days counts twice, and each day's open hours are measured on their own.
+    by_day = await _grouped(f"""
+        SELECT s.branch_id, s.day, COUNT(*) AS invoices,
+               SUM(s.gross) AS gross_sales, SUM(s.disc_total) AS disc_total, SUM(s.gst) AS gst,
+               SUM(s.net_value) AS net_sales, SUM(s.cogs) AS cogs, SUM(s.cash_back) AS cash_back,
+               COUNT(DISTINCT s.party_code) AS named_customers,
+               MIN(s.{dialect.quote('at')}) AS first_sale_at, MAX(s.{dialect.quote('at')}) AS last_sale_at
+          FROM branch_sales s WHERE {sales_where}
+         GROUP BY s.branch_id, s.day
+    """, sales_args)
+
+    items = await _grouped(f"""
+        SELECT SUM(CASE WHEN l.is_return = 1 THEN -l.qty ELSE l.qty END) AS items_sold
+          FROM branch_sale_lines l JOIN branch_sales s ON s.id = l.sale_id WHERE {sales_where}
+    """, sales_args)
+
+    returns_where, returns_args = window("r")
+    returns = await _grouped(f"""
+        SELECT COUNT(*) AS returns_count, SUM(r.refund_total) AS returns_value
+          FROM branch_return_records r WHERE {returns_where}
+    """, returns_args)
+
+    # A drawer belongs to the window by when it was closed, which is the only moment a variance exists at.
+    tills_where, tills_args = window("t", "closed_at")
+    tills = await _grouped(f"""
+        SELECT COUNT(*) AS tills_closed, SUM(t.variance) AS till_variance
+          FROM branch_till_closes t WHERE {tills_where}
+    """, tills_args)
+
+    t = Totals(days=len({r["day"] for r in by_day}), basis="bills", whole_day=WHOLE_DAY_WHEN_TIMED)
+    for r in by_day:
+        t.invoices += int(r["invoices"] or 0)
+        t.gross_sales += _sum(r["gross_sales"])
+        t.disc_total += _sum(r["disc_total"])
+        t.gst += _sum(r["gst"])
+        t.net_sales += _sum(r["net_sales"])
+        t.cogs += _sum(r["cogs"])
+        t.named_customers += int(r["named_customers"] or 0)
+        first, last = r["first_sale_at"], r["last_sale_at"]
+        if first and last:
+            if isinstance(first, str):
+                first, last = datetime.fromisoformat(first), datetime.fromisoformat(last)
+            hours = Decimal((last - first).total_seconds()) / Decimal(3600)
+            t.trading_hours += max(hours, Decimal("0.5"))
+
+    t.items_sold = _sum(items[0]["items_sold"]) if items else D0
+    if returns:
+        t.returns_count = int(returns[0]["returns_count"] or 0)
+        t.returns_value = _sum(returns[0]["returns_value"])
+    if tills:
+        t.tills_closed = int(tills[0]["tills_closed"] or 0)
+        t.till_variance = _sum(tills[0]["till_variance"])
+
+    # The four that cannot follow a time are still worth answering, as the whole days the window touches, so the
+    # tile shows a figure with a marker rather than a blank. `whole_day` above is what says which they are.
+    day_rows = await _in(BranchDailyStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
+    for r in day_rows:
+        t.cash_in += r.cash_in or D0
+        t.cash_out += r.cash_out or D0
+        t.cash_collected += r.cash_collected or D0
+        t.credit_sales += r.credit_sales or D0
     return t
 
 
@@ -268,6 +481,22 @@ async def snapshot_as_of(branch_id: str | None = None) -> datetime | None:
 
 
 # ── live (cloud-owned) folds ────────────────────────────────────────────────
+async def _products_by_id(ids: list[str]) -> dict:
+    """The products behind a list of ids, fetched in chunks and keyed by id as a string.
+
+    `id__in=[...]` names every id as a parameter and SQL Server takes 2,100 in one statement. Both callers below
+    pass one id per product the godown holds, which was safe only while it held nothing: `warehouse_stock_movements`
+    had no rows, the list was empty, and the limit was never near. Loading head office's stock position put 2,202
+    products in it and the Stock and Supply panels of the Company Dashboard both started answering with
+    "COUNT field incorrect or syntax error" instead of a figure.
+    """
+    out = {}
+    for part in range(0, len(ids), 500):
+        for product in await Product.filter(id__in=ids[part:part + 500]):
+            out[str(product.id)] = product
+    return out
+
+
 async def godown_stock_value() -> Decimal:
     rows = (
         await StockMovement.all().annotate(total=Sum("qty"))
@@ -275,7 +504,7 @@ async def godown_stock_value() -> Decimal:
     )
     if not rows:
         return D0
-    prices = {str(p.id): p.price for p in await Product.filter(id__in=[r["product_id"] for r in rows])}
+    prices = {pid: p.price for pid, p in (await _products_by_id([r["product_id"] for r in rows])).items()}
     return sum((Decimal(str(r["total"] or 0)) * prices.get(r["product_id"], D0) for r in rows), D0)
 
 
@@ -284,7 +513,7 @@ async def godown_balances() -> list[dict]:
         await StockMovement.all().annotate(total=Sum("qty"))
         .group_by("product_id").values("product_id", "total")
     )
-    products = {str(p.id): p for p in await Product.filter(id__in=[r["product_id"] for r in rows])}
+    products = await _products_by_id([r["product_id"] for r in rows])
     out = []
     for r in rows:
         p = products.get(r["product_id"])
@@ -297,35 +526,76 @@ async def godown_balances() -> list[dict]:
     return out
 
 
-async def warehouse_status() -> dict:
-    transfers = await Transfer.all().prefetch_related("lines")
-    in_flight = [t for t in transfers if t.status in ("dispatched", "in_transit")]
-    disputes = [t for t in transfers if t.dispute_open]
-    awaiting_pick = [t for t in transfers if t.status == "approved"]
-    pending_reqs = await Requisition.filter(status="pending").count()
-    return {
-        "stockValue": await godown_stock_value(),
-        "inFlight": len(in_flight),
-        "awaitingPick": len(awaiting_pick),
-        "disputesOpen": len(disputes),
-        "pendingRequisitions": pending_reqs,
-        "transfers": transfers,
+async def warehouse_status(*, transfers: bool = False, stock_value: bool = True) -> dict:
+    """What the godown is holding and what is moving, counted in the database rather than in Python.
+
+    Not `.prefetch_related("lines")`. Nothing here or in any caller reads a transfer's lines: the tile counts
+    transfers by status, the drill-down lists numbers, vehicles and dates, and `live_alerts` looks at
+    `dispute_open`. The prefetch fetched 115,871 lines nobody asked for, and because Tortoise prefetches by naming
+    the parent ids it also meant `WHERE transfer_id IN (6,332 parameters)`, which SQL Server refuses at its 2,100
+    ceiling with "COUNT field incorrect or syntax error". That answered /executive/kpis with a 500.
+
+    AND NOT `Transfer.all()` EITHER, WHICH IS WHY THE TWO FLAGS EXIST
+    ----------------------------------------------------------------
+    It used to build every one of the 6,393 transfers as a model object and then count them with three list
+    comprehensions. Four callers share this function and only ONE of them ever reads that list -- the drill-down
+    that puts it in a table. The Supply tile wants two numbers, `business_health` wants two numbers, and
+    `live_alerts` wants only the handful that are in dispute. So the counting is now one GROUP BY, the list is
+    fetched only when asked for, and the disputed few are fetched on their own because that is all anybody wanted
+    of them.
+
+    `stock_value` is the same story: it costs about a third of a second and neither `business_health` nor
+    `live_alerts` reads it. Together these took `warehouse_status` from 1.01s to a fraction of it, and the Health
+    section is the slowest thing on the dashboard on every period, because none of this ever depended on the
+    period at all.
+    """
+    rows = await _grouped(
+        f'SELECT t."status" AS status, COUNT(*) AS n, '
+        f'       SUM(CASE WHEN t."dispute_open" = 1 THEN 1 ELSE 0 END) AS disputes '
+        f'FROM "transfers" t GROUP BY t."status"', [])
+    by_status = {str(r["status"]): int(r["n"] or 0) for r in rows}
+    out = {
+        "inFlight": by_status.get("dispatched", 0) + by_status.get("in_transit", 0),
+        "awaitingPick": by_status.get("approved", 0),
+        "disputesOpen": sum(int(r["disputes"] or 0) for r in rows),
+        "pendingRequisitions": await Requisition.filter(status="pending").count(),
+        # Always: it is the few that are in dispute, which is what `live_alerts` builds its notices from.
+        "disputed": await Transfer.filter(dispute_open=True),
     }
+    out["stockValue"] = await godown_stock_value() if stock_value else None
+    out["transfers"] = await Transfer.all() if transfers else []
+    return out
 
 
 async def purchase_status() -> dict:
-    grns = await GRN.all().prefetch_related("lines")
-    received_value = D0
-    for g in grns:
-        for l in g.lines:
-            received_value += (l.qty or D0) * (l.unit_price or D0)
+    """What has come into the godown, and what is waiting on a decision.
+
+    This read every delivery with `GRN.all().prefetch_related("lines")` and added the lines up here. Tortoise
+    prefetches by naming the parent ids, so once the 5,968 Multi-Tec deliveries landed that became
+    `WHERE grn_id IN (5,968 parameters)`, SQL Server refused it at its 2,100 ceiling with "COUNT field incorrect or
+    syntax error", and the Supply tiles took the whole Company Dashboard down with them: /executive/kpis answered
+    500 rather than slowly.
+
+    The tiles want four numbers, not 92,509 delivery lines. Three aggregates answer them, and nothing is carried into
+    Python that is not shown on a tile.
+    """
+    from tortoise import Tortoise
+
+    conn = Tortoise.get_connection("default")
+    counts = (await conn.execute_query_dict(
+        "SELECT COUNT(*) AS grns, SUM(CASE WHEN approved = 0 THEN 1 ELSE 0 END) AS unapproved FROM warehouse_grns", []))[0]
+    # qty is decimal(16,3) and unit_price decimal(14,2), so the product is exact at decimal(31,5) and the sum at
+    # decimal(38,5): the same arithmetic the Python loop did, to the same last digit.
+    value = (await conn.execute_query_dict("SELECT SUM(qty * unit_price) AS value FROM warehouse_grn_lines", []))[0]
+    reqs = {r["status"]: r["n"] for r in await conn.execute_query_dict(
+        "SELECT status, COUNT(*) AS n FROM requisitions GROUP BY status", [])}
     return {
-        "grnCount": len(grns),
-        "receivedValue": received_value,
-        "unapproved": len([g for g in grns if not g.approved]),
-        "pendingRequisitions": await Requisition.filter(status="pending").count(),
-        "approvedRequisitions": await Requisition.filter(status="approved").count(),
-        "rejectedRequisitions": await Requisition.filter(status="rejected").count(),
+        "grnCount": int(counts["grns"] or 0),
+        "receivedValue": Decimal(str(value["value"] or 0)),
+        "unapproved": int(counts["unapproved"] or 0),
+        "pendingRequisitions": int(reqs.get("pending", 0)),
+        "approvedRequisitions": int(reqs.get("approved", 0)),
+        "rejectedRequisitions": int(reqs.get("rejected", 0)),
     }
 
 
@@ -335,102 +605,190 @@ async def supplier_performance() -> list[dict]:
 
     Deliberately not "on-time delivery %" or a quality score — nothing in the MVP records a
     promised date or a rejection reason, so those would be invented numbers wearing a KPI label.
+
+    Same reason as `purchase_status` for not reading the deliveries themselves: `GRN.all().prefetch_related("lines")`
+    named all 5,968 of them as parameters and SQL Server refused. Two GROUP BYs instead, one per grain.
+
+    The receipts and the last receipt date have to come from the deliveries rather than from their lines, because a
+    delivery with no lines is still a receipt. That is why this is two queries and not one join.
     """
+    from tortoise import Tortoise
+
+    conn = Tortoise.get_connection("default")
     suppliers = {str(s.id): s for s in await Supplier.all()}
-    grns = await GRN.all().prefetch_related("lines")
+    receipts = {str(r["supplier_id"]): r for r in await conn.execute_query_dict(
+        "SELECT supplier_id, COUNT(*) AS receipts, MAX(at) AS last_at FROM warehouse_grns GROUP BY supplier_id", [])}
+    lines = {str(r["supplier_id"]): r for r in await conn.execute_query_dict(
+        "SELECT g.supplier_id AS supplier_id, SUM(l.qty * l.unit_price) AS value, SUM(l.qty) AS units, "
+        "       SUM(l.bonus_qty) AS bonus FROM warehouse_grn_lines l "
+        "  JOIN warehouse_grns g ON g.id = l.grn_id GROUP BY g.supplier_id", [])}
     agg: dict[str, dict] = {}
-    for g in grns:
-        sid = str(g.supplier_id)
-        row = agg.setdefault(sid, {
+    for sid in list(receipts) + [s for s in suppliers if s not in receipts]:
+        got, line = receipts.get(sid), lines.get(sid, {})
+        agg[sid] = {
             "supplierId": sid,
             "name": suppliers[sid].name if sid in suppliers else sid,
             "code": suppliers[sid].code if sid in suppliers else None,
-            "receipts": 0, "value": D0, "units": D0, "bonusUnits": D0, "lastReceipt": None,
-        })
-        row["receipts"] += 1
-        for l in g.lines:
-            row["value"] += (l.qty or D0) * (l.unit_price or D0)
-            row["units"] += l.qty or D0
-            row["bonusUnits"] += l.bonus_qty or D0
-        if row["lastReceipt"] is None or g.at > row["lastReceipt"]:
-            row["lastReceipt"] = g.at
-    for sid, s in suppliers.items():
-        agg.setdefault(sid, {
-            "supplierId": sid, "name": s.name, "code": s.code,
-            "receipts": 0, "value": D0, "units": D0, "bonusUnits": D0, "lastReceipt": None,
-        })
+            "receipts": int(got["receipts"]) if got else 0,
+            "value": Decimal(str(line.get("value") or 0)),
+            "units": Decimal(str(line.get("units") or 0)),
+            "bonusUnits": Decimal(str(line.get("bonus") or 0)),
+            "lastReceipt": got["last_at"] if got else None,
+        }
     return sorted(agg.values(), key=lambda r: r["value"], reverse=True)
 
 
 # ── breakdowns ──────────────────────────────────────────────────────────────
+async def _ranked_items(period: Period, branch_id: str | None) -> list[dict]:
+    """Each Item summed over the period: whole months from `branch_product_months`, the ragged ends from the days.
+
+    WHY THIS DOES NOT GROUP THE DAYS ITSELF
+    ---------------------------------------
+    It used to, and over a year that is the whole of `branch_product_stats` -- 1,838,739 rows -- grouped twice, once
+    for the Items and once for the categories. The Rankings section of the Company Dashboard took 21.6 seconds for
+    the twelve month view against a browser that gives up at 15, so that section showed an error on that period.
+
+    `analytics_service._ranked` already answers exactly this question off the rollup, including the part-month at
+    each end and the fall back to the day table when the rollup has not been built. Calling it rather than writing a
+    second reader also means the dashboard's Top Items and the Item analytics screens cannot disagree about what an
+    Item sold, which two separate folds over the same rows eventually would.
+
+    WHAT CHANGED IN THE NUMBERS, EXACTLY
+    ------------------------------------
+    Nothing in any total: net sales over the twelve months is 696,942,558.33 over 26,070 Items read either way, to
+    the paisa. What changes is where an Item sits when its own classification moved during the period. Grouping the
+    days puts each day's sales in whatever category that day carried, so one Item lands in two categories and is
+    counted in both their Item counts. This path takes one category per Item, so it lands in one. Over the last
+    twelve months that is 2 Items whose category changed and 5 whose brand changed, out of 26,070: MEDICINE
+    (PHARMACY) reads 2,489 Items rather than 2,490, and DefaultBrand 8,896 rather than 8,901. Department was
+    identical. If attribution at the time of sale is wanted instead, it is this function that changes, not the two
+    callers.
+
+    The rollup is keyed by branch code, not id, so the one lookup here turns the id the dashboard holds into the code
+    the rollup wants.
+    """
+    from app.services.analytics_service import _ranked
+
+    code = None
+    if branch_id:
+        found = await Branch.filter(id=branch_id).values_list("code", flat=True)
+        code = found[0] if found else None
+    return await _ranked(period.start, period.end, code)
+
+
+def _classified(value) -> str:
+    """A grouping label, with blank and missing both reading as Unclassified rather than as two empty groups."""
+    text = (value or "").strip()
+    return text or "Unclassified"
+
+
 async def top_products(period: Period, limit: int = 20, branch_id: str | None = None) -> list[dict]:
-    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
-    agg: dict[str, dict] = {}
-    for r in rows:
-        row = agg.setdefault(r.product_sku, {
-            "sku": r.product_sku, "name": r.product_name, "department": r.department,
-            "category": r.category, "brand": r.brand, "qty": D0, "netSales": D0, "cogs": D0,
-        })
-        row["qty"] += r.qty or D0
-        row["netSales"] += r.net_sales or D0
-        row["cogs"] += r.cogs or D0
-    for row in agg.values():
-        row["grossProfit"] = row["netSales"] - row["cogs"]
-    return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
+    rows = sorted(await _ranked_items(period, branch_id), key=lambda r: -float(r["net_sales"] or 0))
+    # The limit is applied here, not in the read, so every caller asks the same question and the read memo can answer
+    # it once. The grid wants 20, a chart 12, a drill-down 50 and another 1,000; discarding rows afterwards is free.
+    out = []
+    for r in rows[:limit]:
+        net, cogs = _sum(r["net_sales"]), _sum(r["cogs"])
+        out.append({"sku": r["sku"], "name": r["name"], "department": r["department"],
+                    "category": r["category"], "brand": r["brand"], "qty": _sum(r["qty"]),
+                    "netSales": net, "cogs": cogs, "grossProfit": net - cogs})
+    return out
+
+
+# The columns a Top Categories view may group by. Named rather than interpolated, because `attr` reaches this from
+# a query string, and it is now also the key read off each Item's row.
+_GROUPABLE = {"category": "category", "brand": "brand", "department": "department"}
 
 
 async def top_by(period: Period, attr: str, limit: int = 15, branch_id: str | None = None) -> list[dict]:
-    """Top categories / departments / brands — the same fold, grouped by a different column."""
-    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
-    agg: dict[str, dict] = {}
-    for r in rows:
-        key = getattr(r, attr) or "Unclassified"
-        row = agg.setdefault(key, {"name": key, "qty": D0, "netSales": D0, "cogs": D0, "products": set()})
-        row["qty"] += r.qty or D0
-        row["netSales"] += r.net_sales or D0
-        row["cogs"] += r.cogs or D0
-        row["products"].add(r.product_sku)
-    out = []
-    for row in agg.values():
-        out.append({
-            "name": row["name"], "qty": row["qty"], "netSales": row["netSales"],
-            "grossProfit": row["netSales"] - row["cogs"], "products": len(row["products"]),
-        })
-    return sorted(out, key=lambda r: r["netSales"], reverse=True)[:limit]
+    """Top categories / departments / brands -- the same Items, folded on a different column.
+
+    Folded here off `_ranked_items` rather than grouped over the day rows a second time. The rows are one per Item,
+    which is 26,070 over a year, against another pass over 1.8 million Item-days: that second pass was 7.9 seconds of
+    the Rankings section's 21.6, on top of the 5.3 that Top Items cost over the very same rows. Now 0.26s.
+
+    `products` counts the Items in each group, which is what `COUNT(DISTINCT product_sku)` counted before. There is
+    one row per Item here, so it is the number of rows. See `_ranked_items` for the one way that answer differs.
+    """
+    if attr not in _GROUPABLE:
+        raise ValueError(f"cannot group Items by {attr!r}: only {', '.join(sorted(_GROUPABLE))}")
+    groups: dict[str, dict] = {}
+    for r in await _ranked_items(period, branch_id):
+        name = _classified(r.get(attr))
+        g = groups.get(name)
+        if g is None:
+            g = groups[name] = {"name": name, "qty": D0, "net": D0, "cogs": D0, "products": 0}
+        g["qty"] += _sum(r["qty"])
+        g["net"] += _sum(r["net_sales"])
+        g["cogs"] += _sum(r["cogs"])
+        g["products"] += 1
+    ranked = sorted(groups.values(), key=lambda g: -g["net"])
+    return [{"name": g["name"], "qty": g["qty"], "netSales": g["net"],
+             "grossProfit": g["net"] - g["cogs"], "products": g["products"]} for g in ranked[:limit]]
 
 
 async def cashier_ranking(period: Period, limit: int = 20, branch_id: str | None = None) -> list[dict]:
-    # Scoped to a branch, the people are that branch's people: their bills there and nowhere else.
-    rows = await _in(BranchCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
-    branches = await _branch_codes()
-    agg: dict[str, dict] = {}
-    for r in rows:
-        row = agg.setdefault(r.cashier_name, {
-            "name": r.cashier_name, "invoices": 0, "netSales": D0, "days": 0, "branchSet": set(),
-            "qty": D0, "itemNetSales": D0, "cogs": D0, "items": set(),
+    """Who sold what, ranked. Scoped to a branch, the people are that branch's people: their bills there and nowhere
+    else.
+
+    Both folds are done by the database. They used to be done in Python over model objects, which cost nothing while
+    a branch sent a few dozen cashier-days and became the single most expensive thing on the Company Dashboard once
+    `branch_product_cashier_stats` held 2,251,239 rows: Tortoise built an object for every one, parsing a date and a
+    UUID on the way, and the grid asks for this eighty times to draw one screen.
+
+    `COUNT(DISTINCT product_sku)` is what `len(set(...))` was doing by hand, and `GROUP_CONCAT(DISTINCT ...)` is the
+    branch list. The two halves stay two queries because a join between them would multiply each cashier-day by that
+    person's Item rows and silently inflate every invoice count.
+    """
+    where, args = _scope_sql(period, branch_id, "cs")
+    people = await _grouped(f'''
+        SELECT cs."cashier_name" AS name,
+               SUM(cs."invoices") AS invoices,
+               SUM(CAST(cs."net_sales" AS REAL)) AS net_sales,
+               COUNT(*) AS days,
+               {dialect.group_concat_distinct(chr(34) + "b" + chr(34) + "." + chr(34) + "code" + chr(34))} AS branches
+          FROM "branch_cashier_stats" cs
+          JOIN "branches" b ON b."id" = cs."branch_id"
+         WHERE {where}
+         GROUP BY cs."cashier_name"
+    ''', args)
+    if not people:
+        return []
+
+    where, args = _scope_sql(period, branch_id, "pc")
+    baskets = {r["name"]: r for r in await _grouped(f'''
+        SELECT pc."cashier_name" AS name,
+               SUM(CAST(pc."qty" AS REAL)) AS qty,
+               SUM(CAST(pc."net_sales" AS REAL)) AS net_sales,
+               SUM(CAST(pc."cogs" AS REAL)) AS cogs,
+               COUNT(DISTINCT pc."product_sku") AS items
+          FROM "branch_product_cashier_stats" pc
+         WHERE {where}
+         GROUP BY pc."cashier_name"
+    ''', args)}
+
+    out: list[dict] = []
+    for r in people:
+        basket = baskets.get(r["name"]) or {}
+        net = _sum(r["net_sales"])
+        item_net = _sum(basket.get("net_sales"))
+        cogs = _sum(basket.get("cogs"))
+        invoices = int(r["invoices"] or 0)
+        out.append({
+            "name": r["name"], "invoices": invoices, "netSales": net, "days": int(r["days"] or 0),
+            # GROUP_CONCAT gives them in whatever order it met them; the old fold sorted a set.
+            "branches": ", ".join(sorted((r["branches"] or "?").split(","))),
+            "qty": _sum(basket.get("qty")), "itemNetSales": item_net, "cogs": cogs,
+            "distinctItems": int(basket.get("items") or 0),
+            "avgBasket": _money(net / invoices) if invoices else D0,
+            "grossProfit": (item_net - cogs) if item_net else None,
+            "marginPercent": _money((item_net - cogs) / item_net * 100) if item_net else None,
         })
-        row["invoices"] += r.invoices
-        row["netSales"] += r.net_sales or D0
-        row["days"] += 1
-        row["branchSet"].add(branches.get(str(r.branch_id), "?"))
-    # What each person's bills were made of, where the branch sends it: items, units, and the profit on them.
-    for r in await _in(BranchProductCashierStat.filter(day__gte=period.start, day__lte=period.end), branch_id):
-        row = agg.get(r.cashier_name)
-        if row is None:
-            continue
-        row["qty"] += r.qty or D0
-        row["itemNetSales"] += r.net_sales or D0
-        row["cogs"] += r.cogs or D0
-        row["items"].add(r.product_sku)
-    total = sum((row["netSales"] for row in agg.values()), D0)
-    for row in agg.values():
-        row["avgBasket"] = _money(row["netSales"] / row["invoices"]) if row["invoices"] else D0
-        row["share"] = _money(row["netSales"] / total * 100) if total else D0
-        row["branches"] = ", ".join(sorted(row.pop("branchSet")))
-        row["distinctItems"] = len(row.pop("items"))
-        row["grossProfit"] = row["itemNetSales"] - row["cogs"] if row["itemNetSales"] else None
-        row["marginPercent"] = _money(row["grossProfit"] / row["itemNetSales"] * 100) if row["itemNetSales"] else None
-    return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
+    total = sum((r["netSales"] for r in out), D0)
+    for r in out:
+        r["share"] = _money(r["netSales"] / total * 100) if total else D0
+    out.sort(key=lambda r: r["netSales"], reverse=True)
+    return out[:limit]  # the SQL carries no LIMIT, so every caller shares one cached fold
 
 
 async def duty_by_day(period: Period, branch_id: str | None = None) -> dict[tuple[str, date], dict]:
@@ -509,7 +867,8 @@ async def branch_by_code(code: str) -> Branch | None:
 
 
 async def branch_comparison(period: Period) -> list[dict]:
-    branches = await Branch.all()
+    """Every selling branch ranked by net sales. Head office is not ranked -- see `selling_branches`."""
+    branches = await selling_branches()
     out = []
     for b in branches:
         t = await totals_for(period, str(b.id))
@@ -633,7 +992,8 @@ async def business_health(period: Period, branch_id: str | None = None) -> Healt
         f"{len(alerts['outOfStock'])} of {lines} godown lines out of stock"))
 
     # Supply chain: open disputes and requisitions waiting on a decision.
-    wh = await warehouse_status()
+    # Two counts, so neither the stock value nor the transfer list is asked for.
+    wh = await warehouse_status(stock_value=False)
     friction = wh["disputesOpen"] * 2 + wh["pendingRequisitions"]
     components.append(HealthComponent(
         "supply", "Supply chain", _clamp(100 - friction * 12), 10,
@@ -658,9 +1018,11 @@ async def live_alerts() -> list[dict]:
     from so the reader knows whether it is live or as-reported."""
     out: list[dict] = []
 
-    wh = await warehouse_status()
-    for t in wh["transfers"]:
-        if t.dispute_open:
+    # Neither the whole transfer list nor the stock value: this builds a notice per dispute and a notice about
+    # waiting requisitions, and reads nothing else.
+    wh = await warehouse_status(stock_value=False)
+    for t in wh["disputed"]:
+        if True:
             out.append({
                 "severity": "high", "kind": "dispute", "source": "live",
                 "title": f"{t.transfer_number}: short-receipt dispute",
@@ -701,13 +1063,32 @@ async def live_alerts() -> list[dict]:
                 "detail": "As last reported by the branch.",
             })
 
-    for b in await Branch.all():
+    # Selling branches: head office has a branches row but no branch server, so "has never reported" is not a
+    # thing that can be true of it. See models.branch.selling_branches.
+    for b in await selling_branches():
         if b.status == "active" and not b.last_seen_at:
             out.append({
                 "severity": "medium", "kind": "sync", "source": "live",
                 "title": f"{b.name} has never reported",
                 "detail": "Registered, but no data has arrived from this branch yet.",
             })
+
+    # What the branches say is broken at their end. Worth being here rather than only on its own tile: this is
+    # the list somebody reads when they want to know what needs a decision, and a shop that cannot sell is the
+    # most urgent thing on it. Counted, not listed one by one -- the tile's drill-down has the detail.
+    from app.services import technical_reports_service as tr
+
+    tally = await tr.failure_tally()
+    for shop in tally["branches"]:
+        if not shop["total"]:
+            continue
+        fresh = shop["lastDay"]
+        out.append({
+            "severity": "high" if fresh else "low", "kind": "branch-error", "source": "live",
+            "title": f"{shop['name']}: {shop['total']} failure(s) reported" + (f", {fresh} today" if fresh else ""),
+            "detail": "The branch is pushing, so Sync Health reads clear. Its staff are working around something."
+                      if fresh else f"Nothing in the last day. The most recent was within {tally['days']} days.",
+        })
 
     order = {"high": 0, "medium": 1, "low": 2}
     return sorted(out, key=lambda a: order.get(a["severity"], 3))
@@ -842,24 +1223,32 @@ async def credit_customers(branch_id: str | None = None) -> list[dict]:
 # ── focused views: one category, one product, one cashier, one day, one supplier ──
 async def products_where(period: Period, attr: str, value: str, limit: int = 100, branch_id: str | None = None) -> list[dict]:
     """The products inside one category / brand / department — what a Top Categories row opens."""
-    rows = await _in(BranchProductStat.filter(day__gte=period.start, day__lte=period.end), branch_id)
-    wanted = (value or "").strip().lower()
-    agg: dict[str, dict] = {}
-    for r in rows:
-        actual = (getattr(r, attr) or "Unclassified").strip().lower()
-        if actual != wanted:
-            continue
-        row = agg.setdefault(r.product_sku, {
-            "sku": r.product_sku, "name": r.product_name, "category": r.category,
-            "brand": r.brand, "department": r.department, "qty": D0, "netSales": D0, "cogs": D0,
-        })
-        row["qty"] += r.qty or D0
-        row["netSales"] += r.net_sales or D0
-        row["cogs"] += r.cogs or D0
-    for row in agg.values():
-        row["grossProfit"] = row["netSales"] - row["cogs"]
-        row["marginPercent"] = _money(row["grossProfit"] / row["netSales"] * 100) if row["netSales"] else D0
-    return sorted(agg.values(), key=lambda r: r["netSales"], reverse=True)[:limit]
+    column = _GROUPABLE.get(attr)
+    if not column:
+        raise ValueError(f"cannot pick Items by {attr!r}: only {', '.join(sorted(_GROUPABLE))}")
+    where, args = _scope_sql(period, branch_id)
+    rows = await _grouped(f'''
+        SELECT ps."product_sku" AS sku, MAX(ps."product_name") AS name,
+               MAX(ps."category") AS category, MAX(ps."brand") AS brand,
+               MAX(ps."department") AS department,
+               SUM(CAST(ps."qty" AS REAL)) AS qty,
+               SUM(CAST(ps."net_sales" AS REAL)) AS net_sales,
+               SUM(CAST(ps."cogs" AS REAL)) AS cogs
+          FROM "branch_product_stats" ps
+         WHERE {where}
+           AND LOWER(TRIM(COALESCE(NULLIF(TRIM(COALESCE(ps."{column}", '')), ''), 'Unclassified'))) = ?
+         GROUP BY ps."product_sku"
+         ORDER BY SUM(CAST(ps."net_sales" AS REAL)) DESC
+    ''', args + [(value or "").strip().lower()])
+    out = []
+    for r in rows[:limit]:
+        net, cogs = _sum(r["net_sales"]), _sum(r["cogs"])
+        profit = net - cogs
+        out.append({"sku": r["sku"], "name": r["name"], "category": r["category"], "brand": r["brand"],
+                    "department": r["department"], "qty": _sum(r["qty"]), "netSales": net, "cogs": cogs,
+                    "grossProfit": profit,
+                    "marginPercent": _money(profit / net * 100) if net else D0})
+    return out
 
 
 async def product_days(period: Period, sku: str, branch_id: str | None = None) -> tuple[list[dict], dict]:
@@ -932,6 +1321,15 @@ async def product_day_people(period: Period, sku: str, branch_id: str | None = N
     return out
 
 
+# One day's drill-down lists what sold, and "what sold" has to mean all of it. It was capped at 20, which on
+# 1 October showed 20 Items of the 2,182 that sold while the day's total above it was the whole 2.4 million: the
+# list looked like the answer and was a twentieth of it. The fold is already done by the time the limit is applied,
+# so asking for every Item costs nothing measurable (0.02s against 0.03s). The cap that remains is a ceiling on the
+# size of one response, not a view: no day has come near it, and if one ever does the count on the card says so.
+DAY_ITEMS = 5000
+DAY_PEOPLE = 200
+
+
 async def day_detail(day_iso: str, branch_id: str | None = None) -> dict:
     """Everything about one trading day — what a row in the daily breakdown opens into."""
     try:
@@ -942,8 +1340,8 @@ async def day_detail(day_iso: str, branch_id: str | None = None) -> dict:
     return {
         "day": day_iso,
         "hours": await hourly_profile(one, branch_id),
-        "cashiers": await cashier_ranking(one, limit=20, branch_id=branch_id),
-        "products": await top_products(one, limit=20, branch_id=branch_id),
+        "cashiers": await cashier_ranking(one, limit=DAY_PEOPLE, branch_id=branch_id),
+        "products": await top_products(one, limit=DAY_ITEMS, branch_id=branch_id),
         "tenders": await tender_mix(one, branch_id),
         "closes": await till_closes(one, branch_id=branch_id),
         "totals": await totals_for(one, branch_id),
@@ -1006,11 +1404,18 @@ async def _branch_codes() -> dict[str, str]:
 
 async def _item_info(period: Period) -> dict[str, dict]:
     """Names and taxonomy by sku. The per-person rows carry only the sku; the item rows carry the rest."""
-    info: dict[str, dict] = {}
-    for r in await BranchProductStat.filter(day__gte=period.start, day__lte=period.end):
-        info[r.product_sku] = {"name": r.product_name, "category": r.category or "Unclassified", "brand": r.brand or "Unclassified",
-                               "department": r.department or "Unclassified"}
-    return info
+    # One row per sku, not one per Item-day: this read every one of them to keep the last, which for a year is
+    # 1.8 million rows fetched to build a dictionary of about 68,000.
+    rows = await _grouped('''
+        SELECT ps."product_sku" AS sku, MAX(ps."product_name") AS name,
+               MAX(ps."category") AS category, MAX(ps."brand") AS brand, MAX(ps."department") AS department
+          FROM "branch_product_stats" ps
+         WHERE ps."day" >= ? AND ps."day" <= ?
+         GROUP BY ps."product_sku"
+    ''', [period.start.isoformat(), period.end.isoformat()])
+    return {r["sku"]: {"name": r["name"], "category": r["category"] or "Unclassified",
+                       "brand": r["brand"] or "Unclassified",
+                       "department": r["department"] or "Unclassified"} for r in rows}
 
 
 def _profit(row: dict) -> dict:

@@ -26,6 +26,11 @@ class Totals(BaseModel):
     units: str
     valueAtCost: str
     origin: Origin
+    # Whether `origin` is a measurement or an absence. A branch that reports its own movements knows how much of
+    # its shelf came from the godown, from another branch, and from its own buying; a Multi-Tec shop loaded by the
+    # nightly import does not, because their stock report carries a quantity and a cost and no provenance. Both
+    # cases arrive here as three zeros, and a screen cannot tell them apart without this.
+    originKnown: bool = False
     receivedFromWarehouse: str
     receivedFromBranches: str
     sold: str

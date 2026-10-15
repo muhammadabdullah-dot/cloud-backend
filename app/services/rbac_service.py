@@ -106,6 +106,24 @@ async def list_roles() -> list[Role]:
     return await Role.all().order_by("name")
 
 
+async def _a_branch_to_buy_for(branch_id) -> str | None:
+    """The branch an account may buy for, checked before it is stored.
+
+    Head office is refused as well as an unknown id. It has a row in `branches` because it needs one -- it owns
+    the HO book, the godown's stock is held against it -- but it is not a shop, and an account scoped to head
+    office would mean "may buy only for the godown", which is what an unscoped account already is. Letting it
+    through would create an account whose scope reads as a restriction and does nothing.
+    """
+    wanted = str(branch_id or "").strip() or None
+    if wanted is None:
+        return None
+    from app.models.branch import selling_branches
+
+    if not await selling_branches().filter(id=wanted).exists():
+        raise RbacError("That branch doesn't exist, or it is head office, which is the godown itself.", status=422)
+    return wanted
+
+
 async def create_user(data: UserCreate, caller: User | None = None) -> User:
     """Creates the account AND materializes its role's permission template into real
     UserPermission rows — the same thing the seed does. Without that second half the new user can
@@ -133,6 +151,7 @@ async def create_user(data: UserCreate, caller: User | None = None) -> User:
 
     user = await User.create(
         name=data.name, email=data.email, password_hash=hash_password(data.password), role_id=data.roleId,
+        po_branch_id=await _a_branch_to_buy_for(data.poBranchId),
     )
     for resource, actions in sorted(wanted.items()):
         if actions:
@@ -201,6 +220,10 @@ async def update_user(user_id: str, data: UserUpdate, caller: User) -> User | No
         user.password_hash = hash_password(fields["password"])
     if "poLimit" in fields:
         user.po_limit = fields["poLimit"]
+    # `in fields` and not a truth test, so sending it as null is how a scope is REMOVED. A PATCH that does not
+    # name it leaves whatever scope the account has, which is what a PATCH means.
+    if "poBranchId" in fields:
+        user.po_branch_id = await _a_branch_to_buy_for(fields["poBranchId"])
 
     await user.save()
     return user

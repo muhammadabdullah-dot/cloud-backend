@@ -21,6 +21,17 @@ class PeriodOut(BaseModel):
     start: date
     end: date
     compareLabel: str
+    # The window as moments, filled only when a time was picked. Null means whole days, which is every request a
+    # screen made before this existed, so nothing that sends dates sees any change.
+    atStart: datetime | None = None
+    atEnd: datetime | None = None
+    # Where the figures came from: "day" is the folded daily rows, as always; "bills" means a time was picked and
+    # they were rebuilt from the documents instead.
+    basis: str = "day"
+    # The figures in this answer that could NOT follow the time and are given for the whole days the window
+    # touches. Empty unless `basis` is "bills". A screen should mark these rather than show a day's cash beside an
+    # hour's sales; `core/when.GRAIN` carries the same list as prose, and `/meta/date-filters` hands it over.
+    wholeDay: list[str] = []
 
 
 class KpiDelta(BaseModel):
@@ -105,6 +116,26 @@ class KpiListOut(BaseModel):
     notBuilt: list[NotBuiltOut]
 
 
+class KpiSectionOut(BaseModel):
+    """One section's tiles and charts, and everything the page around them needs.
+
+    The dashboard asks for each section separately so a slow one does not hold up the rest and a failed one fails in
+    its own corner. It carries the period selector's options, the branch list and the business date too, so the page
+    needs no separate request before the figures: whichever section answers first furnishes the chrome, and the
+    cheapest is asked for first. A round trip to be told what the sections are is a round trip to learn something
+    the page already knows.
+    """
+    section: str
+    label: str
+    period: PeriodOut
+    periods: list[PeriodOut] = []
+    businessDate: date | None = None
+    asOf: datetime | None = None
+    items: list[KpiOut]
+    charts: list[ChartOut] = []
+    notBuilt: list[NotBuiltOut] = []
+
+
 class SeriesPoint(BaseModel):
     day: str
     value: Money
@@ -165,7 +196,7 @@ class KpiDetailOut(BaseModel):
     focusLabel: str | None = None
     parentKpi: str | None = None
     parentLabel: str | None = None
-    # The whole way back up when it is more than one step (Best Salesperson > Hina Malik > this item).
+    # The whole way back up when it is more than one step (Best Cashier > Hina Malik > this item).
     # When set, it replaces parentKpi/parentLabel in the breadcrumb.
     trail: list[Crumb] = []
     headline: KpiOut

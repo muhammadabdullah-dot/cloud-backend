@@ -137,9 +137,13 @@ async def books(user: User = Depends(_any_screen)) -> list[dict]:
 
     names = {b.code: b.name for b in await Branch.all()}
     today = shop_day()
+    # Every book's balances in one query. Asking per book summed each book's whole history and took 23 seconds
+    # across five, which the client gives up on at 15 -- and a failed books call is why the book switcher showed
+    # Head Office and nothing else.
+    batched = await accounts_reports_service.sums_by_book(codes, today)
     out = []
     for code in codes:
-        summary = await accounts_reports_service.book_summary(code, today)
+        summary = await accounts_reports_service.book_summary(code, today, batched.get(code, {}))
         out.append({**summary, "name": "Head Office" if code == HEAD_OFFICE_BOOK else names.get(code, code), "readOnly": code != HEAD_OFFICE_BOOK})
     return out
 
@@ -272,7 +276,7 @@ class ReasonIn(BaseModel):
 @router.get("/vouchers")
 async def list_vouchers(
     type: str | None = None, status_: str | None = Query(None, alias="status"), auto: bool | None = None,
-    from_: date | None = Query(None, alias="from"), to: date | None = None, q: str | None = None, accountId: str | None = None,
+    from_: datetime | None = Query(None, alias="from"), to: datetime | None = None, q: str | None = None, accountId: str | None = None,
     accountKind: str | None = None, limit: int = 50, offset: int = 0, book: str | None = None, sort: str | None = None,
     order: str | None = None, user: User = Depends(_vouchers),
 ) -> dict:
@@ -346,14 +350,23 @@ async def reverse_voucher(voucher_id: str, payload: ReasonIn, user: User = Depen
 # ── reports ────────────────────────────────────────────────────────────────────────────────────
 
 @router.get("/ledger")
-async def ledger(accountId: str, from_: date | None = Query(None, alias="from"), to: date | None = None, pdc: bool = False, user: User = Depends(_ledger)) -> dict:
+async def ledger(accountId: str, from_: date | None = Query(None, alias="from"), to: date | None = None, pdc: bool = False,
+                 book: str | None = None,
+                 # Left out, the whole ledger comes back, which is what this always did. Their busiest account
+                 # holds 2,580,863 lines across the five books and took 207 seconds that way, so a caller showing
+                 # a table should ask for a page. The answer carries `total` either way.
+                 limit: int | None = Query(None, ge=1, le=2000),
+                 offset: int = Query(0, ge=0),
+                 user: User = Depends(_ledger)) -> dict:
     await accounts_posting_service.ensure_recent()
     start, end = _range(from_, to)
     account = await Account.get_or_none(id=accountId)
+    # `book` decides the scope: one book reads that book's copy, ALL reads every copy of the same account together.
+    # Permission is still checked against the account that was asked for, and against the books the scope covers.
+    books, _ = await _books_for(user, book or (account.book if account else None))
     if account:
-        await _books_for(user, account.book)
         await _guard(accounts_areas.check_ledger, await access_of(user), account)
-    return await _guard(accounts_reports_service.ledger, accountId, start, end, pdc)
+    return await _guard(accounts_reports_service.ledger, accountId, start, end, pdc, books, limit, offset)
 
 
 @router.get("/trial-balance")
@@ -382,6 +395,7 @@ async def month_by_month(from_: date | None = Query(None, alias="from"), to: dat
     books, _together = await _books_for(user, book)
     await accounts_posting_service.ensure_recent()
     end = to or shop_day()
+    chosen = from_ is not None
     if from_:
         start = from_
     else:
@@ -390,7 +404,15 @@ async def month_by_month(from_: date | None = Query(None, alias="from"), to: dat
     if start > end:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "The start date is after the end date.")
     if (end.year - start.year) * 12 + end.month - start.month >= 24:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick up to 24 months.")
+        # The ceiling is for a range somebody asked for. When nobody has, the page opens on "books start to this
+        # month", and head office's books start 2024-06-04 -- 28 months, so the screen's own default was refused
+        # and it opened on a red "Couldn't load the months" before anyone had chosen anything. Worse, it was going
+        # to stay broken and get further out every month. So a range nobody picked is shortened to the newest 23
+        # months rather than refused, and only a range somebody typed is sent back to be narrowed.
+        if chosen:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick up to 24 months.")
+        whole = end.month - 1 - 23
+        start = date(end.year + whole // 12, whole % 12 + 1, 1)
     return await accounts_reports_service.month_by_month(books, start, end)
 
 
@@ -403,7 +425,7 @@ async def balance_sheet(asOf: date | None = None, book: str | None = None, user:
 
 
 @router.get("/day-book")
-async def day_book(from_: date | None = Query(None, alias="from"), to: date | None = None, type: str | None = None, limit: int = 100, offset: int = 0,
+async def day_book(from_: datetime | None = Query(None, alias="from"), to: datetime | None = None, type: str | None = None, limit: int = 100, offset: int = 0,
                    book: str | None = None, user: User = Depends(_day_book)) -> dict:
     books, _ = await _books_for(user, book)
     await accounts_posting_service.ensure_recent()

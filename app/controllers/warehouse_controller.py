@@ -5,6 +5,7 @@ and user id into a readable label. It exists because the alternative — letting
 ids against whatever it cached — produces tables full of bare codes as soon as the catalog is
 bigger than one page. Resolve once here, and every screen reads properly for free.
 """
+from decimal import Decimal
 from dataclasses import dataclass, field
 
 from fastapi import HTTPException, status
@@ -227,6 +228,12 @@ def _grn_out(g: GRN, names: _Names) -> GRNOut:
         binId=str(g.bin_id), binLabel=names.bin_label(str(g.bin_id)), gstMode=g.gst_mode,
         advanceTax=g.advance_tax, approved=g.approved, receivedByUserId=uid,
         receivedByName=names.user(uid), at=g.at, lines=lines,
+        # Only a receipt just taken carries this; one read back from the list has no such attribute, and an
+        # empty list is the right answer there -- the transfers it caused are on the transfers board, not here.
+        sentOn=[
+            {**row, "qty": format(row["qty"].quantize(Decimal("0.001")).normalize(), "f")}
+            for row in (getattr(g, "sent_on", None) or [])
+        ],
     )
 
 

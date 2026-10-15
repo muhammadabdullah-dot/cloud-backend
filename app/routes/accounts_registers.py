@@ -7,7 +7,7 @@ used to live only on the branch server and belong here, where the accountant sit
 Every filter on the old software's own dialogs is a query parameter here, named for what it does rather than for
 what their form calls it, and the crosswalk document records which is which.
 """
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -16,10 +16,34 @@ from pydantic import BaseModel
 from app.middlewares.auth import require_any_permission, require_permission
 from app.models import Account, User
 from app.routes.accounts import _books_for, _guard, _range
-from app.services import accounts_posting_service, accounts_registers_service, bank_rec_service, cheques_service
+from app.services import (
+    accounts_posting_service, accounts_registers_service, bank_rec_service, bill_reports_service,
+    cheques_service, purchase_report_service,
+)
 from app.services.accounts_reports_service import shop_day
 
 Day = date
+# A bound that may carry a time. Annotating it `datetime` is what makes one filter control work on every screen: a
+# bare "2026-10-01" still parses, as midnight, so a screen sending dates today is unaffected. The three bill
+# registers use it because a bill carries the moment it was rung, and the three that LIST voucher entries now use
+# it too, because `acc_vouchers.at` carries the moment their ledger recorded for 1,100,573 of 1,134,868 vouchers.
+# The registers that state a BALANCE stay on Day: a voucher with no moment drops out of a timed window, which a
+# list can report and a balance cannot survive. `core/when.GRAIN` and `core/when.voucher_bound` hold that line.
+# The upper bound's midnight means the END of that day -- core/when.end_instant.
+Moment = datetime
+
+
+def _moment_range(from_: datetime | None, to: datetime | None,
+                  default_days: int = 0) -> tuple[datetime | None, datetime]:
+    """`_range`, keeping any time that was asked for.
+
+    The default end is the shop's day, which has no time, so a range nobody narrowed still means whole days.
+    """
+    end = to or datetime.combine(shop_day(), time(0, 0))
+    start = from_ if from_ else (end - timedelta(days=default_days) if default_days else None)
+    if start and start > end:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The start of the range is after its end.")
+    return start, end
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -30,7 +54,8 @@ _cheques_act = require_permission("accounts.cheques", "X")
 _rec_read = require_any_permission(("accounts.bank-reconciliation", "R"), ("accounts.registers", "R"))
 _rec_write = require_permission("accounts.bank-reconciliation", "W")
 
-ERRORS = (accounts_registers_service.RegisterError, cheques_service.ChequeError, bank_rec_service.BankRecError)
+ERRORS = (accounts_registers_service.RegisterError, cheques_service.ChequeError, bank_rec_service.BankRecError,
+          bill_reports_service.BillReportError)
 
 
 async def _run(call, *args, **kwargs):
@@ -126,7 +151,7 @@ async def account_summary(from_: Day | None = Query(None, alias="from"), to: Day
 
 
 @router.get("/registers/voucher-detail")
-async def voucher_detail(from_: Day | None = Query(None, alias="from"), to: Day | None = None,
+async def voucher_detail(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
                          kinds: str | None = None, forUser: str | None = None, limit: int = 500, offset: int = 0,
                          book: str | None = None, user: User = Depends(_registers)) -> dict:
     """Their Voucher Detail Report. `kinds` is their ten tickboxes, comma separated; leaving it off means all ten."""
@@ -139,7 +164,7 @@ async def voucher_detail(from_: Day | None = Query(None, alias="from"), to: Day 
 
 
 @router.get("/registers/date-wise-payment")
-async def date_wise_payment(from_: Day | None = Query(None, alias="from"), to: Day | None = None,
+async def date_wise_payment(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
                             suppliers: str | None = None, book: str | None = None,
                             user: User = Depends(_registers)) -> dict:
     """Their Date Wise Payment: what went out to suppliers, cash kept apart from cheque."""
@@ -150,7 +175,7 @@ async def date_wise_payment(from_: Day | None = Query(None, alias="from"), to: D
 
 
 @router.get("/registers/date-wise-receipt")
-async def date_wise_receipt(from_: Day | None = Query(None, alias="from"), to: Day | None = None,
+async def date_wise_receipt(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
                             customers: str | None = None, area: str | None = None, subArea: str | None = None,
                             category: str | None = None, book: str | None = None,
                             user: User = Depends(_registers)) -> dict:
@@ -373,3 +398,72 @@ async def rec_reopen(rec_id: str, user: User = Depends(_rec_write)) -> dict:
 async def rec_discard(rec_id: str, user: User = Depends(_rec_write)) -> dict:
     await _run(bank_rec_service.discard, rec_id)
     return {"discarded": True}
+
+# ── read off the bills head office keeps ─────────────────────────────────────────────────────────
+# Three of their Sale Report entries that needed every bill with its lines, its party and its cost of goods. Head
+# office only started keeping those this week, so these are a report rather than a rebuild.
+
+async def _books_for_bills(user: User, book: str | None) -> tuple[list[str], bool]:
+    """The books a bill report covers, defaulting to the whole company rather than head office.
+
+    Head office is the central buyer and rings no bills at all, so every bill-based register asked for its book
+    alone returns nothing in 0.0 seconds: a short circuit, not a slow query, and an empty screen with no reason
+    on it. The other registers read the books, which head office does have, so their default is right and this
+    one is not. Asked for explicitly, any book still answers for itself.
+    """
+    if book:
+        return await _books_for(user, book)
+    try:
+        return await _books_for(user, "ALL")
+    except HTTPException:
+        # Without the right to see branch books there is only head office to offer, and it will be empty. That
+        # is a permission answer, not a bug, and the report says so rather than pretending.
+        return await _books_for(user, None)
+
+
+@router.get("/registers/invoice-profit")
+async def invoice_profit(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
+                         minMargin: str | None = None, maxMargin: str | None = None, party: str | None = None,
+                         limit: int = 500, offset: int = 0, book: str | None = None,
+                         user: User = Depends(_registers)) -> dict:
+    """Their Invoice Wise Profit. The margin filters are what it is for: finding the handful of bills sold at or
+    below cost among thousands, rather than reading all of them."""
+    books, _ = await _books_for_bills(user, book)
+    start, end = _moment_range(from_, to, default_days=30)
+    return await _run(bill_reports_service.invoice_profit, books, start or end, end, minMargin, maxMargin, party,
+                      min(max(limit, 1), 5000), max(offset, 0))
+
+
+@router.get("/registers/item-party-sales")
+async def item_party_sales(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
+                           party: str | None = None, sku: str | None = None, by: str = "party",
+                           limit: int = 1000, book: str | None = None,
+                           user: User = Depends(_registers)) -> dict:
+    """Their Item Party Wise Sale Detail. `by=party` is a customer's buying list; `by=item` is who buys that Item,
+    which is the question a shop asks before it stops stocking something."""
+    books, _ = await _books_for_bills(user, book)
+    start, end = _moment_range(from_, to, default_days=30)
+    return await _run(bill_reports_service.item_party_sales, books, start or end, end, party, sku, by,
+                      min(max(limit, 1), 5000))
+
+
+@router.get("/registers/party-category-sales")
+async def party_category_sales(from_: Moment | None = Query(None, alias="from"), to: Moment | None = None,
+                               book: str | None = None, user: User = Depends(_registers)) -> dict:
+    """Their Party Category Wise Sale. The category rides on the account head office keeps for that customer."""
+    books, _ = await _books_for_bills(user, book)
+    start, end = _moment_range(from_, to, default_days=30)
+    return await _run(bill_reports_service.party_category_sales, books, start or end, end)
+
+
+@router.get("/registers/excess-short-purchase")
+async def excess_short_purchase(from_: Day | None = Query(None, alias="from"), to: Day | None = None,
+                                supplier: str | None = None, onlyVariances: bool = True, tolerance: str = "0",
+                                user: User = Depends(_registers)) -> dict:
+    """Their Excess And Short Purchase: ordered against received, line by line.
+
+    Head office's own buying, so it takes no book. A supplier quietly ten per cent short every month costs more than
+    the discount they gave, and a purchase summary never shows it because it only ever counts what arrived.
+    """
+    start, end = _range(from_, to, default_days=90)
+    return await _run(purchase_report_service.excess_and_short, start, end, supplier, onlyVariances, tolerance)

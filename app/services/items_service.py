@@ -8,17 +8,23 @@ every sale or retail price change is logged.
 """
 import asyncio
 import io
+import os
+import zipfile
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
+from openpyxl.cell.cell import ERROR_CODES, ILLEGAL_CHARACTERS_RE
+from openpyxl.compat import safe_string
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import IllegalCharacterError
 from tortoise.expressions import Q
 from tortoise.transactions import atomic
 
+from app.core import dialect
 from app.core.ordering import by_column
 from app.core.pk_time import now_pk
 from app.models import (
@@ -26,7 +32,7 @@ from app.models import (
 )
 from app.schemas.import_result import ImportRowError, ImportSummary
 from app.schemas.items import ItemAliasIn, ItemCreate, ItemSupplierIn, ItemUpdate
-from app.services import media_service, price_history_service
+from app.services import item_sync_service, media_service, price_history_service
 from app.services.import_service import cell_bool, cell_str_any, parse_rows, row_error
 
 
@@ -198,6 +204,9 @@ async def update(product_id: str, data: ItemUpdate, user: User | None = None) ->
     if not product:
         raise ItemError("Item not found", status=404)
     before = price_history_service.snapshot(product)
+    # Taken before the save, so only what genuinely moved goes down to the branches. See item_sync_service:
+    # a price decided here used to reach nobody, and somebody had to retype it at every till.
+    shared_before = item_sync_service.shared_snapshot(product)
     await _refuse_switched_off(data.model_dump(exclude_unset=True), {
         "department": product.department, "category": product.category, "itemClass": product.item_class,
         "subclass": product.subclass, "manufacturer": product.manufacturer, "brand": product.brand,
@@ -226,6 +235,7 @@ async def update(product_id: str, data: ItemUpdate, user: User | None = None) ->
         product.needs_details = False
     await product.save()
     await price_history_service.record(product, before, "form", None, user)
+    await item_sync_service.publish_changes(product, shared_before)
     return product
 
 
@@ -605,7 +615,93 @@ def _plain(value: Any) -> Any:
         return str(value)
 
 
-def _write_xlsx(rows: list[dict], columns: list[Column]) -> bytes:
+# ── writing the workbook ───────────────────────────────────────────────────────────────────────
+#
+# WHY THE DATA ROWS ARE WRITTEN AS XML AND THE REST IS NOT
+# --------------------------------------------------------
+# The Item master is 67,804 rows of 23 columns. openpyxl's write-only mode still builds a `Cell` object for every
+# value and hands it to an XML serialiser one element at a time, and with about 1.16 million non-empty cells that was
+# where this endpoint's time went. The workbook alone, reads excluded, measured on their data:
+#
+#     openpyxl write_only   17.62s          these rows spliced in as XML   2.78s
+#
+# openpyxl is still what writes the file. It produces the workbook with the header row and nothing else -- the content
+# types, the relationships, the styles behind the bold header, the column widths, the frozen top row -- and the data
+# rows are written into its `sheetData` on the way through the zip, streamed, so nothing holds 30 MB of XML at once.
+#
+# So the only hand-written part of the format is the one shape that repeats a million times, and `_cell_xml` is not an
+# approximation of it: it reproduces openpyxl's own bytes. `scripts/check_items_export.py` is that claim, kept runnable.
+# It writes the whole 67,804 row sheet both ways and compares `xl/worksheets/sheet1.xml` character for character, and
+# then does the same for the cases that look like nothing until a legacy Item name hits one: a name beginning with "="
+# (openpyxl stores that as a formula, not as text), a name that is an Excel error code, outer whitespace
+# (`xml:space="preserve"`) against inner whitespace (which needs nothing), a newline, and the control characters
+# openpyxl refuses outright. Run it after touching either function, after changing `_EXPORT_COLUMNS`, or after
+# upgrading openpyxl.
+_SHEET_COLUMNS = tuple(get_column_letter(index) for index in range(1, 80))
+
+
+def _escape(text: str) -> str:
+    """Element text as the serialiser this replaces would have written it.
+
+    Two things, both copied rather than chosen. ElementTree's `_escape_cdata`, which et_xmlfile calls, escapes `&`,
+    `<` and `>` and nothing else, in that order. And openpyxl writes the sheet through a text-mode file, so a newline
+    inside a cell comes out as the platform's line ending: `\\r\\n` on Windows, `\\n` elsewhere. `os.linesep` is what
+    that file object translates to, so using it here is what keeps the two byte for byte on either platform.
+    """
+    if "&" in text:
+        text = text.replace("&", "&amp;")
+    if "<" in text:
+        text = text.replace("<", "&lt;")
+    if ">" in text:
+        text = text.replace(">", "&gt;")
+    if "\n" in text and os.linesep != "\n":
+        text = text.replace("\n", os.linesep)
+    return text
+
+
+def _cell_xml(ref: str, value: Any) -> str:
+    """One `<c>` element, as openpyxl's write-only sheet writes it.
+
+    The branches are openpyxl's own type inference (`Cell._bind_value`), kept in the same order it applies them.
+    """
+    if isinstance(value, str):
+        # A string is truncated at Excel's limit and control characters are refused, both as openpyxl does.
+        text = value[:32767]
+        if next(ILLEGAL_CHARACTERS_RE.finditer(text), None):
+            raise IllegalCharacterError(f"{text} cannot be used in worksheets.")
+        if len(text) > 1 and text.startswith("="):
+            # openpyxl reads this as a formula: no type on the cell, `<f>` without the leading "=", and then the empty
+            # `<v />` it adds because it falls through to writing a value it has already set aside.
+            return f'<c r="{ref}"><f>{_escape(text[1:])}</f><v /></c>'
+        if text in ERROR_CODES:
+            return f'<c r="{ref}" t="e"><v>{_escape(text)}</v></c>'
+        if text == "":
+            # A space before the slash: that is how et_xmlfile closes an element with nothing in it.
+            return f'<c r="{ref}" t="inlineStr" />'
+        # `xml:space="preserve"` only when there is outer whitespace around something, which is the condition
+        # openpyxl's `whitespace()` applies -- not merely when the text has a space in it.
+        stripped = text.strip()
+        space = ' xml:space="preserve"' if stripped and text != stripped else ""
+        return f'<c r="{ref}" t="inlineStr"><is><t{space}>{_escape(text)}</t></is></c>'
+    if isinstance(value, bool):
+        # Before the numeric branch: a bool is an int in Python and a type of its own to Excel.
+        return f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>'
+    return f'<c r="{ref}" t="n"><v>{safe_string(value)}</v></c>'
+
+
+def _row_xml(number: int, values: list) -> str:
+    """One `<row>`. A cell with no value is left out altogether, which is what openpyxl does with an unstyled
+    empty cell, and is why the file is 1.16 million cells and not 1.56 million."""
+    parts = [f'<row r="{number}">']
+    for index, value in enumerate(values):
+        if value is not None:
+            parts.append(_cell_xml(f"{_SHEET_COLUMNS[index]}{number}", value))
+    parts.append("</row>")
+    return "".join(parts)
+
+
+def _header_only_workbook(columns: list[Column]) -> tuple[bytes, str]:
+    """The workbook openpyxl writes with the titles and nothing under them, and the path of its sheet inside the zip."""
     workbook = Workbook(write_only=True)
     sheet = workbook.create_sheet("Items")
     for index, (_, _, width) in enumerate(columns, start=1):
@@ -617,31 +713,69 @@ def _write_xlsx(rows: list[dict], columns: list[Column]) -> bytes:
         cell.font = Font(bold=True)
         header.append(cell)
     sheet.append(header)
-    for row in rows:
-        sheet.append([_plain(getter(row)) for _, getter, _ in columns])
     out = io.BytesIO()
     workbook.save(out)
+    content = out.getvalue()
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        sheets = [name for name in archive.namelist() if name.startswith("xl/worksheets/") and name.endswith(".xml")]
+    if len(sheets) != 1:
+        raise RuntimeError(f"expected one worksheet in the workbook, found {sheets}")
+    return content, sheets[0]
+
+
+def _write_xlsx(rows: list[dict], columns: list[Column]) -> bytes:
+    skeleton, sheet_path = _header_only_workbook(columns)
+    getters = [getter for _, getter, _ in columns]
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(skeleton)) as src, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        head, closed, tail = src.read(sheet_path).decode("utf-8").partition("</sheetData>")
+        if not closed:
+            raise RuntimeError("the header workbook has no sheetData to write the Items into")
+        for entry in src.infolist():
+            if entry.filename != sheet_path:
+                dst.writestr(entry, src.read(entry.filename))
+        with dst.open(sheet_path, "w") as sheet:
+            sheet.write(head.encode("utf-8"))
+            # In batches, so the join stays small and the zip gets steady work rather than one 30 MB write.
+            batch: list[str] = []
+            for number, row in enumerate(rows, start=2):
+                batch.append(_row_xml(number, [_plain(getter(row)) for getter in getters]))
+                if len(batch) >= 2000:
+                    sheet.write("".join(batch).encode("utf-8"))
+                    batch.clear()
+            if batch:
+                sheet.write("".join(batch).encode("utf-8"))
+            sheet.write((closed + tail).encode("utf-8"))
     return out.getvalue()
 
 
 async def export_xlsx(include_costs: bool = True) -> tuple[bytes, str]:
-    """The whole Item master as a workbook, read in chunks and written on a worker thread. Without
-    `include_costs` the Average cost column is left out."""
+    """The whole Item master as a workbook, written on a worker thread. Without `include_costs` the Average cost
+    column is left out.
+
+    WHY THE ITEMS ARE READ IN ONE GO
+    --------------------------------
+    This paged through them 2,000 at a time with `.offset(n).limit(2000)`, which reads as being gentle and is the
+    opposite. `OFFSET` is not a position the database can jump to: with 67,804 Items it sorted the whole table by
+    name on all 34 passes and threw away everything before the offset, so the last pages cost the most and the work
+    was quadratic. Measured, the reads alone:
+
+        34 paged reads   about 22s, and 373s once while the machine was busy        one read   1.72s
+
+    One read also needs no `asyncio.sleep(0)` between pages to let the event loop breathe, because the fetch itself
+    is awaited on a worker thread by the ODBC driver.
+
+    The `ORDER BY` stays in SQL and is not done here. `products.name` collates `Latin1_General_100_CI_AS_SC_UTF8`,
+    which is case insensitive, and Python sorts by code point, so sorting here would put "apple" and "Apple" in a
+    different order than every other screen does and quietly reorder the file.
+    """
     columns = [c for c in _EXPORT_COLUMNS if include_costs or c[0] != "Average cost"]
     aliases: dict[str, list[str]] = {}
     for product_id, code in await ProductAlias.all().values_list("product_id", "code"):
         aliases.setdefault(product_id, []).append(code)
-    rows: list[dict] = []
-    offset = 0
-    while True:
-        chunk = await Product.all().order_by("name", "id").offset(offset).limit(2000).values(*_EXPORT_FIELDS)
-        for row in chunk:
-            row["alias_codes"] = ", ".join(aliases.get(row["id"], [])) or None
-        rows.extend(chunk)
-        if len(chunk) < 2000:
-            break
-        offset += 2000
-        await asyncio.sleep(0)
+    rows = await Product.all().order_by("name", "id").values(*_EXPORT_FIELDS)
+    for row in rows:
+        row["alias_codes"] = ", ".join(aliases.get(row["id"], [])) or None
     content = await asyncio.to_thread(_write_xlsx, rows, columns)
     return content, f"godown-items-{now_pk():%Y%m%d-%H%M}.xlsx"
 
@@ -671,8 +805,23 @@ async def latest_branch_lists() -> list[dict]:
 
     from app.models import Branch
 
+    # The newest complete run per branch, ranked rather than grouped.
+    #
+    # This read `SELECT branch_id, snapshot_id, MAX(completed_at) GROUP BY branch_id`, which works on SQLite because
+    # it has a documented extension: a bare column beside MAX comes from the row that produced the maximum. No other
+    # engine has it, and SQL Server refuses the statement outright ("snapshot_id is invalid in the select list"). It
+    # was also only ever true by convention here, never stated. ROW_NUMBER says which row is wanted and why, runs on
+    # both engines, and breaks a tie the same way every time instead of arbitrarily.
     rows = await Tortoise.get_connection("default").execute_query_dict(
-        "SELECT branch_id, snapshot_id, MAX(completed_at) AS done FROM branch_snapshot_runs WHERE status = 'complete' GROUP BY branch_id", [],
+        """
+        SELECT branch_id, snapshot_id, completed_at AS done
+          FROM (SELECT branch_id, snapshot_id, completed_at,
+                       ROW_NUMBER() OVER (PARTITION BY branch_id
+                                          ORDER BY completed_at DESC, snapshot_id DESC) AS rank_in_branch
+                  FROM branch_snapshot_runs
+                 WHERE status = 'complete') ranked
+         WHERE rank_in_branch = 1
+        """, [],
     )
     ids = [str(r["branch_id"]) for r in rows]
     branches = {str(b.id): b for b in await Branch.filter(id__in=ids, status="active")} if ids else {}
@@ -689,9 +838,9 @@ async def branch_rows(lists: list[dict], terms: list[str] | None = None, skus: l
 
     if not lists or (not terms and not skus):
         return []
-    where = ["(" + " OR ".join("(s.branch_id = ? AND s.snapshot_id = ?)" for _ in lists) + ")"]
+    where = ["(" + " OR ".join(f"(s.branch_id = {dialect.mark()} AND s.snapshot_id = {dialect.mark('varchar(60)')})" for _ in lists) + ")"]
     params: list = [v for entry in lists for v in (entry["branchId"], entry["snapshotId"])]
-    order = "s.product_name COLLATE NOCASE"
+    order = dialect.nocase("s.product_name")
     if skus:
         where.append(f"s.product_sku IN ({','.join('?' * len(skus))})")
         params += skus
@@ -700,12 +849,18 @@ async def branch_rows(lists: list[dict], terms: list[str] | None = None, skus: l
         params += [f"%{_escaped(term)}%", f"%{_escaped(term)}%"]
     tail: list = []
     if terms:
+        # An exact code match first, then a name that starts with the whole phrase, then everything else by name.
+        # Written as CASE rather than `(s.product_sku = ?) DESC`: SQLite sorts the comparison as 0 or 1, while SQL
+        # Server has no boolean to sort and refuses the statement with "Incorrect syntax near '='".
         whole = " ".join(terms)
-        order = f"(s.product_sku = ?) DESC, (s.product_name LIKE ? ESCAPE '{_ESC}') DESC, {order}"
+        order = (f"CASE WHEN s.product_sku = {dialect.mark('varchar(60)')} THEN 0 ELSE 1 END, "
+                 f"CASE WHEN s.product_name LIKE ? ESCAPE '{_ESC}' THEN 0 ELSE 1 END, {order}")
         tail = [whole, f"{_escaped(whole)}%"]
     sql = (
-        "SELECT s.branch_id, s.product_sku, s.product_name, s.department, s.category, s.brand, s.qty, s.avg_cost, s.price "
-        f"FROM branch_product_stock s WHERE {' AND '.join(where)} ORDER BY {order} LIMIT {int(limit)}"
+        "SELECT s.branch_id, s.product_sku, s.product_name, s.department, s.category, "
+        "s.brand, s.qty, s.avg_cost, s.price "
+        f"FROM branch_product_stock s WHERE {' AND '.join(where)} ORDER BY {order} "
+        f"{dialect.limit_offset(limit, 0)}"
     )
     return await Tortoise.get_connection("default").execute_query_dict(sql, params + tail)
 
@@ -820,10 +975,12 @@ async def _next_company_sku() -> str:
             highest = max(highest, int(sku))
     lists = await latest_branch_lists()
     if lists:
-        pairs = " OR ".join("(branch_id = ? AND snapshot_id = ?)" for _ in lists)
+        pairs = " OR ".join(f"(branch_id = {dialect.mark()} AND snapshot_id = {dialect.mark('varchar(60)')})" for _ in lists)
         rows = await Tortoise.get_connection("default").execute_query_dict(
             f"SELECT MAX(CAST(product_sku AS INTEGER)) AS top FROM branch_product_stock WHERE ({pairs}) "
-            "AND length(product_sku) BETWEEN 1 AND 7 AND product_sku NOT GLOB '*[^0-9]*'",
+            f"AND LEN(product_sku) BETWEEN 1 AND 7 AND {dialect.all_digits('product_sku')}"
+            if dialect.engine() == dialect.MSSQL else
+            f"AND length(product_sku) BETWEEN 1 AND 7 AND {dialect.all_digits('product_sku')}",
             [v for entry in lists for v in (entry["branchId"], entry["snapshotId"])],
         )
         highest = max(highest, int((rows[0]["top"] if rows else 0) or 0))

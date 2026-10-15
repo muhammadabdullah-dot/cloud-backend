@@ -85,6 +85,11 @@ class BranchSale(models.Model):
         # One bill per number per branch: a document sent twice updates rather than doubling, which is what makes
         # both a retried event and a replayed window safe.
         unique_together = (("branch", "invoice_number"),)
+        # The executive figures are folded from these rows whenever a window carries a time
+        # (`executive_service._totals_from_bills`), and that fold filters on the moment, not the day. Without this
+        # the unique index above is no help -- it leads on `invoice_number` -- and a timed dashboard scans all
+        # 1,067,857 rows. Branch first because every fold either names one branch or sweeps them all.
+        indexes = (("branch", "at"),)
         ordering = ["-at"]
 
 

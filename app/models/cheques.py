@@ -45,7 +45,7 @@ class Cheque(models.Model):
     direction = fields.CharField(max_length=10, default="received")
     # The customer it came from, or the supplier it was written to.
     party_account: fields.ForeignKeyRelation["Account"] = fields.ForeignKeyField(  # noqa: F821
-        "models.Account", related_name="cheques", on_delete=fields.RESTRICT
+        "models.Account", related_name="cheques", on_delete=fields.NO_ACTION
     )
     # The bank account it was deposited into, or is drawn on. Null while a received cheque is still in the drawer.
     bank_account: fields.ForeignKeyNullableRelation["Account"] = fields.ForeignKeyField(  # noqa: F821

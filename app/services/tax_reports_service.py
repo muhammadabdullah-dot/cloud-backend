@@ -17,6 +17,7 @@ from decimal import Decimal
 from tortoise import Tortoise
 from tortoise.transactions import atomic
 
+from app.core import dialect
 from app.models import HEAD_OFFICE_BOOK, Account, User, Voucher
 from app.services import accounts_areas, vouchers_service
 from app.services.accounts_chart_service import gid, money
@@ -84,7 +85,7 @@ async def _entries(account_ids: list[str], start: date | None, end: date) -> lis
     """Posted lines on the accounts, oldest first, with their voucher."""
     if not account_ids:
         return []
-    where, params = ["v.status = 'posted'", f"l.account_id IN ({','.join('?' for _ in account_ids)})", "v.date <= ?"], [*account_ids, end.isoformat()]
+    where, params = ["v.status = 'posted'", f"l.account_id IN ({dialect.marks(account_ids)})", "v.date <= ?"], [*account_ids, end.isoformat()]
     if start:
         where.append("v.date >= ?")
         params.append(start.isoformat())
@@ -105,7 +106,7 @@ async def _entries(account_ids: list[str], start: date | None, end: date) -> lis
 async def _balances(account_ids: list[str], before: date | None = None, upto: date | None = None) -> dict[str, Decimal]:
     if not account_ids:
         return {}
-    where, params = ["v.status = 'posted'", f"l.account_id IN ({','.join('?' for _ in account_ids)})"], list(account_ids)
+    where, params = ["v.status = 'posted'", f"l.account_id IN ({dialect.marks(account_ids)})"], list(account_ids)
     if before:
         where.append("v.date < ?")
         params.append(before.isoformat())
@@ -330,7 +331,7 @@ async def withholding(books: list[str], together: bool, start: date, end: date) 
             part = purchase_ids[chunk:chunk + 400]
             for s in await _query(
                 "SELECT l.voucher_id, a.id AS account_id, a.book, a.code, a.name FROM acc_voucher_lines l JOIN acc_accounts a ON a.id = l.account_id "
-                f"WHERE a.kind = 'supplier' AND l.voucher_id IN ({','.join('?' for _ in part)})", part,
+                f"WHERE a.kind = 'supplier' AND l.voucher_id IN ({dialect.marks(part)})", part,
             ):
                 suppliers[str(s["voucher_id"])] = {"id": str(s["account_id"]), "code": s["code"], "book": s["book"],
                                                    "name": f"{s['book']} · {s['name']}" if together else s["name"]}

@@ -159,6 +159,16 @@ class GRNOut(BaseModel):
     receivedByUserId: str | None = None
     receivedByName: str | None = None
     at: datetime
+    # What this receipt sent straight on to a branch, which is only ever filled for an order raised wholly for
+    # one branch -- the pharmacy short road. Empty on every ordinary receipt, including one whose order records a
+    # per-branch split on its lines, because that split is attribution and the godown dispatches it later.
+    #
+    #   [{ "transferId": "...", "transferNumber": "TR-0010", "branchId": "...", "branchCode": "FC",
+    #      "branchName": "Fort Colony", "qty": "50", "lines": 1 }]
+    #
+    # An entry with `failed` set and no `transferNumber` means the stock is received and still in the godown, and
+    # the transfer has to be raised by hand. The receipt itself stands: the goods did arrive.
+    sentOn: list[dict] = []
     lines: list[GRNLineOut]
 
 

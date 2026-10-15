@@ -19,6 +19,10 @@ class OrderLineIn(BaseModel):
     productId: str
     qty: Decimal = Field(gt=0)
     unitCost: Decimal = Field(ge=0)
+    # The branch this quantity is for, or null for the godown's own stock. The same Item may appear on several
+    # lines as long as each names a different branch, which is how one order of 100 becomes 40 for one branch, 40
+    # for another and 20 kept.
+    forBranchId: str | None = None
 
 
 class OrderIn(BaseModel):
@@ -27,6 +31,10 @@ class OrderIn(BaseModel):
     expectedAt: datetime | None = None
     notes: str | None = Field(default=None, max_length=255)
     reason: str | None = Field(default=None, max_length=120)
+    # The branch this order is for. Left out, it is the godown, which is every ordinary central order. An account
+    # scoped to one branch (`users.po_branch`) has its own filled in for it, and asking for another is refused
+    # rather than quietly corrected.
+    forBranchId: str | None = None
 
 
 class NoteIn(BaseModel):
@@ -41,6 +49,9 @@ class OrderLineOut(BaseModel):
     qty: str
     unitCost: str
     receivedQty: str
+    # Who this line's quantity was bought for. Null is the godown's own stock.
+    forBranchId: str | None = None
+    forBranchCode: str | None = None
     # Added while buying and still waiting for someone to complete its details on the Item form.
     needsDetails: bool = False
 
@@ -64,12 +75,32 @@ class OrderOut(BaseModel):
     autoApproved: bool
     decisionNote: str | None = None
     closedAt: datetime | None = None
+    # Who the order is for, when the WHOLE order is for one branch. Null on a central order and on a split one,
+    # where the answer is per line -- see `branchSplit`.
+    forBranchId: str | None = None
+    forBranchCode: str | None = None
+    forBranchName: str | None = None
+    # Each branch's share of this order, biggest first, with the godown's own remainder last. **Empty means the
+    # whole order is the godown's**, which is how a screen tells "central" from "split" without adding anything up.
+    #   [{ "branchId": "...", "branchCode": "FC", "branchName": "Fort Colony",
+    #      "qty": "40", "value": "4000.00", "lines": 1 }, ...]
+    branchSplit: list[dict] = []
     lines: list[OrderLineOut]
 
 
 class OrderListOut(BaseModel):
     items: list[OrderOut]
     total: int
+    # How many each filter on the page would show, so the Segmented control can label itself. Without it the
+    # page opens on Open, shows 61 drafts out of 859 orders with "0 of N" received on every row, and gives the
+    # reader no way to tell a broken figure from a filter. See `purchasing_service.order_counts`.
+    counts: dict[str, int] = {}
+    # Set when the person asking may buy for one branch only. The list is already narrowed to it, so a screen
+    # should name that branch and not offer the branch filter at all.
+    scopedToBranchId: str | None = None
+    # What this answer actually holds, so a pager can tell 'page 1 of 35' from 'all of them'.
+    limit: int = 0
+    offset: int = 0
 
 
 class LowStockOut(BaseModel):
@@ -79,6 +110,21 @@ class LowStockOut(BaseModel):
     onHand: str
     reorderLevel: str
     avgCost: str
+
+
+class SuggestionBranchOut(BaseModel):
+    """One branch's side of a suggested line: what it sells, what it has, and how long that lasts.
+
+    `daysLeft` is null when the branch holds the Item but has not sold any in the window, which is a different
+    thing from lasting forever and is why it is not sent as a very large number.
+    """
+    branchId: str
+    branchCode: str
+    branchName: str
+    ratePerDay: str
+    held: str
+    onTheWay: str
+    daysLeft: str | None = None
 
 
 class SuggestionLineOut(BaseModel):
@@ -99,11 +145,18 @@ class SuggestionLineOut(BaseModel):
     # Why it's on the list: "received from them", "ordered from them", "on the Item's supplier list", "running low".
     why: str
     needsDetails: bool = False
+    # Which branches this quantity is for, most urgent first. A branch appears here when it sells the Item or
+    # holds it, so a line can have none at all: a godown Item no branch has reported either way.
+    branches: list[SuggestionBranchOut] = []
 
 
 class SuggestionsOut(BaseModel):
     supplierId: str | None = None
     supplierName: str | None = None
+    # Set when the question was asked for one branch rather than for the godown.
+    branchId: str | None = None
+    branchCode: str | None = None
+    branchName: str | None = None
     coverDays: int
     salesDays: int
     # How many Items the rules found; at most 300 are sent.
@@ -175,22 +228,44 @@ def _q(v: Decimal) -> str:
     return "0" if text in ("-0", "") else text
 
 
+def _who(user, recorded_name: str | None) -> str:
+    """Who did it, from the account that did it or from the name their old software recorded.
+
+    Legacy documents have no Cloud App account to point at: they were raised in Multi-Tec by people who are
+    branch staff here, so the foreign key is null by design and the name rides alongside as text. Dereferencing
+    the key without checking returned 500 on every page of /warehouse/purchase-orders the moment the godown's
+    809 legacy orders loaded, because the very first row is one of them.
+    """
+    if user is not None:
+        return user.name
+    return recorded_name or "Imported from Multi-Tec"
+
+
 async def _out(po: PurchaseOrder) -> OrderOut:
     from app.models import Product
 
     products = {p.id: p for p in await Product.filter(id__in=[l.product_id for l in po.lines])}
     return OrderOut(
         id=str(po.id), number=po.po_number, supplierId=str(po.supplier_id), supplierName=po.supplier.name, status=po.status,
-        reason=po.reason, expectedAt=po.expected_at, notes=po.notes, total=purchasing_service.money(po.total), raisedBy=po.raised_by.name,
+        reason=po.reason, expectedAt=po.expected_at, notes=po.notes, total=purchasing_service.money(po.total), raisedBy=_who(po.raised_by, po.raised_by_name),
         raisedById=str(po.raised_by_id), raisedAt=po.raised_at, submittedAt=po.submitted_at,
-        approvedBy=po.approved_by.name if po.approved_by else None, approvedAt=po.approved_at, autoApproved=po.auto_approved,
+        approvedBy=_who(po.approved_by, getattr(po, 'approved_by_name', None)), approvedAt=po.approved_at, autoApproved=po.auto_approved,
         decisionNote=po.decision_note, closedAt=po.closed_at,
+        forBranchId=str(po.for_branch_id) if po.for_branch_id else None,
+        forBranchCode=po.for_branch.code if po.for_branch_id and po.for_branch else None,
+        forBranchName=po.for_branch.name if po.for_branch_id and po.for_branch else None,
+        branchSplit=[
+            {**row, "qty": _q(row["qty"]), "value": purchasing_service.money(row["value"])}
+            for row in await purchasing_service.branch_split(po)
+        ],
         lines=[
             OrderLineOut(
                 productId=str(l.product_id), productName=products[l.product_id].name if l.product_id in products else None,
                 productSku=products[l.product_id].sku if l.product_id in products else None,
                 unit=products[l.product_id].unit if l.product_id in products else None,
                 qty=_q(l.qty), unitCost=purchasing_service.money(l.unit_cost), receivedQty=_q(l.received_qty),
+                forBranchId=str(l.for_branch_id) if l.for_branch_id else None,
+                forBranchCode=l.for_branch.code if l.for_branch_id and l.for_branch else None,
                 needsDetails=bool(products[l.product_id].needs_details) if l.product_id in products else False,
             )
             for l in sorted(po.lines, key=lambda x: x.position)
@@ -203,9 +278,23 @@ def _fail(exc: purchasing_service.PurchasingError) -> HTTPException:
 
 
 @router.get("/purchase-orders", response_model=OrderListOut)
-async def list_orders(status: str | None = None, q: str | None = None, limit: int = 50, offset: int = 0, user: User = Depends(_read)) -> OrderListOut:
-    rows, total = await purchasing_service.list_orders(status, q, limit, offset)
-    return OrderListOut(items=[await _out(po) for po in rows], total=total)
+async def list_orders(status: str | None = None, q: str | None = None, limit: int = 50, offset: int = 0,
+                      branch: str | None = None, user: User = Depends(_read)) -> OrderListOut:
+    """`total` is how many match the filter, which is not how many come back: `limit` is capped at
+    `purchasing_service.MAX_ORDERS_PER_REQUEST`. A caller that shows `total` beside the rows it received has to
+    page, or it tells the reader there are 861 while holding 200.
+
+    `branch` is a branch id, for the orders raised for that branch, or the word `godown` for the ones raised for
+    no branch, which is every ordinary central order. Left out, the list is every order.
+
+    `scopedToBranchId` on the answer is set when the person asking may only buy for one branch. When it is set
+    the list is already narrowed to it and `branch` is ignored, so a screen should show that branch's name and
+    not offer the filter at all.
+    """
+    rows, total = await purchasing_service.list_orders(status, q, limit, offset, branch, user)
+    return OrderListOut(items=[await _out(po) for po in rows], total=total, limit=limit, offset=max(offset, 0),
+                        counts=await purchasing_service.order_counts(),
+                        scopedToBranchId=await purchasing_service.scope_of(user))
 
 
 @router.get("/purchase-orders/my-limit", response_model=MyLimitOut)
@@ -226,18 +315,25 @@ async def low_stock(user: User = Depends(_read)) -> list[LowStockOut]:
 
 
 @router.get("/purchase-orders/suggestions", response_model=SuggestionsOut)
-async def suggestions(supplierId: str | None = None, coverDays: int = 30, excludeOrderId: str | None = None, user: User = Depends(_write)) -> SuggestionsOut:
+async def suggestions(supplierId: str | None = None, coverDays: int = 30, excludeOrderId: str | None = None,
+                      branch: str | None = None, user: User = Depends(_write)) -> SuggestionsOut:
     """With `supplierId`: the Items bought from that supplier before, each with a suggested quantity and the working in
-    words. Without it: the godown Items running low. `excludeOrderId` leaves the order being changed out of "on order"."""
+    words. Without it: the godown Items running low. `excludeOrderId` leaves the order being changed out of "on order".
+
+    With `branch`, the question becomes what that one branch is running out of, measured on its own sales, its own
+    shelves and what is already on its way to it. The branch still does not buy; this is what head office should
+    be buying for it. Either way every line carries `branches`, which is who the quantity is for.
+    """
     from app.services.rbac_service import can_see_costs
 
     try:
-        found = await purchasing_service.suggestions(supplierId, coverDays, excludeOrderId)
+        found = await purchasing_service.suggestions(supplierId, coverDays, excludeOrderId, branch)
     except purchasing_service.PurchasingError as exc:
         raise _fail(exc) from exc
     costs = await can_see_costs(user)
     return SuggestionsOut(
         supplierId=found["supplierId"], supplierName=found["supplierName"], coverDays=found["coverDays"], salesDays=found["salesDays"],
+        branchId=found["branchId"], branchCode=found["branchCode"], branchName=found["branchName"],
         count=found["count"], rule=found["rule"],
         lines=[
             SuggestionLineOut(
@@ -246,6 +342,15 @@ async def suggestions(supplierId: str | None = None, coverDays: int = 30, exclud
                 reorderLevel=_q(l["reorderLevel"]) if l["reorderLevel"] is not None else None, branchesHold=_q(l["branchesHold"]),
                 suggestedQty=_q(l["suggestedQty"]), unitCost=purchasing_service.money(l["unitCost"]) if costs else "0.00",
                 reason=l["reason"], why=l["why"], needsDetails=l["needsDetails"],
+                branches=[
+                    SuggestionBranchOut(
+                        branchId=b["branchId"], branchCode=b["branchCode"], branchName=b["branchName"],
+                        ratePerDay=_q(Decimal(b["ratePerDay"]).quantize(Decimal("0.001"))), held=_q(b["held"]),
+                        onTheWay=_q(b["onTheWay"]),
+                        daysLeft=_q(Decimal(b["daysLeft"]).quantize(Decimal("0.1"))) if b["daysLeft"] is not None else None,
+                    )
+                    for b in l["branches"]
+                ],
             )
             for l in found["lines"]
         ],
@@ -264,7 +369,9 @@ async def get_order(order_id: str, user: User = Depends(_read)) -> OrderOut:
 async def create_order(payload: OrderIn, user: User = Depends(_write)) -> OrderOut:
     try:
         po = await purchasing_service.create_order(
-            user, payload.supplierId, [(l.productId, l.qty, l.unitCost) for l in payload.lines], payload.expectedAt, payload.notes, payload.reason,
+            user, payload.supplierId,
+            [(l.productId, l.qty, l.unitCost, l.forBranchId) for l in payload.lines],
+            payload.expectedAt, payload.notes, payload.reason, payload.forBranchId,
         )
     except purchasing_service.PurchasingError as exc:
         raise _fail(exc) from exc
@@ -275,7 +382,11 @@ async def create_order(payload: OrderIn, user: User = Depends(_write)) -> OrderO
 async def update_order(order_id: str, payload: OrderIn, user: User = Depends(_write)) -> OrderOut:
     try:
         po = await purchasing_service.update_order(
-            user, order_id, payload.supplierId, [(l.productId, l.qty, l.unitCost) for l in payload.lines], payload.expectedAt, payload.notes, payload.reason,
+            # The line's branch travels on an edit too. Without it, editing a split order for any reason -- a
+            # changed quantity, a corrected cost -- would quietly flatten every line back to the godown.
+            user, order_id, payload.supplierId,
+            [(l.productId, l.qty, l.unitCost, l.forBranchId) for l in payload.lines],
+            payload.expectedAt, payload.notes, payload.reason,
         )
     except purchasing_service.PurchasingError as exc:
         raise _fail(exc) from exc

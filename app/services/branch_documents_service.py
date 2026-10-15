@@ -113,7 +113,8 @@ async def apply_sale(branch: Branch, data: dict) -> str:
         lines = data.get("lines") or []
         await BranchSaleLine.bulk_create([
             BranchSaleLine(
-                sale=sale, line_no=int(l.get("lineNo") or i + 1),
+                sale=sale, # A line numbered 0 is a line, not a missing number: `or` here turned a bill numbered 0, 1 into 1, 1.
+                line_no=int(l["lineNo"]) if l.get("lineNo") is not None else i + 1,
                 product_sku=_text(l.get("productSku"), 40) or "?",
                 product_name=_text(l.get("productName"), 200), department=_text(l.get("department"), 80),
                 qty=_dec(l.get("qty")), unit_price=_dec(l.get("unitPrice")),
@@ -163,7 +164,8 @@ async def apply_return(branch: Branch, data: dict) -> str:
         lines = data.get("lines") or []
         await BranchReturnLine.bulk_create([
             BranchReturnLine(
-                return_record=record, line_no=int(l.get("lineNo") or i + 1),
+                return_record=record, # A line numbered 0 is a line, not a missing number: `or` here turned a bill numbered 0, 1 into 1, 1.
+                line_no=int(l["lineNo"]) if l.get("lineNo") is not None else i + 1,
                 product_sku=_text(l.get("productSku"), 40) or "?",
                 product_name=_text(l.get("productName"), 200),
                 qty=_dec(l.get("qty")), unit_price=_dec(l.get("unitPrice")),
@@ -202,7 +204,8 @@ async def apply_fbr_invoice(branch: Branch, data: dict) -> str:
         lines = data.get("lines") or []
         await BranchFbrInvoiceLine.bulk_create([
             BranchFbrInvoiceLine(
-                invoice=row, line_no=int(l.get("lineNo") or i + 1),
+                invoice=row, # A line numbered 0 is a line, not a missing number: `or` here turned a bill numbered 0, 1 into 1, 1.
+                line_no=int(l["lineNo"]) if l.get("lineNo") is not None else i + 1,
                 product_sku=_text(l.get("productSku"), 40), product_name=_text(l.get("productName"), 200),
                 hs_code=_text(l.get("hsCode"), 40), qty=_dec(l.get("qty")),
                 unit_price=_dec(l.get("unitPrice")), disc_amount=_dec(l.get("discAmount")),
@@ -251,6 +254,11 @@ async def replace_window(branch: Branch, start: date, end: date, sales: list[dic
         await apply_return(branch, row)
     for row in fbr:
         await apply_fbr_invoice(branch, row)
+
+    # Documents have changed, so anything the dashboard remembered about this window is stale.
+    from app.services import query_cache
+
+    query_cache.clear()
 
     return {
         "branch": branch.code, "from": start.isoformat(), "to": end.isoformat(),

@@ -43,8 +43,10 @@ class Product(models.Model):
     remarks = fields.CharField(max_length=255, null=True)
     picture = fields.CharField(max_length=160, null=True)
     # Legacy Child And Parent: `parent_qty` of this Item make one `parent`.
+    # NO ACTION: SQL Server refuses a self-referencing SET NULL outright. Nothing is lost, because no Item is
+    # ever deleted here; one no longer sold is switched off, the same rule the supplier list states for itself.
     parent: fields.ForeignKeyNullableRelation["Product"] = fields.ForeignKeyField(
-        "models.Product", related_name="children", null=True, on_delete=fields.SET_NULL
+        "models.Product", related_name="children", null=True, on_delete=fields.NO_ACTION
     )
     parent_qty = fields.DecimalField(max_digits=12, decimal_places=3, null=True)
     # At or below this much in the godown, with nothing on order, the Item shows as running low.

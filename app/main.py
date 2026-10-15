@@ -108,6 +108,8 @@ app.include_router(maintenance_router)
 app.include_router(client_errors_router)
 from app.routes.technical_reports import router as technical_reports_router  # noqa: E402
 app.include_router(technical_reports_router)
+from app.routes.dashboards import router as dashboards_router
+app.include_router(dashboards_router)
 
 register_tortoise(app, config=TORTOISE_ORM, generate_schemas=False, add_exception_handlers=True)
 

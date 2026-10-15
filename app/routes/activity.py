@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from tortoise.expressions import Q
 
 from app.middlewares.auth import require_any_permission
-from app.models import Branch, BranchActivity, User
+from app.models import Branch, BranchActivity, User, failed_at_branch
 
 router = APIRouter(prefix="/branches", tags=["activity"])
 _read = require_any_permission(("admin.sync-endpoints", "R"), ("executive.branches", "R"))
@@ -26,6 +26,9 @@ class ActivityOut(BaseModel):
     status: int
     detail: dict | list | None = None
     deviceId: str | None = None
+    # The reference the person at the branch was shown, where this row is a failure. Pulled out of the
+    # detail so a screen can offer it to read down the phone without digging through the payload.
+    errorId: str | None = None
 
 
 class ActivityListOut(BaseModel):
@@ -53,17 +56,24 @@ async def branch_activity(
     to: datetime | None = None,
     limit: int = 100,
     offset: int = 0,
+    failures: bool = False,
     sort: str | None = None,
     order: str | None = None,
     caller: User = Depends(_read),
 ) -> ActivityListOut:
     """Newest first unless `sort` names a column (see SORTS) and `order` is asc or desc. `user` is the person's id at
-    that branch; `q` searches the action, the person and the path."""
+    that branch; `q` searches the action, the person and the path.
+
+    `failures` narrows it to what went wrong there -- see `failed_at_branch`. Worth its own switch rather than a
+    search term: a branch records hundreds of ordinary actions a day, and a broken screen somebody is on the
+    phone about is not findable by scrolling past them."""
     if not await Branch.exists(id=branch_id):
         raise HTTPException(404, "No such branch")
     qs = BranchActivity.filter(branch_id=branch_id)
     if user:
         qs = qs.filter(user_id=user)
+    if failures:
+        qs = qs.filter(failed_at_branch())
     if q:
         qs = qs.filter(Q(action__icontains=q) | Q(user_name__icontains=q) | Q(path__icontains=q))
     if from_:
@@ -78,6 +88,7 @@ async def branch_activity(
         ActivityOut(
             id=str(r.id), at=r.at, userId=r.user_id, userName=r.user_name, userTitle=r.user_title, action=r.action,
             method=r.method, route=r.route, path=r.path, params=r.params, status=r.status_code, detail=r.detail, deviceId=r.device_id,
+            errorId=(r.detail or {}).get("errorId") if isinstance(r.detail, dict) else None,
         )
         for r in rows
     ])

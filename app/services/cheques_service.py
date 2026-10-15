@@ -109,6 +109,11 @@ def payload(cheque: Cheque, lines: list[ChequeLine] | None = None) -> dict:
 
 # ── the register ─────────────────────────────────────────────────────────────────────────────────
 
+# The most cheques one call will read, and therefore the most parameters its prefetch can ever ask for.
+# Well under SQL Server's 2,100: see the note in `register`.
+MAX_PAGE = 500
+
+
 async def register(books: list[str], direction: str | None = None, date_basis: str = "due",
                    start: date | None = None, end: date | None = None, posted: str | None = None,
                    finalized: str | None = None, cancelled: bool | None = None, status: str | None = None,
@@ -129,7 +134,13 @@ async def register(books: list[str], direction: str | None = None, date_basis: s
         raise ChequeError(f"Sort on one of: {', '.join(SORTS)}.")
     posted, finalized = _tristate("Posted", posted), _tristate("Finalized", finalized)
 
-    qs = Cheque.filter(book__in=books).prefetch_related("party_account", "bank_account", "lines")
+    # No prefetch here. This queryset is the WHOLE matching set, which is what the counts and the three totals
+    # are taken over, and it is only the page that gets its party, bank and lines fetched with it. Prefetching on
+    # the whole set builds `WHERE cheque_id IN (...)` with one parameter per cheque, and SQL Server refuses a
+    # statement above 2,100 of them: at 4,055 cheques this register answered "The register didn't load" with
+    # "COUNT field incorrect or syntax error", which names neither the limit nor the cause. One book worked only
+    # because the biggest, HO, holds 2,015 -- eighty-five short of breaking on its own.
+    qs = Cheque.filter(book__in=books)
     if direction:
         qs = qs.filter(direction=direction)
     column = DATE_BASIS[date_basis]
@@ -158,16 +169,33 @@ async def register(books: list[str], direction: str | None = None, date_basis: s
         if value:
             qs = qs.filter(**{field: value})
 
-    rows = await qs.order_by(SORTS[sort_on], "number")
-    total = sum((money(c.amount) for c in rows), ZERO)
-    # The two figures somebody reads this report for: what is still to come, and what is already overdue.
+    # The totals over the WHOLE register, read as three narrow columns and added here.
+    #
+    # Not `annotate(Sum(...))`: this file's neighbours say why, and SQL Server refuses it outright anyway --
+    # "Cannot perform an aggregate function on an expression containing an aggregate or a subquery". And not a
+    # second hand-built WHERE clause in raw SQL either, which would mean one filter written twice and two places
+    # for it to drift apart; a total that quietly stops matching the rows beneath it is worse than one that is
+    # slow. So: one queryset, one filter, and the only thing read for the totals is amount, status and date.
+    # No joins and no prefetch, which is what blew the parameter ceiling before.
     today = date.today()
-    outstanding = sum((money(c.amount) for c in rows if c.status == "pending"), ZERO)
-    overdue = sum((money(c.amount) for c in rows if c.status == "pending" and c.cheque_date < today), ZERO)
+    figures = await qs.values_list("amount", "status", "cheque_date")
+    total = sum((money(a) for a, _s, _d in figures), ZERO)
+    # The two figures somebody reads this report for: what is still to come, and what is already overdue.
+    outstanding = sum((money(a) for a, s, _d in figures if s == "pending"), ZERO)
+    overdue = sum((money(a) for a, s, d in figures if s == "pending" and d < today), ZERO)
+
+    # Only the page is read with its party, its bank and its lines. A page is MAX_PAGE at most, so the prefetch
+    # asks for that many parameters however big the register grows.
+    rows = await (
+        qs.order_by(SORTS[sort_on], "number", "id")
+        .offset(max(offset, 0)).limit(max(min(limit, MAX_PAGE), 1))
+        .prefetch_related("party_account", "bank_account", "lines")
+    )
     return {
         "direction": direction, "dateBasis": date_basis, "sortOn": sort_on,
         "start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
-        "count": len(rows), "rows": [payload(c, list(c.lines)) for c in rows[offset:offset + limit]],
+        "count": len(figures), "limit": limit, "offset": max(offset, 0),
+        "rows": [payload(c, list(c.lines)) for c in rows],
         "totals": {"amount": format(total, "f"), "outstanding": format(outstanding, "f"),
                    "overdue": format(overdue, "f")},
     }

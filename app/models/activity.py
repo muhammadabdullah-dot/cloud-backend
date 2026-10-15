@@ -4,6 +4,7 @@ A branch writes one row for every sale, price change, count, till close, access 
 and sends it here. Head office keeps them all, so any activity at any branch can be traced to a person.
 """
 from tortoise import fields, models
+from tortoise.expressions import Q
 
 
 class BranchActivity(models.Model):
@@ -30,3 +31,26 @@ class BranchActivity(models.Model):
 
     class Meta:
         table = "branch_activities"
+
+
+# The path a branch's browser errors arrive on (the branch's own routes/client_errors.py).
+CLIENT_ERROR_PATH = "/client-errors"
+
+
+def failed_at_branch() -> Q:
+    """What counts as a failure at a branch, for every screen and report that lists them.
+
+    Two shapes, because the two are genuinely different events and are marked differently:
+
+      * **The branch server could not answer.** The row carries its own 5xx. This covers a till, a report, a
+        sign-in, and the branch's own background work -- its scheduler and nightly jobs write a row with no
+        user and no device and a status of 500, which is the only way work nobody was watching can be seen
+        from here at all.
+      * **A screen broke in the browser.** That arrives as a *successful* POST to /client-errors -- the report
+        worked, the screen did not -- so the status says 204 and the path is what identifies it.
+
+    Both carry `detail.errorId`: the reference the person at the branch was shown, and the same reference in
+    that branch's own log file. It is what turns "it said 7KQ2-M9XD" on the phone into the entry that explains
+    it, which matters because nobody can open that machine.
+    """
+    return Q(status_code__gte=500) | Q(path=CLIENT_ERROR_PATH)

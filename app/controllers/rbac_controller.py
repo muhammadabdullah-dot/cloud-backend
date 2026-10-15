@@ -15,7 +15,8 @@ from app.services import rbac_service
 
 
 def _to_summary(u: User) -> UserSummaryOut:
-    return UserSummaryOut(id=str(u.id), name=u.name, email=u.email, roleId=u.role_id, active=u.active, poLimit=None if u.po_limit is None else format(u.po_limit.quantize(Decimal('0.01')), 'f'))
+    return UserSummaryOut(id=str(u.id), name=u.name, email=u.email, roleId=u.role_id, active=u.active, poLimit=None if u.po_limit is None else format(u.po_limit.quantize(Decimal('0.01')), 'f'),
+                          poBranchId=str(u.po_branch_id) if u.po_branch_id else None)
 
 
 def resources() -> list[str]:

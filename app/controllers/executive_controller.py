@@ -9,8 +9,8 @@ The KPI list comes from the Executive Dashboard section of the ERP blueprint (St
 MVP is returned in `notBuilt` rather than silently dropped or faked.
 """
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel
@@ -25,6 +25,7 @@ from app.schemas.executive import (
     KpiDetailOut as _KpiDetailOut,
     KpiListOut as _KpiListOut,
     KpiOut,
+    KpiSectionOut as _KpiSectionOut,
     NotBuiltOut,
     PeriodOut,
     SeriesPoint,
@@ -33,6 +34,7 @@ from app.schemas.executive import (
 from app.schemas.types import Money
 from app.services import analytics_service as an
 from app.services import executive_service as ex
+from app.services import technical_reports_service as tr
 
 D0 = Decimal("0")
 
@@ -73,6 +75,11 @@ class KpiListOut(_KpiListOut):
     branches: list[BranchRef] = []
 
 
+class KpiSectionOut(_KpiSectionOut):
+    branch: BranchRef | None = None
+    branches: list[BranchRef] = []
+
+
 class KpiDetailOut(_KpiDetailOut):
     branch: BranchRef | None = None
     branches: list[BranchRef] = []
@@ -108,7 +115,7 @@ class Scope:
         return self.branch.name if self.branch else "every branch"
 
 
-async def resolve_scope(period_id: str | None, start: str | None = None, end: str | None = None,
+async def resolve_scope(period_id: str | None, start: str | datetime | None = None, end: str | datetime | None = None,
                         branch: str | None = None, basis: str | None = None) -> Scope:
     try:
         period = ex.resolve_period(period_id or "30d", start=start, end=end)
@@ -148,6 +155,22 @@ def num(v: Decimal | int | None) -> str:
     return f"{v:,.0f}" if v == v.to_integral_value() else f"{v:,.2f}"
 
 
+def qty(v: Decimal | int | None) -> str:
+    """A quantity, always whole.
+
+    Their shops sell loose goods by weight, so the figures carry real fractions: 9.5 of MEDA, 1.5 of BLACK CHANA.
+    Shown as they are, a day read "13,616.72 item(s) sold", which is accurate and reads like a fault on a screen
+    whose other counts are whole. Rounded half up, so nothing ever shows as 0 that was actually sold.
+
+    This is a presentation rule only. Nothing is rounded before it is added up: the totals are summed from the exact
+    figures and rounded once, at the end, where they are written out.
+    """
+    if v is None:
+        return "0"
+    whole = Decimal(v).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{whole:,}"
+
+
 def pct(v: Decimal | float | None) -> str:
     return f"{float(v or 0):.1f}%"
 
@@ -169,11 +192,23 @@ def _money_pct(part: Decimal | None, whole: Decimal | None) -> Decimal:
 
 
 def _period_out(p: ex.Period) -> PeriodOut:
-    return PeriodOut(id=p.id, label=p.label, start=p.start, end=p.end, compareLabel=p.compare_label)
+    return PeriodOut(id=p.id, label=p.label, start=p.start, end=p.end, compareLabel=p.compare_label,
+                     atStart=p.at_start, atEnd=p.at_end,
+                     basis="bills" if p.timed else "day",
+                     wholeDay=list(ex.WHOLE_DAY_WHEN_TIMED) if p.timed else [])
 
 
 def _prev(p: ex.Period) -> ex.Period:
-    return ex.Period(p.id, p.label, p.prev_start, p.prev_end, p.prev_start, p.prev_end, p.compare_label)
+    """The window every delta is measured against, carrying the same time of day.
+
+    The times have to move with it. A window of 17:00 to 21:00 compared against the whole of the day before would
+    put four hours beside twenty-four and call the difference a fall, which is how a dashboard teaches people to
+    stop believing it. So the bounds shift by exactly the days between the two windows and keep their clock time.
+    """
+    shift = p.prev_start - p.start
+    return ex.Period(p.id, p.label, p.prev_start, p.prev_end, p.prev_start, p.prev_end, p.compare_label,
+                     at_start=p.at_start + shift if p.at_start else None,
+                     at_end=p.at_end + shift if p.at_end else None)
 
 
 # What the blueprint asks for that this MVP has no data for. Each says what module would supply
@@ -205,9 +240,34 @@ CHART_BACKED = {
 }
 
 
-async def list_kpis(period_id: str, *, start: str | None = None, end: str | None = None,
-                    branch: str | None = None) -> KpiListOut:
-    return await _grid(await resolve_scope(period_id, start, end, branch))
+async def list_kpis(period_id: str, *, start: str | datetime | None = None, end: str | datetime | None = None,
+                    branch: str | None = None, sections: str | None = None) -> KpiListOut:
+    """The whole grid, or only the sections named.
+
+    `sections` is a comma separated list of `SECTIONS` keys. Left out, every section is built, so the answer is
+    exactly what it has always been and no existing caller changes.
+
+    It exists because the one caller left is the branch page's Sales tab, which displays the Sales and Money
+    groups and nothing else -- 15 tiles of the 29 this builds. On Garden Town over all time that cost 27.41
+    seconds against 0.46 for the two groups it shows, and since this endpoint carries the client's ordinary 15
+    second timeout, the twelve month and all time views did not merely crawl, they failed.
+    """
+    wanted = None
+    if sections:
+        names = [n.strip() for n in sections.split(",") if n.strip()]
+        unknown = [n for n in names if n not in SECTIONS]
+        if unknown:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"No such section: {', '.join(unknown)}. "
+                                f"Choose from {', '.join(SECTIONS)}.")
+        wanted = names or None
+    return await _grid(await resolve_scope(period_id, start, end, branch), sections=wanted)
+
+
+async def section_for(name: str, period_id: str, *, start: str | datetime | None = None, end: str | datetime | None = None,
+                      branch: str | None = None) -> KpiSectionOut:
+    """One section, with the same period and branch handling as the whole grid."""
+    return await section(await resolve_scope(period_id, start, end, branch), name)
 
 
 # How the classification tiles read. One builder each, used by the grid and by the view the tile opens,
@@ -274,292 +334,517 @@ async def _statement(scope: Scope, start: date, end: date) -> dict:
     return await books.income_statement(wanted, together, start, end)
 
 
-async def _grid(scope: Scope, *, include_charted: bool = False) -> KpiListOut:
-    """The grid. `include_charted` returns the chart-backed KPIs too, because `kpi_detail` needs them to
-    build a headline for a drill-down that is no longer reachable from a tile, and skips the charts,
-    which a drill-down never shows."""
-    period, bid, code = scope.period, scope.branch_id, scope.code
-    prev = _prev(period)
-    now = await ex.totals_for(period, bid)
-    before = await ex.totals_for(prev, bid)
-    as_of = await ex.snapshot_as_of(bid)
-    across = f"at {scope.branch.name}" if scope.branch else "across every branch that has reported"
+async def _statement_and_before(scope: Scope, start: date, end: date, prev_start: date, prev_end: date) -> tuple[dict, dict]:
+    """Both income statements a "and what was it last period" tile needs.
 
+    Two `_statement` calls read the chart of accounts twice for the same answer. See
+    `accounts_reports_service.income_statement_pair`, which also records what was tried on the ledger itself and why
+    it was not kept.
+    """
+    from app.services import accounts_reports_service as books
+
+    wanted, together = await books.resolve_books(scope.book)
+    return await books.income_statement_pair(wanted, together, start, end, prev_start, prev_end)
+
+
+async def _grid(scope: Scope, *, include_charted: bool = False,
+                sections: list[str] | None = None) -> KpiListOut:
+    """The whole grid, every section, in one answer.
+
+    Kept because `kpi_detail` needs it and because an existing caller should not break, but it is no longer what the
+    dashboard asks for: see `section()` below and the note on `SECTIONS`.
+
+    `include_charted` returns the chart-backed KPIs too, because `kpi_detail` needs them to build a headline for a
+    drill-down that is no longer reachable from a tile, and skips the charts, which a drill-down never shows.
+    """
+    ctx = _Ctx(scope)
     items: list[KpiOut] = []
-
-    def add(**kw) -> None:
-        kw.setdefault("source", SNAPSHOT)
-        kw.setdefault("asOf", as_of)
-        kw.setdefault("ctaLabel", "See the detail")
-        items.append(KpiOut(**kw))
-
-    # ── Sales ───────────────────────────────────────────────────────────────
-    today = ex.resolve_period("today")
-    today_t = await ex.totals_for(today, bid)
-    yday_t = await ex.totals_for(_prev(today), bid)
-    add(id="sales-today", label="Today's Sales", group="Sales",
-        hint=f"Net value of everything sold today, {across}.",
-        value=today_t.net_sales, display=money(today_t.net_sales), unit="PKR",
-        sub=f"{today_t.invoices} invoice(s)",
-        delta=_delta(today_t.net_sales, yday_t.net_sales, "yesterday"))
-
-    for pid, label in (("7d", "This Week"), ("30d", "This Month"), ("ytd", "This Year")):
-        p = ex.resolve_period(pid)
-        t = await ex.totals_for(p, bid)
-        b = await ex.totals_for(_prev(p), bid)
-        add(id=f"sales-{pid}", label=label, group="Sales",
-            hint=f"Net sales over {p.label.lower()}, compared with {p.compare_label}.",
-            value=t.net_sales, display=money(t.net_sales), unit="PKR",
-            sub=f"{t.invoices} invoice(s)", delta=_delta(t.net_sales, b.net_sales, p.compare_label))
-
-    add(id="gross-profit", label="Gross Profit", group="Sales",
-        hint="Net sales minus the cost of what was sold. Expenses come off in Net Profit, from the books.",
-        value=now.gross_profit, display=money(now.gross_profit), unit="PKR",
-        sub=f"{pct(now.margin_percent)} margin",
-        delta=_delta(now.gross_profit, before.gross_profit, period.compare_label))
-
-    # Net profit comes from the books (head office's and every branch's that has synced, or one branch's
-    # own), not from the snapshot.
-    statement = await _statement(scope, period.start, period.end)
-    earlier = await _statement(scope, prev.start, prev.end)
-    net_profit = Decimal(statement["netProfit"])
-    expenses = Decimal(statement["operatingExpenses"]) + Decimal(statement["financialExpenses"])
-    add(id="net-profit", label="Net Profit", group="Sales",
-        hint=(f"From {scope.branch.name}'s own books: its net sales, less the cost of what was sold, less every expense posted to them."
-              if scope.branch else
-              "From the books: net sales, less the cost of what was sold, less every expense posted, across head office and every branch whose books have synced."),
-        value=net_profit, display=money(net_profit), unit="PKR", source=BOOKS, asOf=None,
-        sub=f"{money(expenses)} expenses", delta=_delta(net_profit, Decimal(earlier["netProfit"]), period.compare_label),
-        severity="bad" if net_profit < D0 else None, ctaLabel="See what's behind it")
-
-    add(id="avg-basket", label="Average Basket", group="Sales",
-        hint="Net sales divided by the number of invoices: what a typical customer spends per visit.",
-        value=now.avg_basket, display=money(now.avg_basket), unit="PKR",
-        sub=f"across {now.invoices} invoice(s)",
-        delta=_delta(now.avg_basket, before.avg_basket, period.compare_label))
-
-    add(id="customer-count", label="Customer Count", group="Sales",
-        hint="Bills rung in the period. Bills to named customers are counted separately below.",
-        value=Decimal(now.invoices), display=num(now.invoices), unit="count",
-        sub=f"{now.named_customers} to named customers",
-        delta=_delta(Decimal(now.invoices), Decimal(before.invoices), period.compare_label))
-
-    add(id="bills-per-hour", label="Bills Per Hour", group="Sales",
-        hint="Invoices divided by measured trading hours (the gap between each branch's first and last sale, not an assumed shift length).",
-        value=now.bills_per_hour, display=f"{float(now.bills_per_hour):.1f}", unit="rate",
-        sub=f"{float(now.trading_hours):.0f} trading hour(s)",
-        delta=_delta(now.bills_per_hour, before.bills_per_hour, period.compare_label))
-
-    # ── Money ───────────────────────────────────────────────────────────────
-    add(id="cash-position", label="Cash Position", group="Money",
-        hint="Cash taken, plus drawer top-ups, less payouts. Credit sales are excluded because they never entered a drawer.",
-        value=now.net_cash, display=money(now.net_cash), unit="PKR",
-        sub=f"{money(now.credit_sales)} on credit",
-        delta=_delta(now.net_cash, before.net_cash, period.compare_label))
-
-    overrides = await ex.discount_overrides(period, branch_id=bid)
-    override_total = sum((o["discTotal"] for o in overrides), D0)
-    approvers = {o["approvedBy"] for o in overrides if o["approvedBy"]}
-    add(id="discount-overrides", label="Discount Overrides", group="Money",
-        hint="Discounts given above a salesperson's own authority, and the manager who signed each one off. Margin given away on someone's signature.",
-        value=override_total, display=money(override_total), unit="PKR",
-        sub=f"{len(overrides)} sale(s) · {len(approvers)} approver(s)" if overrides else "none in this period",
-        severity="watch" if overrides else "good")
-
-    add(id="returns", label="Returns", group="Sales",
-        hint="Goods brought back and refunded. Returns come straight off net sales, so a rising figure is margin leaving the business.",
-        value=now.returns_value, display=money(now.returns_value), unit="PKR",
-        sub=f"{now.returns_count} return(s)",
-        delta=_delta(now.returns_value, before.returns_value, period.compare_label, higher_is_better=False),
-        severity="watch" if now.returns_value > D0 else "good")
-
-    variance_bad = abs(now.till_variance) > D0
-    add(id="till-variance", label="Till Variance", group="Money",
-        hint="Counted cash minus what the system expected, across every till close in the period.",
-        value=now.till_variance, display=money(now.till_variance), unit="PKR",
-        sub=f"{now.tills_closed} till close(s)",
-        severity="bad" if variance_bad else "good")
-
-    # ── Stock ───────────────────────────────────────────────────────────────
-    branch_stock = await ex.latest_stock_value(bid)
-    if scope.branch:
-        # One branch's floor. The godown is head office's, not the branch's, so it stays out.
-        add(id="inventory-value", label="Inventory Value", group="Stock",
-            hint=f"{scope.branch.name}'s floor, valued at sale price, as last reported.",
-            value=branch_stock, display=money(branch_stock), unit="PKR", sub="branch floor only")
-    else:
-        godown_stock = await ex.godown_stock_value()
-        add(id="inventory-value", label="Inventory Value", group="Stock",
-            hint="Branch floors plus the godown, valued at sale price. The godown half is live; the branch half is as last reported.",
-            value=branch_stock + godown_stock, display=money(branch_stock + godown_stock), unit="PKR",
-            sub=f"godown {money(godown_stock)}", source="mixed")
-
-    _, alert_totals = await ex.stock_alerts(branch_id=bid)
-    godown = await ex.godown_alerts() if not scope.branch else {"outOfStock": [], "lowStock": []}
-    oos = alert_totals.get("out-of-stock", 0) + len(godown["outOfStock"])
-    low = alert_totals.get("low-stock", 0) + len(godown["lowStock"])
-    expiring = alert_totals.get("near-expiry", 0) + alert_totals.get("expired", 0)
-    stock_source = SNAPSHOT if scope.branch else "mixed"
-
-    add(id="out-of-stock", label="Out of Stock", group="Stock",
-        hint="Lines showing zero or negative stock" + (f" at {scope.branch.name}." if scope.branch else ", across branch floors and the godown."),
-        value=Decimal(oos), display=num(oos), unit="count",
-        sub="on the branch floor" if scope.branch else f"{len(godown['outOfStock'])} in the godown",
-        severity="bad" if oos else "good", source=stock_source)
-
-    add(id="low-stock", label="Low Stock", group="Stock",
-        hint=f"Lines below {ex.LOW_STOCK_THRESHOLD} units.",
-        value=Decimal(low), display=num(low), unit="count",
-        sub="on the branch floor" if scope.branch else f"{len(godown['lowStock'])} in the godown",
-        severity="watch" if low else "good", source=stock_source)
-
-    add(id="expiring", label="Expiring & Expired", group="Stock",
-        hint="Batches already expired or within 30 days of expiry. For groceries and pharmacy this is where value is actually lost.",
-        value=Decimal(expiring), display=num(expiring), unit="count",
-        sub=f"{alert_totals.get('expired', 0)} already expired",
-        severity="bad" if alert_totals.get("expired") else ("watch" if expiring else "good"))
-
-    # ── Classification ──────────────────────────────────────────────────────
-    # Different questions about the same shelf, kept apart on purpose: which Items earn the money (ABC),
-    # which sell steadily (XYZ), both at once (the 9 boxes), which sold least or not at all, which have
-    # stopped selling (dead stock), and which move fastest (velocity). Collapsing them into one
-    # "product score" is how a flag becomes impossible to explain.
-    abc_rows, _ = await an.abc(period.start, period.end, code)
-    add(**_abc_tile(abc_rows, "sales"))
-
-    xyz_rows, xyz_cov = await an.xyz(period.start, period.end, code)
-    add(**_xyz_tile(xyz_rows, xyz_cov))
-
-    add(**_matrix_tile(an.merge_classes(abc_rows, xyz_rows)))
-
-    add(**_sold_least_tile(*await an.unsold_on_shelf(period.start, period.end, code)))
-
-    # Summary only: the tile needs three numbers, not 47,000 rows. See dead_stock_summary().
-    dead_summary = await an.dead_stock_summary(code)
-    dead_value = sum((Decimal(v["value"]) for v in dead_summary.values()), D0)
-    dead_lines = sum(v["lines"] for v in dead_summary.values())
-    add(id="dead-stock", label="Dead Stock", group="Stock",
-        hint="Stock on the shelf that nothing is pulling through: never sold, or not sold in 90+ days. Valued at cost, because that is the money actually tied up.",
-        value=dead_value, display=money(dead_value), unit="PKR",
-        sub=f"{num(dead_lines)} line(s) not moving",
-        severity="bad" if dead_lines else "good", ctaLabel="See what's stuck")
-
-    move_rows, _ = await an.movement(period.start, period.end, code)
-    fast = [r for r in move_rows if r["band"] == "fast"]
-    add(id="movement", label="Fast & Slow Moving", group="Stock",
-        hint="Units sold per trading day, banded. A shelf-space question, not a money question: a cheap line can be the fastest thing in the shop and still be C-class.",
-        value=Decimal(len(fast)), display=num(len(fast)), unit="count",
-        sub=(f"fast lines of {num(len(move_rows))}" if move_rows else "nothing sold in this period"),
-        ctaLabel="See the bands")
-
-    # ── Performance ─────────────────────────────────────────────────────────
-    products = await ex.top_products(period, limit=1, branch_id=bid)
-    add(id="top-products", label="Top Products", group="Performance",
-        hint="Ranked by net sales in the period.",
-        display=products[0]["name"] if products else "-", unit="text",
-        sub=money(products[0]["netSales"]) if products else "no sales in this period")
-
-    cats = await ex.top_by(period, "category", limit=1, branch_id=bid)
-    add(id="top-categories", label="Top Categories", group="Performance",
-        hint="Product categories ranked by net sales, using the catalog's own taxonomy.",
-        display=cats[0]["name"] if cats else "-", unit="text",
-        sub=money(cats[0]["netSales"]) if cats else "no sales in this period")
-
-    brands = await ex.top_by(period, "brand", limit=1, branch_id=bid)
-    add(id="top-brands", label="Top Brands", group="Performance",
-        hint="Brands ranked by net sales.",
-        display=brands[0]["name"] if brands else "-", unit="text",
-        sub=money(brands[0]["netSales"]) if brands else "no sales in this period")
-
-    cashiers = await ex.cashier_ranking(period, limit=1, branch_id=bid)
-    add(id="best-cashier", label="Best Salesperson", group="Performance",
-        hint="Ranked by net sales rung in the period. The person who rings the sale is the only sales attribution that exists. There is no separate commission-carrying salesperson.",
-        display=cashiers[0]["name"] if cashiers else "-", unit="text",
-        sub=f"{money(cashiers[0]['netSales'])} · {cashiers[0]['invoices']} invoice(s)" if cashiers else "no sales in this period")
-
-    staffing = await ex.staffing(period, bid)
-    latest = staffing[0] if staffing else None
-    # What the branch says it put on the counters, when it says anything; otherwise the old measure,
-    # which can only see people who rang something.
-    latest_staff = (latest["onDuty"] if latest and latest["onDuty"] is not None else (latest["traded"] if latest else 0)) or 0
-    # Sits with Sales rather than in a Performance group of its own. Once Top Products, Top
-    # Categories, Top Brands, Best Cashier and Branch Comparison became charts, Performance held
-    # exactly one tile — and a group heading over a single card is furniture, not structure. Staff
-    # on Duty belongs next to Customer Count and Bills Per Hour anyway: they are all "what did the
-    # trading day look like".
-    add(id="staffing", label="Staff on Duty", group="Sales",
-        hint="How many people were on a counter, per branch per day, and how many of them rang a sale.",
-        value=Decimal(latest_staff), display=num(latest_staff), unit="count",
-        sub=(f"on {date.fromisoformat(latest['day']):%d %b %Y} · {num(latest['traded'])} rang a sale" if latest and latest["onDuty"] is not None
-             else f"rang a sale on {date.fromisoformat(latest['day']):%d %b %Y}" if latest else "no trading days in this period"))
-
-    comparison = await ex.branch_comparison(period)
-    reporting = [b for b in comparison if b["reporting"]]
-    add(id="branch-comparison", label="Branch Comparison", group="Performance",
-        hint="Every registered branch ranked by net sales. A branch that has never reported shows as such rather than as zero.",
-        display=comparison[0]["name"] if reporting else "-", unit="text",
-        sub=f"{len(reporting)} of {len(comparison)} branch(es) reporting")
-
-    # ── Supply ──────────────────────────────────────────────────────────────
-    # The godown is head office's own, so these stay whole-company whichever branch is picked.
-    wh = await ex.warehouse_status()
-    add(id="warehouse-status", label="Warehouse Status", group="Supply",
-        hint="The godown right now: stock value, what is in flight, and what is stuck.",
-        value=wh["stockValue"], display=money(wh["stockValue"]), unit="PKR",
-        sub=f"{wh['inFlight']} in flight · {wh['disputesOpen']} dispute(s)",
-        severity="bad" if wh["disputesOpen"] else "good", source=LIVE, asOf=None)
-
-    ps = await ex.purchase_status()
-    add(id="purchase-status", label="Purchase Status", group="Supply",
-        hint="Goods received into the godown, and requisitions waiting on a decision.",
-        value=ps["receivedValue"], display=money(ps["receivedValue"]), unit="PKR",
-        sub=f"{ps['grnCount']} GRN(s) · {ps['pendingRequisitions']} requisition(s) pending",
-        severity="watch" if ps["pendingRequisitions"] else "good", source=LIVE, asOf=None)
-
-    suppliers = await ex.supplier_performance()
-    active_suppliers = [s for s in suppliers if s["receipts"]]
-    add(id="supplier-performance", label="Supplier Performance", group="Supply",
-        hint="Receipts into the godown by supplier. On-time and quality scoring need a promised date and a rejection reason, neither of which is recorded yet.",
-        display=active_suppliers[0]["name"] if active_suppliers else "-", unit="text",
-        sub=f"{len(active_suppliers)} of {len(suppliers)} supplier(s) have delivered",
-        source=LIVE, asOf=None)
-
-    # ── Health ──────────────────────────────────────────────────────────────
-    health = await ex.business_health(period, bid)
-    add(id="health-score", label="Business Health Score", group="Health",
-        hint="A weighted composite of sales trend, margin, till accuracy, stock availability, supply friction and branch reporting. Nothing here is predicted. Every component is measured.",
-        value=Decimal(health.score), display=f"{health.score}", unit="score", sub=health.band,
-        severity="good" if health.score >= 80 else ("watch" if health.score >= 60 else "bad"),
-        source="mixed")
-
-    alerts = await ex.live_alerts()
-    high = [a for a in alerts if a["severity"] == "high"]
-    add(id="live-alerts", label="Live Alerts", group="Health",
-        hint="Everything currently asking for a decision, most serious first.",
-        value=Decimal(len(alerts)), display=num(len(alerts)), unit="count",
-        sub=f"{len(high)} need attention now" if high else "nothing urgent",
-        severity="bad" if high else ("watch" if alerts else "good"), source="mixed")
-
-    branches = await ex.Branch.all()
-    never = [b for b in branches if b.status == "active" and not b.last_seen_at]
-    add(id="sync-health", label="Sync Health", group="Health",
-        hint="Which branches have reported, and how recently. A branch sends its own figures: events every couple of minutes, its whole picture every two hours.",
-        value=Decimal(len(branches) - len(never)), display=f"{len(branches) - len(never)}/{len(branches)}", unit="text",
-        sub=f"{len(never)} never reported" if never else "all branches reporting",
-        severity="watch" if never else "good", source=LIVE, asOf=None)
-
+    for name, build in SECTIONS.items():
+        if sections is not None and name not in sections:
+            continue
+        items += await build(ctx)
     return KpiListOut(
-        period=_period_out(period),
+        period=_period_out(ctx.period),
         periods=[_period_out(ex.resolve_period(p)) for p in ex.PERIOD_IDS],
         businessDate=ex.business_today(),
-        asOf=as_of,
+        asOf=await ctx.as_of(),
         items=items if include_charted else [k for k in items if k.id not in CHART_BACKED],
-        charts=[] if include_charted else await _build_charts(scope),
+        # The charts are narrowed with the tiles. Leaving them whole would have a caller asking for two sections
+        # still pay for six sections' worth of ranked pictures, which it never displays.
+        charts=[] if include_charted else await _build_charts(scope, only=set(sections) if sections else None),
         notBuilt=NOT_BUILT,
         branch=_branch_ref(scope.branch),
         branches=await _branch_refs(),
     )
 
+
+async def section(scope: Scope, name: str) -> KpiSectionOut:
+    """One section of the grid, on its own.
+
+    WHY THE DASHBOARD ASKS SECTION BY SECTION
+    -----------------------------------------
+    Every tile used to be built by one call behind one loader, so the page showed nothing until the slowest tile in
+    the slowest section finished, and a single failure took the whole dashboard with it. That was survivable while
+    the books held 76,819 lines. Their real ledger is 5,343,432, and the money section went from under a second to
+    over two minutes the day it arrived, taking Sales, Stock and everything else down with it.
+
+    So each section is its own request with its own loader. Sales appears while Money is still counting, and a
+    section that fails fails alone and says so in its own corner of the screen.
+
+    It costs a little more in total: the period totals behind Sales and Money are read once per section that wants
+    them rather than once for the page. `_Ctx` caches them within a request, and the figure that matters is how long
+    before something is on screen, not how much work the server does in all.
+    """
+    wanted = name.strip().lower()
+    build = SECTIONS.get(wanted)
+    if build is None:
+        raise ValueError(f"no section called {name!r}: it is one of {', '.join(SECTIONS)}")
+    ctx = _Ctx(scope)
+    items = await build(ctx)
+    return KpiSectionOut(
+        section=wanted,
+        label=SECTION_LABELS[wanted],
+        period=_period_out(ctx.period),
+        periods=[_period_out(ex.resolve_period(p)) for p in ex.PERIOD_IDS],
+        businessDate=ex.business_today(),
+        asOf=await ctx.as_of(),
+        notBuilt=NOT_BUILT,
+        branches=await _branch_refs(),
+        items=[k for k in items if k.id not in CHART_BACKED],
+        # Only this section's charts, and only this section's queries to build them. Rankings is nothing but
+        # charts: its five tiles are all chart-backed, so without these it would render as an empty heading.
+        charts=await _build_charts(scope, only={wanted}),
+        branch=_branch_ref(scope.branch),
+    )
+
+
+class _Ctx:
+    """What more than one section needs, read once per request rather than once per section.
+
+    The period totals are three queries and two of the six sections want them, so they are fetched when first asked
+    for and not before: Supply and Health read neither, and used to pay for both.
+    """
+
+    def __init__(self, scope: Scope, only: set[str] | None = None):
+        # `only` narrows the section to the tiles named, for a drill-down that wants exactly one of them. The
+        # dashboard itself never passes it, so a section asked for in full is built in full.
+        #
+        # WHY THIS EXISTS. A drill-down resolves its headline by building the section that owns the tile
+        # (`_headline_for`), which was already a large saving over building all thirty-six. It is not enough on the
+        # Stock section, because that section is the dashboard's most expensive and its tiles are unrelated
+        # questions: opening Stock Health, which shows Inventory Value and five rows, cost 3.24 seconds, of which
+        # 0.67 was Inventory Value and 2.20 was nine tiles the page then threw away -- XYZ analysis alone was 1.27.
+        #
+        # The filter has to be read BEFORE the query, not when the tile is appended. `c.tile` runs after the work
+        # is done, so skipping the append saves nothing; `wants`/`wants_any` are checked around the awaits.
+        self.only = only
+        self.scope = scope
+        self.period = scope.period
+        self.prev = _prev(scope.period)
+        self.bid = scope.branch_id
+        self.code = scope.code
+        self.across = f"at {scope.branch.name}" if scope.branch else "across every branch that has reported"
+        self._now = None
+        self._before = None
+        self._as_of = _UNSET
+
+    async def now(self):
+        if self._now is None:
+            self._now = await ex.totals_for(self.period, self.bid)
+        return self._now
+
+    async def before(self):
+        if self._before is None:
+            self._before = await ex.totals_for(self.prev, self.bid)
+        return self._before
+
+    async def as_of(self):
+        if self._as_of is _UNSET:
+            self._as_of = await ex.snapshot_as_of(self.bid)
+        return self._as_of
+
+    def wants(self, kpi_id: str) -> bool:
+        """Is this tile being asked for. True for everything when no filter was given."""
+        return self.only is None or kpi_id in self.only
+
+    def wants_any(self, *kpi_ids: str) -> bool:
+        """For work several tiles share: do it if any one of them is wanted."""
+        return self.only is None or any(i in self.only for i in kpi_ids)
+
+    async def tile(self, items: list, **kw) -> None:
+        kw.setdefault("source", SNAPSHOT)
+        if "asOf" not in kw:
+            kw["asOf"] = await self.as_of()
+        kw.setdefault("ctaLabel", "See the detail")
+        items.append(KpiOut(**kw))
+
+
+_UNSET = object()
+
+
+# ── the sections, one builder each ──────────────────────────────────────────
+
+async def _sales_section(c: _Ctx) -> list[KpiOut]:
+    items: list[KpiOut] = []
+    now, before, period = await c.now(), await c.before(), c.period
+
+    # The period the person actually picked, first, because the fixed tiles below cannot answer it. Pick three days,
+    # or yesterday, or a week in March, and every other tile here still reads today, this week, this month, this
+    # year. This one follows the picker.
+    #
+    # It also covers for Today's Sales, which reads zero for most of the working day: their shops send their figures
+    # once the day is closed, so until that arrives today is genuinely empty and a dashboard whose headline is
+    # today's sales shows a zero that is true and useless. Deliberately not in `_SALES_KPIS`, because the tiles in
+    # there pin their drill-down to one fixed window and the whole point of this one is that it does not.
+    if period.id != "today":
+        await c.tile(items, id=PICKED_SALES, label=f"Sales, {period.label.lower()}", group="Sales",
+                     hint=f"Net value of everything sold over {period.label.lower()}, {c.across}. "
+                          f"This is the period chosen at the top of the page, not a fixed one.",
+                     value=now.net_sales, display=money(now.net_sales), unit="PKR",
+                     sub=f"{now.invoices} invoice(s) · {qty(now.items_sold)} item(s) sold",
+                     delta=_delta(now.net_sales, before.net_sales, period.compare_label))
+
+    today = ex.resolve_period("today")
+    today_t = await ex.totals_for(today, c.bid)
+    yday_t = await ex.totals_for(_prev(today), c.bid)
+    await c.tile(items, id="sales-today", label="Today's Sales", group="Sales",
+                 hint=f"Net value of everything sold today, {c.across}.",
+                 value=today_t.net_sales, display=money(today_t.net_sales), unit="PKR",
+                 sub=f"{today_t.invoices} invoice(s)",
+                 delta=_delta(today_t.net_sales, yday_t.net_sales, "yesterday"))
+
+    for pid, label in (("7d", "This Week"), ("30d", "This Month"), ("ytd", "This Year")):
+        p = ex.resolve_period(pid)
+        t = await ex.totals_for(p, c.bid)
+        b = await ex.totals_for(_prev(p), c.bid)
+        await c.tile(items, id=f"sales-{pid}", label=label, group="Sales",
+                     hint=f"Net sales over {p.label.lower()}, compared with {p.compare_label}.",
+                     value=t.net_sales, display=money(t.net_sales), unit="PKR",
+                     sub=f"{t.invoices} invoice(s)", delta=_delta(t.net_sales, b.net_sales, p.compare_label))
+
+    await c.tile(items, id="gross-profit", label="Gross Profit", group="Sales",
+                 hint="Net sales minus the cost of what was sold. Expenses come off in Net Profit, from the books.",
+                 value=now.gross_profit, display=money(now.gross_profit), unit="PKR",
+                 sub=f"{pct(now.margin_percent)} margin",
+                 delta=_delta(now.gross_profit, before.gross_profit, period.compare_label))
+
+    # Net profit comes from the books (head office's and every branch's that has synced, or one branch's
+    # own), not from the snapshot.
+    statement, earlier = await _statement_and_before(c.scope, period.start, period.end, c.prev.start, c.prev.end)
+    net_profit = Decimal(statement["netProfit"])
+    expenses = Decimal(statement["operatingExpenses"]) + Decimal(statement["financialExpenses"])
+    await c.tile(items, id="net-profit", label="Net Profit", group="Sales",
+                 hint=(f"From {c.scope.branch.name}'s own books: its net sales, less the cost of what was sold, less every expense posted to them."
+                       if c.scope.branch else
+                       "From the books: net sales, less the cost of what was sold, less every expense posted, across head office and every branch whose books have synced."),
+                 value=net_profit, display=money(net_profit), unit="PKR", source=BOOKS, asOf=None,
+                 sub=f"{money(expenses)} expenses",
+                 delta=_delta(net_profit, Decimal(earlier["netProfit"]), period.compare_label),
+                 severity="bad" if net_profit < D0 else None, ctaLabel="See what's behind it")
+
+    await c.tile(items, id="avg-basket", label="Average Basket", group="Sales",
+                 hint="Net sales divided by the number of invoices: what a typical customer spends per visit.",
+                 value=now.avg_basket, display=money(now.avg_basket), unit="PKR",
+                 sub=f"across {now.invoices} invoice(s)",
+                 delta=_delta(now.avg_basket, before.avg_basket, period.compare_label))
+
+    await c.tile(items, id="customer-count", label="Customer Count", group="Sales",
+                 hint="Bills rung in the period. Bills to named customers are counted separately below.",
+                 value=Decimal(now.invoices), display=num(now.invoices), unit="count",
+                 sub=f"{now.named_customers} to named customers",
+                 delta=_delta(Decimal(now.invoices), Decimal(before.invoices), period.compare_label))
+
+    await c.tile(items, id="bills-per-hour", label="Bills Per Hour", group="Sales",
+                 hint="Invoices divided by measured trading hours (the gap between each branch's first and last sale, not an assumed shift length).",
+                 value=now.bills_per_hour, display=f"{float(now.bills_per_hour):.1f}", unit="rate",
+                 sub=f"{float(now.trading_hours):.0f} trading hour(s)",
+                 delta=_delta(now.bills_per_hour, before.bills_per_hour, period.compare_label))
+
+    # Returns are a Sales tile although their figures sit beside the money ones: a return comes straight off net
+    # sales, so it is read next to sales rather than next to the drawer.
+    await c.tile(items, id="returns", label="Returns", group="Sales",
+                 hint="Goods brought back and refunded. Returns come straight off net sales, so a rising figure is margin leaving the business.",
+                 value=now.returns_value, display=money(now.returns_value), unit="PKR",
+                 sub=f"{now.returns_count} return(s)",
+                 delta=_delta(now.returns_value, before.returns_value, period.compare_label, higher_is_better=False),
+                 severity="watch" if now.returns_value > D0 else "good")
+
+    staffing = await ex.staffing(period, c.bid)
+    latest = staffing[0] if staffing else None
+    # What the branch says it put on the counters, when it says anything; otherwise the old measure,
+    # which can only see people who rang something.
+    latest_staff = (latest["onDuty"] if latest and latest["onDuty"] is not None else (latest["traded"] if latest else 0)) or 0
+    # Sits with Sales rather than in a Performance group of its own. Staff on Duty belongs next to Customer Count
+    # and Bills Per Hour: they are all "what did the trading day look like".
+    await c.tile(items, id="staffing", label="Staff on Duty", group="Sales",
+                 hint="How many people were on a counter, per branch per day, and how many of them rang a sale.",
+                 value=Decimal(latest_staff), display=num(latest_staff), unit="count",
+                 sub=(f"on {date.fromisoformat(latest['day']):%d %b %Y} · {num(latest['traded'])} rang a sale" if latest and latest["onDuty"] is not None
+                      else f"rang a sale on {date.fromisoformat(latest['day']):%d %b %Y}" if latest else "no trading days in this period"))
+    return items
+
+
+async def _money_section(c: _Ctx) -> list[KpiOut]:
+    items: list[KpiOut] = []
+    now, before, period = await c.now(), await c.before(), c.period
+
+    await c.tile(items, id="cash-position", label="Cash Position", group="Money",
+                 hint="Cash taken, plus drawer top-ups, less payouts. Credit sales are excluded because they never entered a drawer.",
+                 value=now.net_cash, display=money(now.net_cash), unit="PKR",
+                 sub=f"{money(now.credit_sales)} on credit",
+                 delta=_delta(now.net_cash, before.net_cash, period.compare_label))
+
+    overrides = await ex.discount_overrides(period, branch_id=c.bid)
+    override_total = sum((o["discTotal"] for o in overrides), D0)
+    approvers = {o["approvedBy"] for o in overrides if o["approvedBy"]}
+    await c.tile(items, id="discount-overrides", label="Discount Overrides", group="Money",
+                 hint="Discounts given above a cashier's own authority, and the manager who signed each one off. Margin given away on someone's signature.",
+                 value=override_total, display=money(override_total), unit="PKR",
+                 sub=f"{len(overrides)} sale(s) · {len(approvers)} approver(s)" if overrides else "none in this period",
+                 severity="watch" if overrides else "good")
+
+    variance_bad = abs(now.till_variance) > D0
+    await c.tile(items, id="till-variance", label="Till Variance", group="Money",
+                 hint="Counted cash minus what the system expected, across every till close in the period.",
+                 value=now.till_variance, display=money(now.till_variance), unit="PKR",
+                 sub=f"{now.tills_closed} till close(s)",
+                 severity="bad" if variance_bad else "good")
+    return items
+
+
+async def _stock_section(c: _Ctx) -> list[KpiOut]:
+    items: list[KpiOut] = []
+    period, scope = c.period, c.scope
+
+    if c.wants("inventory-value"):
+        branch_stock = await ex.latest_stock_value(c.bid)
+        if scope.branch:
+            # One branch's floor. The godown is head office's, not the branch's, so it stays out.
+            await c.tile(items, id="inventory-value", label="Inventory Value", group="Stock",
+                         hint=f"{scope.branch.name}'s floor, valued at sale price, as last reported.",
+                         value=branch_stock, display=money(branch_stock), unit="PKR", sub="branch floor only")
+        else:
+            godown_stock = await ex.godown_stock_value()
+            await c.tile(items, id="inventory-value", label="Inventory Value", group="Stock",
+                         hint="Branch floors plus the godown, valued at sale price. The godown half is live; the branch half is as last reported.",
+                         value=branch_stock + godown_stock, display=money(branch_stock + godown_stock), unit="PKR",
+                         sub=f"godown {money(godown_stock)}", source="mixed")
+
+    # One fetch feeds three tiles, so it is skipped only when none of the three is wanted. When one is,
+    # all three are built: they are free once the alerts are in hand, and `only` exists to skip QUERIES.
+    if c.wants_any("out-of-stock", "low-stock", "expiring"):
+        _, alert_totals = await ex.stock_alerts(branch_id=c.bid)
+        godown = await ex.godown_alerts() if not scope.branch else {"outOfStock": [], "lowStock": []}
+        oos = alert_totals.get("out-of-stock", 0) + len(godown["outOfStock"])
+        low = alert_totals.get("low-stock", 0) + len(godown["lowStock"])
+        expiring = alert_totals.get("near-expiry", 0) + alert_totals.get("expired", 0)
+        stock_source = SNAPSHOT if scope.branch else "mixed"
+
+        await c.tile(items, id="out-of-stock", label="Out of Stock", group="Stock",
+                     hint="Lines showing zero or negative stock" + (f" at {scope.branch.name}." if scope.branch else ", across branch floors and the godown."),
+                     value=Decimal(oos), display=num(oos), unit="count",
+                     sub="on the branch floor" if scope.branch else f"{len(godown['outOfStock'])} in the godown",
+                     severity="bad" if oos else "good", source=stock_source)
+
+        await c.tile(items, id="low-stock", label="Low Stock", group="Stock",
+                     hint=f"Lines below {ex.LOW_STOCK_THRESHOLD} units.",
+                     value=Decimal(low), display=num(low), unit="count",
+                     sub="on the branch floor" if scope.branch else f"{len(godown['lowStock'])} in the godown",
+                     severity="watch" if low else "good", source=stock_source)
+
+        await c.tile(items, id="expiring", label="Expiring & Expired", group="Stock",
+                     hint="Batches already expired or within 30 days of expiry. For groceries and pharmacy this is where value is actually lost.",
+                     value=Decimal(expiring), display=num(expiring), unit="count",
+                     sub=f"{alert_totals.get('expired', 0)} already expired",
+                     severity="bad" if alert_totals.get("expired") else ("watch" if expiring else "good"))
+
+    # Different questions about the same shelf, kept apart on purpose: which Items earn the money (ABC),
+    # which sell steadily (XYZ), both at once (the 9 boxes), which sold least or not at all, which have
+    # stopped selling (dead stock), and which move fastest (velocity). Collapsing them into one
+    # "product score" is how a flag becomes impossible to explain.
+    abc_rows: list = []
+    if c.wants_any("abc-analysis", "abc-xyz"):
+        abc_rows, _ = await an.abc(period.start, period.end, c.code)
+        if c.wants("abc-analysis"):
+            await c.tile(items, **_abc_tile(abc_rows, "sales"))
+
+    if c.wants_any("xyz-analysis", "abc-xyz"):
+        xyz_rows, xyz_cov = await an.xyz(period.start, period.end, c.code)
+        if c.wants("xyz-analysis"):
+            await c.tile(items, **_xyz_tile(xyz_rows, xyz_cov))
+        if c.wants("abc-xyz"):
+            await c.tile(items, **_matrix_tile(an.merge_classes(abc_rows, xyz_rows)))
+
+    if c.wants("sold-least"):
+        await c.tile(items, **_sold_least_tile(*await an.unsold_on_shelf(period.start, period.end, c.code)))
+
+    # Summary only: the tile needs three numbers, not 47,000 rows. See dead_stock_summary().
+    if c.wants("dead-stock"):
+        dead_summary = await an.dead_stock_summary(c.code)
+        dead_value = sum((Decimal(v["value"]) for v in dead_summary.values()), D0)
+        dead_lines = sum(v["lines"] for v in dead_summary.values())
+        await c.tile(items, id="dead-stock", label="Dead Stock", group="Stock",
+                     hint="Stock on the shelf that nothing is pulling through: never sold, or not sold in 90+ days. Valued at cost, because that is the money actually tied up.",
+                     value=dead_value, display=money(dead_value), unit="PKR",
+                     sub=f"{num(dead_lines)} line(s) not moving",
+                     severity="bad" if dead_lines else "good", ctaLabel="See what's stuck")
+
+    if c.wants("movement"):
+        move_rows, _ = await an.movement(period.start, period.end, c.code)
+        fast = [r for r in move_rows if r["band"] == "fast"]
+        await c.tile(items, id="movement", label="Fast & Slow Moving", group="Stock",
+                     hint="Units sold per trading day, banded. A shelf-space question, not a money question: a cheap line can be the fastest thing in the shop and still be C-class.",
+                     value=Decimal(len(fast)), display=num(len(fast)), unit="count",
+                     sub=(f"fast lines of {num(len(move_rows))}" if move_rows else "nothing sold in this period"),
+                     ctaLabel="See the bands")
+    return items
+
+
+async def _performance_section(c: _Ctx) -> list[KpiOut]:
+    items: list[KpiOut] = []
+    period = c.period
+
+    products = await ex.top_products(period, limit=1, branch_id=c.bid)
+    await c.tile(items, id="top-products", label="Top Products", group="Performance",
+                 hint="Ranked by net sales in the period.",
+                 display=products[0]["name"] if products else "-", unit="text",
+                 sub=money(products[0]["netSales"]) if products else "no sales in this period")
+
+    cats = await ex.top_by(period, "category", limit=1, branch_id=c.bid)
+    await c.tile(items, id="top-categories", label="Top Categories", group="Performance",
+                 hint="Product categories ranked by net sales, using the catalog's own taxonomy.",
+                 display=cats[0]["name"] if cats else "-", unit="text",
+                 sub=money(cats[0]["netSales"]) if cats else "no sales in this period")
+
+    brands = await ex.top_by(period, "brand", limit=1, branch_id=c.bid)
+    await c.tile(items, id="top-brands", label="Top Brands", group="Performance",
+                 hint="Brands ranked by net sales.",
+                 display=brands[0]["name"] if brands else "-", unit="text",
+                 sub=money(brands[0]["netSales"]) if brands else "no sales in this period")
+
+    cashiers = await ex.cashier_ranking(period, limit=1, branch_id=c.bid)
+    await c.tile(items, id="best-cashier", label="Best Cashier", group="Performance",
+                 hint="Ranked by net sales rung in the period. The person who rings the sale is the only sales attribution that exists. There is no separate commission-carrying salesperson.",
+                 display=cashiers[0]["name"] if cashiers else "-", unit="text",
+                 sub=f"{money(cashiers[0]['netSales'])} · {cashiers[0]['invoices']} invoice(s)" if cashiers else "no sales in this period")
+
+    comparison = await ex.branch_comparison(period)
+    reporting = [b for b in comparison if b["reporting"]]
+    await c.tile(items, id="branch-comparison", label="Branch Comparison", group="Performance",
+                 hint="Every registered branch ranked by net sales. A branch that has never reported shows as such rather than as zero.",
+                 display=comparison[0]["name"] if reporting else "-", unit="text",
+                 sub=f"{len(reporting)} of {len(comparison)} branch(es) reporting")
+    return items
+
+
+async def _supply_section(c: _Ctx) -> list[KpiOut]:
+    items: list[KpiOut] = []
+    # The godown is head office's own, so these stay whole-company whichever branch is picked.
+    wh = await ex.warehouse_status()
+    await c.tile(items, id="warehouse-status", label="Warehouse Status", group="Supply",
+                 hint="The godown right now: stock value, what is in flight, and what is stuck.",
+                 value=wh["stockValue"], display=money(wh["stockValue"]), unit="PKR",
+                 sub=f"{wh['inFlight']} in flight · {wh['disputesOpen']} dispute(s)",
+                 severity="bad" if wh["disputesOpen"] else "good", source=LIVE, asOf=None)
+
+    ps = await ex.purchase_status()
+    await c.tile(items, id="purchase-status", label="Purchase Status", group="Supply",
+                 hint="Goods received into the godown, and requisitions waiting on a decision.",
+                 value=ps["receivedValue"], display=money(ps["receivedValue"]), unit="PKR",
+                 sub=f"{ps['grnCount']} GRN(s) · {ps['pendingRequisitions']} requisition(s) pending",
+                 severity="watch" if ps["pendingRequisitions"] else "good", source=LIVE, asOf=None)
+
+    suppliers = await ex.supplier_performance()
+    active_suppliers = [s for s in suppliers if s["receipts"]]
+    await c.tile(items, id="supplier-performance", label="Supplier Performance", group="Supply",
+                 hint="Receipts into the godown by supplier. On-time and quality scoring need a promised date and a rejection reason, neither of which is recorded yet.",
+                 display=active_suppliers[0]["name"] if active_suppliers else "-", unit="text",
+                 sub=f"{len(active_suppliers)} of {len(suppliers)} supplier(s) have delivered",
+                 source=LIVE, asOf=None)
+    return items
+
+
+async def _health_section(c: _Ctx) -> list[KpiOut]:
+    # Guarded tile by tile, because two of the four are expensive and a drill-down asks for one: the health
+    # score is a weighted composite of six things and Live Alerts reads the warehouse, the godown and every
+    # branch's stock alerts. Opening either one used to build all of them.
+    items: list[KpiOut] = []
+    if c.wants("health-score"):
+        health = await ex.business_health(c.period, c.bid)
+        await c.tile(items, id="health-score", label="Business Health Score", group="Health",
+                     hint="A weighted composite of sales trend, margin, till accuracy, stock availability, supply friction and branch reporting. Nothing here is predicted. Every component is measured.",
+                     value=Decimal(health.score), display=f"{health.score}", unit="score", sub=health.band,
+                     severity="good" if health.score >= 80 else ("watch" if health.score >= 60 else "bad"),
+                     source="mixed")
+
+    if c.wants("live-alerts"):
+        alerts = await ex.live_alerts()
+        high = [a for a in alerts if a["severity"] == "high"]
+        await c.tile(items, id="live-alerts", label="Live Alerts", group="Health",
+                     hint="Everything currently asking for a decision, most serious first.",
+                     value=Decimal(len(alerts)), display=num(len(alerts)), unit="count",
+                     sub=f"{len(high)} need attention now" if high else "nothing urgent",
+                     severity="bad" if high else ("watch" if alerts else "good"), source="mixed")
+
+    if c.wants("sync-health"):
+        # Selling branches only. With head office in here this read "5/5, all branches reporting", because the
+        # nightly Multi-Tec run stamps last_seen_at on every book it feeds and head office is one -- so a row
+        # that has never reported anything counted as reporting. See models.branch.selling_branches.
+        branches = await ex.selling_branches()
+        never = [b for b in branches if b.status == "active" and not b.last_seen_at]
+        await c.tile(items, id="sync-health", label="Sync Health", group="Health",
+                     hint="Which branches have reported, and how recently. A branch sends its own figures: events every couple of minutes, its whole picture every two hours.",
+                     value=Decimal(len(branches) - len(never)), display=f"{len(branches) - len(never)}/{len(branches)}", unit="text",
+                     sub=f"{len(never)} never reported" if never else "all branches reporting",
+                     severity="watch" if never else "good", source=LIVE, asOf=None)
+
+    if c.wants("branch-errors"):
+        # This tile exists because the one above it gives false comfort. Sync Health answers "is the branch
+        # pushing", which is the thing most likely to still be working when everything else is broken: a shop
+        # whose sales screen threw an error all morning pushes its outbox perfectly and reads 4/4 here. The
+        # branch now sends its own failures up the same road (see models.activity.failed_at_branch), so the
+        # two tiles sit together and say different things.
+        tally = await tr.failure_tally()
+        failing = [b for b in tally["branches"] if b["total"]]
+        worst = failing[0] if failing else None
+        if tally["lastDay"]:
+            sub = f"{num(tally['lastDay'])} in the last day"
+            if worst:
+                sub += f", worst {worst['name']}"
+        elif worst:
+            sub = f"none today; {worst['name']} last reported one"
+        else:
+            sub = f"nothing reported in {tally['days']} days"
+        await c.tile(items, id="branch-errors", label="Branch Errors", group="Health",
+                     hint=f"Failures the branches have reported in the last {tally['days']} days: a till or a report that "
+                          f"would not answer, a screen that broke in the browser, and the work a branch does on a timer "
+                          f"with nobody watching. Each carries the reference the person there was shown.",
+                     value=Decimal(tally["total"]), display=num(tally["total"]), unit="count", sub=sub,
+                     severity="bad" if tally["lastDay"] else ("watch" if tally["total"] else "good"),
+                     source=LIVE, asOf=None)
+    return items
+
+
+# The order the dashboard shows them in, and the only place that order is written down. A tile belongs to the
+# section its `group` names, which is not always the block of code that computes it: Returns and Staff on Duty are
+# read next to Sales though their figures come from the money and performance queries.
+SECTIONS = {
+    "sales": _sales_section,
+    "money": _money_section,
+    "stock": _stock_section,
+    "performance": _performance_section,
+    "supply": _supply_section,
+    "health": _health_section,
+}
+
+SECTION_LABELS = {
+    "sales": "Sales",
+    "money": "Money",
+    "stock": "Stock",
+    "performance": "Rankings & Distribution",
+    "supply": "Supply",
+    "health": "Health",
+}
 
 # ── drill-downs ─────────────────────────────────────────────────────────────
 # Status words the tables show, never the stored codes ("in_transit", "active").
@@ -613,7 +898,7 @@ def _ordinal(n: int) -> str:
     return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
-async def _build_charts(scope: Scope) -> list[ChartOut]:
+async def _build_charts(scope: Scope, only: set[str] | None = None) -> list[ChartOut]:
     """The ranked pictures that sit under the tile grid.
 
     A tile answers "what is the number"; these answer "and then what" — second, third, fourth, all
@@ -624,6 +909,11 @@ async def _build_charts(scope: Scope) -> list[ChartOut]:
     Every bar carries its own destination, so a chart is as navigable as a table: clicking the
     tallest bar and clicking the top row of the drill-down land in the same place.
     """
+    def wanted(section: str) -> bool:
+        """Whether this section's charts are being asked for. `only=None` is the whole page,
+        which is what the old single request wanted."""
+        return only is None or section in only
+
     charts: list[ChartOut] = []
     period, bid, code = scope.period, scope.branch_id, scope.code
 
@@ -649,104 +939,109 @@ async def _build_charts(scope: Scope) -> list[ChartOut]:
         )
 
     # ── the trading day's shape ─────────────────────────────────────────────
-    hours = await ex.hourly_profile(period, bid)
-    if hours:
-        busiest = max(hours, key=lambda h: h["netSales"])["hour"]
-        charts.append(ChartOut(
-            id="sales-by-hour", title="Sales through the day",
-            subtitle="Total taken in each hour of the day, across the period",
-            kind="bar-v", unit="PKR",
-            points=[
-                ChartPoint(
-                    label="%02d" % h["hour"], value=h["netSales"], display=money(h["netSales"]),
-                    sub=h["label"],
-                    # The busiest hour is the one worth the eye — it is where staffing and till
-                    # cover get argued about.
-                    tone="accent" if h["hour"] == busiest else None,
-                ) for h in hours
-            ],
-            emptyText="No branch has reported an hourly profile yet.",
-            ctaKpi="bills-per-hour", ctaLabel="See the hour-by-hour detail",
-            note="Hours are branch local time (UTC+5).",
-        ))
+    if wanted("sales"):
+        hours = await ex.hourly_profile(period, bid)
+        if hours:
+            busiest = max(hours, key=lambda h: h["netSales"])["hour"]
+            charts.append(ChartOut(
+                id="sales-by-hour", title="Sales through the day",
+                subtitle="Total taken in each hour of the day, across the period",
+                kind="bar-v", unit="PKR",
+                points=[
+                    ChartPoint(
+                        label="%02d" % h["hour"], value=h["netSales"], display=money(h["netSales"]),
+                        sub=h["label"],
+                        # The busiest hour is the one worth the eye — it is where staffing and till
+                        # cover get argued about.
+                        tone="accent" if h["hour"] == busiest else None,
+                    ) for h in hours
+                ],
+                emptyText="No branch has reported an hourly profile yet.",
+                ctaKpi="bills-per-hour", ctaLabel="See the hour-by-hour detail",
+                note="Hours are branch local time (UTC+5).",
+            ))
 
     # ── who and what is selling ─────────────────────────────────────────────
-    charts.append(bars(
-        "chart-top-products", "Top products by value", await ex.top_products(period, limit=12, branch_id=bid),
-        label_key="name", value_key="netSales", sub_key="category",
-        link_to="product-detail", link_param="sku", link_key="sku",
-        cta_kpi="top-products", cta_label="See all 100",
-        empty="No sales in this period.",
-        note="Click a bar for who sold it and its day-by-day trend.",
-    ))
-    charts.append(bars(
-        "chart-top-categories", "Top categories", await ex.top_by(period, "category", limit=10, branch_id=bid),
-        label_key="name", value_key="netSales",
-        link_to="category-detail", link_param="name",
-        cta_kpi="top-categories", cta_label="See every category",
-        empty="No sales in this period.",
-    ))
-    charts.append(bars(
-        "chart-top-brands", "Top brands", await ex.top_by(period, "brand", limit=10, branch_id=bid),
-        label_key="name", value_key="netSales",
-        link_to="brand-detail", link_param="name",
-        cta_kpi="top-brands", cta_label="See every brand",
-        empty="No sales in this period.",
-    ))
+    if wanted("performance"):
+        charts.append(bars(
+            "chart-top-products", "Top products by value", await ex.top_products(period, limit=12, branch_id=bid),
+            label_key="name", value_key="netSales", sub_key="category",
+            link_to="product-detail", link_param="sku", link_key="sku",
+            cta_kpi="top-products", cta_label="See all 100",
+            empty="No sales in this period.",
+            note="Click a bar for who sold it and its day-by-day trend.",
+        ))
+        charts.append(bars(
+            "chart-top-categories", "Top categories", await ex.top_by(period, "category", limit=10, branch_id=bid),
+            label_key="name", value_key="netSales",
+            link_to="category-detail", link_param="name",
+            cta_kpi="top-categories", cta_label="See every category",
+            empty="No sales in this period.",
+        ))
+        charts.append(bars(
+            "chart-top-brands", "Top brands", await ex.top_by(period, "brand", limit=10, branch_id=bid),
+            label_key="name", value_key="netSales",
+            link_to="brand-detail", link_param="name",
+            cta_kpi="top-brands", cta_label="See every brand",
+            empty="No sales in this period.",
+        ))
 
     # ── who is performing ───────────────────────────────────────────────────
-    branches = await ex.branch_comparison(period)
-    chart = bars(
-        "chart-branches", "Branch comparison", branches,
-        label_key="name", value_key="netSales", sub_key="code",
-        link_to="branch-detail", link_param="code", link_key="code",
-        cta_kpi="branch-comparison", cta_label="See the full comparison",
-        empty="No branch has reported yet.",
-        note="A branch that has never reported shows zero rather than being hidden, because silence is a finding.",
-    )
-    # Every branch stays on the comparison; the one picked stands out, so it is still read against the rest.
-    for point, row in zip(chart.points, branches):
-        if code and row["code"] == code:
-            point.tone = "accent"
-    charts.append(chart)
-    charts.append(bars(
-        "chart-staff", "Salesperson performance", await ex.cashier_ranking(period, limit=12, branch_id=bid),
-        label_key="name", value_key="netSales", sub_key="invoices",
-        link_to="cashier-detail", link_param="name",
-        cta_kpi="best-cashier", cta_label="See every salesperson",
-        empty="Nobody has rung a sale in this period.",
-        note="Ranked by net sales rung. Click a bar for everything that person sold, their days and their till closes.",
-    ))
+    if wanted("performance"):
+        branches = await ex.branch_comparison(period)
+        chart = bars(
+            "chart-branches", "Branch comparison", branches,
+            label_key="name", value_key="netSales", sub_key="code",
+            link_to="branch-detail", link_param="code", link_key="code",
+            cta_kpi="branch-comparison", cta_label="See the full comparison",
+            empty="No branch has reported yet.",
+            note="A branch that has never reported shows zero rather than being hidden, because silence is a finding.",
+        )
+        # Every branch stays on the comparison; the one picked stands out, so it is still read against the rest.
+        for point, row in zip(chart.points, branches):
+            if code and row["code"] == code:
+                point.tone = "accent"
+        charts.append(chart)
+        charts.append(bars(
+            "chart-staff", "Cashier performance", await ex.cashier_ranking(period, limit=12, branch_id=bid),
+            label_key="name", value_key="netSales", sub_key="invoices",
+            link_to="cashier-detail", link_param="name",
+            cta_kpi="best-cashier", cta_label="See every cashier",
+            empty="Nobody has rung a sale in this period.",
+            note="Ranked by net sales rung. Click a bar for everything that person sold, their days and their till closes.",
+        ))
 
     # ── how the catalog is shaped ───────────────────────────────────────────
-    abc_rows, _ = await an.abc(period.start, period.end, code)
-    if abc_rows:
-        summary = _band_summary(abc_rows, "abcClass", ("A", "B", "C"), {})
-        charts.append(bars(
-            "chart-abc", "ABC: where the value sits", summary,
-            label_key="klass", value_key="netSales",
-            link_to="abc-class", link_param="name", link_key="raw",
-            subtitle="Net sales by class",
-            cta_kpi="abc-xyz", cta_label="See the 9 boxes",
-            empty="Nothing sold in this period.",
-            note="Walking the Items from the biggest seller down: A while the Items above carry under 80% of sales, B under 95%, C the rest. Click a bar for its Items.",
-        ))
+    if wanted("stock"):
+        abc_rows, _ = await an.abc(period.start, period.end, code)
+        if abc_rows:
+            summary = _band_summary(abc_rows, "abcClass", ("A", "B", "C"), {})
+            charts.append(bars(
+                "chart-abc", "ABC: where the value sits", summary,
+                label_key="klass", value_key="netSales",
+                link_to="abc-class", link_param="name", link_key="raw",
+                subtitle="Net sales by class",
+                cta_kpi="abc-xyz", cta_label="See the 9 boxes",
+                empty="Nothing sold in this period.",
+                note="Walking the Items from the biggest seller down: A while the Items above carry under 80% of sales, B under 95%, C the rest. Click a bar for its Items.",
+            ))
 
-    xyz_rows, xyz_cov = await an.xyz(period.start, period.end, code)
-    one, many = _BUCKET[xyz_cov.bucket]
-    if xyz_rows:
-        summary = _band_summary(xyz_rows, "xyzClass", ("X", "Y", "Z", an.TOO_NEW), {}, label_map=XYZ_LABEL)
-        charts.append(bars(
-            "chart-xyz", "XYZ: how steadily Items sell", summary,
-            label_key="klass", value_key="lines",
-            link_to="xyz-class", link_param="name", link_key="raw",
-            unit="count", fmt=lambda v: num(v),
-            subtitle="Items by demand pattern",
-            cta_kpi="xyz-analysis", cta_label="See the classification",
-            empty="Nothing sold in this period.",
-            note=f"Counted {one} by {one}, including the {many} an Item sold nothing in. X steady, Y up and down, Z in bursts. An Item needs {an.MIN_BUCKETS} {many} to go on.",
-        ))
+        xyz_rows, xyz_cov = await an.xyz(period.start, period.end, code)
+        one, many = _BUCKET[xyz_cov.bucket]
+        if xyz_rows:
+            summary = _band_summary(xyz_rows, "xyzClass", ("X", "Y", "Z", an.TOO_NEW), {}, label_map=XYZ_LABEL)
+            charts.append(bars(
+                "chart-xyz", "XYZ: how steadily Items sell", summary,
+                label_key="klass", value_key="lines",
+                link_to="xyz-class", link_param="name", link_key="raw",
+                unit="count", fmt=lambda v: num(v),
+                subtitle="Items by demand pattern",
+                cta_kpi="xyz-analysis", cta_label="See the classification",
+                empty="Nothing sold in this period.",
+                note=f"Counted {one} by {one}, including the {many} an Item sold nothing in. X steady, Y up and down, Z in bursts. An Item needs {an.MIN_BUCKETS} {many} to go on.",
+            ))
 
+    return charts
     return charts
 
 
@@ -858,10 +1153,14 @@ FOCUSED = {
 OWN_HEADLINE = {"abc-analysis", "xyz-analysis", "abc-xyz", "sold-least"}
 
 _SALES_KPIS = {"sales-today": "today", "sales-7d": "7d", "sales-30d": "30d", "sales-ytd": "ytd"}
+# The sales tile that follows the period picker instead of naming its own window. Kept out of `_SALES_KPIS` on
+# purpose: everything in there resolves a fixed period, and resolving one for this would pin the drill-down to a
+# window the person did not ask for. It reads the scope's period instead, and otherwise opens the same breakdown.
+PICKED_SALES = "sales-period"
 
 
 async def kpi_detail(kpi_id: str, period_id: str, focus: dict[str, str] | None = None, *,
-                     start: str | None = None, end: str | None = None,
+                     start: str | datetime | None = None, end: str | datetime | None = None,
                      branch: str | None = None, basis: str | None = None) -> KpiDetailOut:
     focus = {k: v for k, v in (focus or {}).items() if v}
     if kpi_id == "branch-detail":
@@ -899,12 +1198,57 @@ async def _finish(out: KpiDetailOut, scope: Scope) -> KpiDetailOut:
     return out
 
 
+# Which section builds which tile. Generated by walking every section builder once and recording what it
+# returned; `ops/checks/kpi_owners.py` rebuilds it and fails if it has drifted, so it cannot quietly go stale.
+#
+# WHY IT EXISTS
+# -------------
+# Opening any drill-down used to call `_grid(scope, include_charted=True)` purely to find ONE headline tile, and
+# `_grid` builds the whole Company Dashboard: all six sections, all 36 tiles. The Branch Ranking page shows five
+# rows that cost 0.33 seconds to work out and took 6.2 seconds to answer, because 6 of those seconds were
+# building a dashboard nobody asked for and throwing 35 tiles away.
+_KPI_OWNER = {
+    "abc-analysis": "stock", "abc-xyz": "stock", "avg-basket": "sales", "best-cashier": "performance",
+    "bills-per-hour": "sales", "branch-comparison": "performance", "cash-position": "money",
+    "customer-count": "sales", "dead-stock": "stock", "discount-overrides": "money", "expiring": "stock",
+    "gross-profit": "sales", "health-score": "health", "inventory-value": "stock", "live-alerts": "health",
+    "low-stock": "stock", "movement": "stock", "net-profit": "sales", "out-of-stock": "stock",
+    "purchase-status": "supply", "returns": "sales", "sales-30d": "sales", "sales-7d": "sales",
+    "sales-period": "sales", "sales-today": "sales", "sales-ytd": "sales", "sold-least": "stock",
+    "staffing": "sales", "supplier-performance": "supply", "sync-health": "health", "branch-errors": "health",
+    "till-variance": "money",
+    "top-brands": "performance", "top-categories": "performance", "top-products": "performance",
+    "warehouse-status": "supply", "xyz-analysis": "stock",
+}
+
+
+async def _headline_for(kpi_id: str, scope: Scope):
+    """The one tile a drill-down puts at the top of itself, built without building the other thirty-five.
+
+    The section builders return their chart-backed tiles too -- it is `section()` that filters those out for the
+    dashboard -- so asking the owning builder directly still finds the drill-downs the charts link to.
+
+    An id that is not in the map falls back to the whole grid rather than failing. A new tile therefore works
+    before anybody remembers this map exists; it is simply slow until `ops/checks/kpi_owners.py` is run and the
+    map updated, and that check says exactly which id is missing.
+    """
+    owner = _KPI_OWNER.get(kpi_id)
+    if owner is not None and owner in SECTIONS:
+        # `only` so the section skips the queries behind the tiles this drill-down will not show. Opening Stock
+        # Health built all ten Stock tiles to display one of them; XYZ analysis alone was 1.27s of that.
+        items = await SECTIONS[owner](_Ctx(scope, only={kpi_id}))
+        found = next((k for k in items if k.id == kpi_id), None)
+        if found is not None:
+            return found
+        # The map named a section that no longer builds this tile. Fall through rather than answer 404: a stale
+        # map should cost a slow page, never a broken one. ops/checks/kpi_owners.py exists to catch this.
+    grid = await _grid(scope, include_charted=True)
+    return next((k for k in grid.items if k.id == kpi_id), None)
+
+
 async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
     period, bid = scope.period, scope.branch_id
-    # The full set, including the chart-backed KPIs the grid no longer shows — their drill-downs
-    # are exactly where the charts link to, so they must still resolve.
-    grid = await _grid(scope, include_charted=True)
-    headline = next((k for k in grid.items if k.id == kpi_id), None)
+    headline = await _headline_for(kpi_id, scope)
     if not headline:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No KPI with id {kpi_id}")
     # Period totals, for the drill-downs whose notes quote the surrounding figures.
@@ -913,8 +1257,11 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
                 headline=headline, period=_period_out(period), source=headline.source, asOf=headline.asOf)
 
     # ── sales, by day — each day opens into its own hour-by-hour picture ──────
-    if kpi_id in _SALES_KPIS:
-        window = ex.resolve_period(_SALES_KPIS[kpi_id])
+    if kpi_id in _SALES_KPIS or kpi_id == PICKED_SALES:
+        # The fixed tiles each open their own window whatever the picker says; `sales-period` IS the picker, so its
+        # window is the scope's own. That is the only difference between them, which is why it shares this builder
+        # rather than having one of its own that could drift from it.
+        window = period if kpi_id == PICKED_SALES else ex.resolve_period(_SALES_KPIS[kpi_id])
         series = await ex.daily_series(window, "net_sales", bid)
         rows = await ex.daily_breakdown(window, bid)
         return KpiDetailOut(
@@ -990,7 +1337,7 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
             seriesLabel="Average basket by day",
             series=[SeriesPoint(day=d["day"], value=d["avgBasket"]) for d in reversed(days)],
             columns=_cols(
-                ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                ("name", "Cashier", "left", "text", "cashier-detail", "name"),
                 ("invoices", "Invoices", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
                 ("avgBasket", "Avg basket", "right", "money"),
@@ -1088,7 +1435,7 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
             columns=_cols(
                 ("sessionNumber", "Session", "left", "mono"),
                 ("day", "Day", "left", "date", "day-detail", "day"),
-                ("cashier", "Salesperson", "left", "text", "cashier-detail", "name", "cashier"),
+                ("cashier", "Cashier", "left", "text", "cashier-detail", "name", "cashier"),
                 ("openingFloat", "Float", "right", "money"),
                 ("netCash", "Expected", "right", "money"),
                 ("countedCash", "Counted", "right", "money"),
@@ -1324,7 +1671,7 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
         return KpiDetailOut(
             **base,
             columns=_cols(
-                ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                ("name", "Cashier", "left", "text", "cashier-detail", "name"),
                 ("branches", "Branch", "left", "mono"),
                 ("invoices", "Invoices", "right", "number"),
                 ("netSales", "Net sales", "right", "money"),
@@ -1415,7 +1762,8 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
 
     # ── supply ───────────────────────────────────────────────────────────────
     if kpi_id == "warehouse-status":
-        wh = await ex.warehouse_status()
+        # The one caller that really does want all of them: this is the table.
+        wh = await ex.warehouse_status(transfers=True)
         rows = [{
             "transferNumber": t.transfer_number, "status": TRANSFER_STATUS_WORDS.get(t.status, t.status.replace("_", " ").capitalize()),
             "vehicle": t.vehicle or "-", "driver": t.driver or "-",
@@ -1519,10 +1867,13 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
         )
 
     if kpi_id == "sync-health":
+        # Selling branches, like the tile. These disagreed: the tile read 4/4 and this listed five, head office
+        # among them, labelled "Never reported" -- which reads as a shop that has gone quiet rather than a row
+        # that was never a shop. See models.branch.selling_branches.
         rows = [{"name": b.name, "code": b.code,
                  "status": _branch_state({"status": b.status, "lastSeenAt": b.last_seen_at}),
                  "lastSeenAt": b.last_seen_at, "syncUrl": b.sync_url or "not set"}
-                for b in await ex.Branch.all()]
+                for b in await ex.selling_branches()]
         return KpiDetailOut(
             **base,
             columns=_cols(
@@ -1540,12 +1891,46 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
             ],
         )
 
+    if kpi_id == "branch-errors":
+        report = await tr.branch_errors()
+        rows = [{
+            "branch": b["name"], "code": b["code"], "what": s["action"],
+            "where": s["path"], "count": s["count"], "status": s["status"],
+            "lastAt": s["newestAt"], "reference": s["errorId"] or "-",
+            "message": s["note"] or ("no detail was sent with it"),
+            "person": s["person"] or ("nobody was watching" if s["background"] else "-"),
+        } for b in report["branches"] for s in b["screens"]]
+        rows.sort(key=lambda r: (-r["count"], r["branch"]))
+        return KpiDetailOut(
+            **base,
+            columns=_cols(
+                ("branch", "Branch", "left", "text", "branch-detail", "code", "code"),
+                ("what", "What broke", "left", "text"), ("where", "Where", "left", "mono"),
+                ("count", "Times", "right", "count"), ("lastAt", "Most recent", "left", "datetime"),
+                ("person", "Who was there", "left", "text"), ("reference", "Reference", "left", "mono"),
+                ("message", "What it said", "left", "text"),
+            ),
+            rows=rows,
+            emptyText=f"No branch has reported a failure in the last {report['days']} days.",
+            notes=[
+                "A branch sends these itself, with the rest of its activity. There are three kinds: a request its "
+                "server could not answer, a screen that broke in the browser, and the work it does on a timer with "
+                "nobody watching -- that last kind has no person against it, which is exactly why it needs saying.",
+                "The reference is the one the person at the branch was shown on screen, and the same one in that "
+                "branch's own log file. It is what turns 'it said 7KQ2-M9XD' on the phone into the entry that "
+                "explains it.",
+                "Repeats are counted, not listed: the same thing breaking the same way is one line. The branch also "
+                "holds its own repeats back, so 'Times' counts what it sent, not every attempt -- the message says "
+                "when it stood in for more.",
+                "This is not the same question as Sync Health. A branch can be pushing perfectly and be unusable.",
+            ],
+        )
+
     if kpi_id == "net-profit":
         from app.services import accounts_reports_service as books
 
         prev = _prev(period)
-        now_st = await _statement(scope, period.start, period.end)
-        before_st = await _statement(scope, prev.start, prev.end)
+        now_st, before_st = await _statement_and_before(scope, period.start, period.end, prev.start, prev.end)
         lines = (("netSales", "Sales"), ("costOfSales", "Cost of sales"), ("grossProfit", "Gross profit"),
                  ("otherIncome", "Other income"), ("operatingExpenses", "Operating expenses"),
                  ("financialExpenses", "Financial expenses"), ("netProfit", "Net profit"))
@@ -1555,6 +1940,13 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
         if not scope.branch:
             names = {b.code: b.name for b in await ex.Branch.all()}
             by_book = []
+            # Measured, 1 October 2026: do NOT collapse this into one grouped query. Grouping by book in a single
+            # pass sounds obviously cheaper and is slower at every window, because each per-book call seeks cleanly
+            # on idx_acc_vouchers_posted (status, book, date) while the grouped version reads every book's rows and
+            # then groups them. Best of two, interleaved, figures identical either way:
+            #     one month    loop 1.7s   one pass 1.7s
+            #     one year     loop 13.5s  one pass 16.8s
+            #     everything   loop 23.8s  one pass 28.8s
             for book in await books.all_books():
                 st = await books.income_statement([book], False, period.start, period.end)
                 by_book.append({
@@ -1602,19 +1994,34 @@ async def _board_detail(kpi_id: str, scope: Scope) -> KpiDetailOut:
 
 async def _grn_rows():
     """Goods receipts as table rows, newest first."""
-    grns = await ex.GRN.all().prefetch_related("lines")
+    from tortoise import Tortoise
+
+    # `prefetch_related("lines")` names every receipt's id as a query parameter. That was fine while the godown
+    # was empty and became a 500 the moment the legacy load landed: 5,968 receipts against SQL Server's ceiling
+    # of 2,100 parameters, which is the same overflow that took out the dashboard, the purchase summary and the
+    # reorder suggestions. The three figures this table shows are sums, so the database works them out and 92,509
+    # line objects never cross into Python.
+    totals = {
+        str(r["grn_id"]): (int(r["lines"] or 0),
+                           Decimal(str(r["units"] or 0)), Decimal(str(r["value"] or 0)))
+        for r in await Tortoise.get_connection("default").execute_query_dict(
+            "SELECT grn_id, COUNT(*) AS lines, "
+            "       SUM(COALESCE(qty, 0) + COALESCE(bonus_qty, 0)) AS units, "
+            "       SUM(COALESCE(qty, 0) * COALESCE(unit_price, 0)) AS value "
+            "FROM warehouse_grn_lines GROUP BY grn_id")
+    }
+    grns = await ex.GRN.all()
     suppliers = {str(s.id): s for s in await ex.Supplier.all()}
     bins = {str(b.id): b for b in await ex.Bin.all()}
     rows = []
     for g in grns:
-        value = sum(((l.qty or D0) * (l.unit_price or D0) for l in g.lines), D0)
-        units = sum(((l.qty or D0) + (l.bonus_qty or D0) for l in g.lines), D0)
+        line_count, units, value = totals.get(str(g.id), (0, D0, D0))
         rows.append({
             "grnNumber": g.grn_number, "supplierId": str(g.supplier_id),
             "supplierName": suppliers[str(g.supplier_id)].name if str(g.supplier_id) in suppliers else str(g.supplier_id),
             "partyInvNo": g.party_inv_no or "-",
             "bin": bins[str(g.bin_id)].label if str(g.bin_id) in bins else str(g.bin_id),
-            "lines": len(g.lines), "units": units, "value": value,
+            "lines": line_count, "units": units, "value": value,
             "approved": "Yes" if g.approved else "Pending", "at": g.at,
         })
     rows.sort(key=lambda r: r["at"], reverse=True)
@@ -1667,7 +2074,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             sections=[_section(
                 f"Who sells this {attr}",
                 _cols(
-                    ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                    ("name", "Cashier", "left", "text", "cashier-detail", "name"),
                     ("items", "Items", "right", "number"),
                     ("qty", "Units", "right", "number"),
                     ("netSales", "Net sales", "right", "money"),
@@ -1696,7 +2103,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
         branches = await ex.product_branches(period, sku, bid)
         people_net = sum((p["netSales"] for p in people), D0)
         lead = people[0] if people else None
-        sub = f"{num(totals['qty'])} sold · {pct(totals['marginPercent'])} margin"
+        sub = f"{qty(totals['qty'])} sold · {pct(totals['marginPercent'])} margin"
         if people:
             sub += f" · sold by {len(people)} person(s)"
         head = _headline(
@@ -1708,7 +2115,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             "The person is whoever rang the bill. Click a name for that person's sales of this item, day by day.",
         ]
         if lead:
-            notes.append(f"{lead['name']} sold the most: {num(lead['qty'])} of {num(totals['qty'])} units, "
+            notes.append(f"{lead['name']} sold the most: {qty(lead['qty'])} of {qty(totals['qty'])} units, "
                          f"{pct(lead['share'])} of the value.")
         if people and abs(people_net - totals["netSales"]) >= Decimal("1"):
             notes.append(f"The people add up to {money(people_net)} against the item's {money(totals['netSales'])}: "
@@ -1751,7 +2158,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             series=[SeriesPoint(day=d["day"], value=d["netSales"]) for d in days],
             tableTitle="Who sold it",
             columns=_cols(
-                ("name", "Salesperson", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                ("name", "Cashier", "left", "text", "cashier-product-detail", PERSON_ITEM),
                 ("qty", "Qty sold", "right", "number"),
                 ("qtyShare", "Of units", "right", "percent"),
                 ("netSales", "Net sales", "right", "money"),
@@ -1796,7 +2203,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
                          f"Average basket {money(totals['avgBasket'])} across {totals['invoices']} invoice(s).")
         if items:
             best = items[0]
-            notes.append(f"Biggest item: {best['name']}, {num(best['qty'])} unit(s) for {money(best['netSales'])} "
+            notes.append(f"Biggest item: {best['name']}, {qty(best['qty'])} unit(s) for {money(best['netSales'])} "
                          f"({pct(best['shareOfPerson'])} of their item sales). Margin on everything they sold {pct(_money_pct(item_profit, item_net))}.")
             notes.append("Of their sales is the item's part of this person's sales; Of item's sales is this person's part of that item's sales across everyone.")
         notes.append(f"{len(closes)} till close(s) in this period, net variance {money(variance)}."
@@ -1882,7 +2289,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
         ))
         return KpiDetailOut(
             id=kpi_id, label=name, group="Performance", hint=head.hint, focusLabel=name,
-            parentKpi="best-cashier", parentLabel="Best Salesperson",
+            parentKpi="best-cashier", parentLabel="Best Cashier",
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
             seriesLabel="Net sales by day",
             series=[SeriesPoint(day=d["day"], value=d["netSales"]) for d in days],
@@ -1915,13 +2322,13 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
         head = _headline(
             kpi_id, label, "Performance", f"How much of {t['name']} {name} sold, day by day, and how that compares with everyone else who sold it.",
             money(t["netSales"]), "PKR",
-            f"{num(t['qty'])} sold over {t['invoices']} bill(s) on {t['days']} day(s) · {pct(t['shareOfItem'])} of the item's sales",
+            f"{qty(t['qty'])} sold over {t['invoices']} bill(s) on {t['days']} day(s) · {pct(t['shareOfItem'])} of the item's sales",
             t["netSales"], as_of=as_of)
         for d in days:
             d["marginPercent"] = _money_pct(d["grossProfit"], d["netSales"])
         place = next((i for i, p in enumerate(people, 1) if p["name"] == name), None)
         notes = [
-            f"{name} sold {num(t['qty'])} of the {num(sum((p['qty'] for p in people), D0))} unit(s) everyone sold "
+            f"{name} sold {qty(t['qty'])} of the {qty(sum((p['qty'] for p in people), D0))} unit(s) everyone sold "
             f"({pct(t['qtyShareOfItem'])} of units, {pct(t['shareOfItem'])} of value)"
             + (f", {_ordinal(place)} of {len(people)} people who sold it." if place else "."),
             f"This item is {pct(t['shareOfPerson'])} of {name}'s item sales in the period. "
@@ -1932,7 +2339,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             id=kpi_id, label=label, group="Performance", hint=head.hint,
             focusLabel=f"{t['name']} ({sku}) sold by {name}",
             parentKpi="cashier-detail", parentLabel=name,
-            trail=[Crumb(label="Best Salesperson", kpi="best-cashier"),
+            trail=[Crumb(label="Best Cashier", kpi="best-cashier"),
                    Crumb(label=name, kpi="cashier-detail", focus={"name": name})],
             headline=head, period=p_out, source=SNAPSHOT, asOf=as_of,
             seriesLabel="Net sales by day",
@@ -1951,7 +2358,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             sections=[_section(
                 "Everyone who sold it",
                 _cols(
-                    ("name", "Salesperson", "left", "text", "cashier-product-detail", PERSON_ITEM),
+                    ("name", "Cashier", "left", "text", "cashier-product-detail", PERSON_ITEM),
                     ("qty", "Qty sold", "right", "number"),
                     ("qtyShare", "Of units", "right", "percent"),
                     ("netSales", "Net sales", "right", "money"),
@@ -2001,7 +2408,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
                     subtitle="The 15 biggest sellers", action=("See every Item", "top-products", {})),
                 _section(
                     "People", _cols(
-                        ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                        ("name", "Cashier", "left", "text", "cashier-detail", "name"),
                         ("invoices", "Invoices", "right", "number"),
                         ("netSales", "Net sales", "right", "money"),
                         ("share", "Share", "right", "percent"),
@@ -2077,7 +2484,11 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
         t = detail["totals"]
         head = _headline(
             kpi_id, day, "Sales", f"Everything that happened on {day}" + (f" at {scope.branch.name}." if scope.branch else "."),
-            money(t.net_sales), "PKR", f"{t.invoices} invoice(s)", t.net_sales, as_of=as_of)
+            money(t.net_sales), "PKR",
+            # How much went out of the door, not only how many times the till opened. Their own sale report is
+            # a list of quantities, so a day that reads 1,514 invoices and nothing else cannot be checked
+            # against it without adding the lines up by hand.
+            f"{t.invoices} invoice(s) · {qty(t.items_sold)} item(s) sold", t.net_sales, as_of=as_of)
         tender_line = ", ".join(f"{x['name']} {money(x['amount'])}" for x in detail["tenders"]) or "nothing tendered"
         the_day = date.fromisoformat(day)
         sellers = await ex.top_sellers(ex.Period("day", day, the_day, the_day, the_day, the_day, "the day before"), bid)
@@ -2110,7 +2521,7 @@ async def _focused(kpi_id: str, scope: Scope, focus: dict, as_of) -> KpiDetailOu
             sections=[_section(
                 "Who was on",
                 _cols(
-                    ("name", "Salesperson", "left", "text", "cashier-detail", "name"),
+                    ("name", "Cashier", "left", "text", "cashier-detail", "name"),
                     ("invoices", "Invoices", "right", "number"),
                     ("billTotal", "Net sales", "right", "money"),
                     ("avgBasket", "Avg basket", "right", "money"),

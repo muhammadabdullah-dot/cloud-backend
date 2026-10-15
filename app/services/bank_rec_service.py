@@ -37,6 +37,7 @@ from decimal import Decimal
 from tortoise import Tortoise
 from tortoise.transactions import atomic
 
+from app.core import dialect
 from app.models import Account, BankReconciliation, User, VoucherLine, next_value
 
 ZERO = Decimal("0")
@@ -81,7 +82,7 @@ async def _sum(account_id, up_to: date, ticked: bool | None = None) -> Decimal:
     dressed as a total. It reads like a sum and is not one. The branch's copy of this was written the wrong way
     first and its check caught it, reporting a 50,000 balance on an account holding 100,000.
     """
-    where = ["l.account_id = ?", "v.status = 'posted'", "v.date <= ?"]
+    where = [f"l.account_id = {dialect.mark()}", "v.status = 'posted'", "v.date <= ?"]
     params: list = [str(account_id), up_to.isoformat()]
     if ticked is True:
         where.append("l.reconciliation_id IS NOT NULL")
@@ -323,7 +324,7 @@ async def statement_report(books: list[str], start: date | None, end: date,
             "r.number AS rec_number "
             "FROM acc_voucher_lines l JOIN acc_vouchers v ON v.id = l.voucher_id "
             "LEFT JOIN acc_bank_reconciliations r ON r.id = l.reconciliation_id "
-            f"WHERE l.account_id = ? AND {' AND '.join(where)} ORDER BY v.date, v.number",
+            f"WHERE l.account_id = {dialect.mark()} AND {' AND '.join(where)} ORDER BY v.date, v.number",
             [str(account.id), *params],
         )
         if not rows:

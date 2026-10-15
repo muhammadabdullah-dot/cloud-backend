@@ -5,9 +5,10 @@ The company details can be read by anyone signed in (a screen or a printout may 
 and the alert timings needs the settings' own access. The role limits sit with the people who already set a person's
 own limit on the Users tab.
 """
-from datetime import datetime
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from tortoise import Tortoise
 from pydantic import BaseModel, Field
 
 from app.middlewares.auth import get_current_user, require_any_permission, require_permission
@@ -107,6 +108,44 @@ def _fail(exc: svc.OfficeSettingsError) -> HTTPException:
 @router.get("/company", response_model=CompanyOut)
 async def get_company(user: User = Depends(get_current_user)) -> CompanyOut:
     return CompanyOut(**await svc.company())
+
+
+class LegacySyncOut(BaseModel):
+    """When the feed from their own software last landed, and how far it reaches."""
+
+    lastSyncAt: datetime | None = None
+    throughDay: date | None = None
+    shops: int = 0
+
+
+@router.get("/legacy-sync", response_model=LegacySyncOut)
+async def legacy_sync(user: User = Depends(get_current_user)) -> LegacySyncOut:
+    """The header's "as of" for the Multi-Tec feed. Open to anyone signed in, like the company details: it says
+    nothing about the data, only how old it is, and that is the one thing every screen's reader needs to know.
+
+    Two different facts, because they answer two different questions and they are often hours apart. `lastSyncAt`
+    is when the sync last finished; `throughDay` is the last trading day it brought in. A sync that ran at five
+    this morning carries yesterday, so a header showing only the run time invites somebody to think today is in.
+    """
+    conn = Tortoise.get_connection("default")
+    _, run = await conn.execute_query(
+        "SELECT TOP 1 completed_at FROM branch_snapshot_runs "
+        "WHERE source = 'legacy' AND status = 'complete' AND completed_at IS NOT NULL "
+        "ORDER BY completed_at DESC")
+    _, day = await conn.execute_query("SELECT MAX(day) AS day FROM branch_daily_stats")
+    _, shops = await conn.execute_query(
+        "SELECT COUNT(DISTINCT branch_id) AS n FROM branch_snapshot_runs WHERE source = 'legacy'")
+    last = run[0]["completed_at"] if run else None
+    # Marked as UTC before it goes out. These columns hold UTC but hold it NAIVELY, and the app reads a timestamp
+    # with no offset as Pakistan wall-clock time already (cloud-app/src/lib/pkTime.ts, WALL_CLOCK) and leaves it
+    # alone. Sent bare, today's 15:53 sync would have reached the header as 10:53. `/health` already answers with a
+    # Z for the same reason, so this follows it rather than inventing a second convention.
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    through = day[0]["day"] if day else None
+    if through is not None and not isinstance(through, date):
+        through = date.fromisoformat(str(through)[:10])
+    return LegacySyncOut(lastSyncAt=last, throughDay=through, shops=int(shops[0]["n"] or 0))
 
 
 @router.put("/company", response_model=CompanyOut)

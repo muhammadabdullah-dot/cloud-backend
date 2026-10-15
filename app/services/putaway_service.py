@@ -57,6 +57,22 @@ def capacity_warning(bin_: Bin, used: Decimal, adding: Decimal) -> str | None:
     return None
 
 
+async def _by_ids(model, ids: list, **filters) -> list:
+    """`id__in` in chunks, because every id is a parameter and SQL Server takes 2,100 in one statement.
+
+    The two places that reach for every product the godown holds were written when it held nothing: `holdings()`
+    reads warehouse_stock_movements, which had no rows at all, so the list was always empty and the limit was never
+    near. Loading head office's stock position put 2,202 products in it and both statements went over -- one of them
+    inside a startup backfill, so the server stopped starting rather than failing on a screen somebody could report.
+
+    The per-product calls elsewhere in this file pass a product's own bins, a handful, and are left alone.
+    """
+    out = []
+    for part in range(0, len(ids), 500):
+        out += list(await model.filter(id__in=ids[part:part + 500], **filters))
+    return out
+
+
 async def item_bins(product_id: str) -> dict:
     product = await Product.get_or_none(id=product_id)
     if not product:
@@ -147,7 +163,7 @@ async def put_home(user: User, product_id: str) -> list[BinMove]:
 async def putaway_list() -> dict:
     """Items with stock outside their home bin, and Items holding stock with no home bin yet."""
     held = await holdings()
-    products = {p.id: p for p in await Product.filter(id__in=list(held))}
+    products = {p.id: p for p in await _by_ids(Product, list(held))}
     bins = {b.id: b for b in await Bin.all()}
     away, homeless = [], []
     for product_id, per_bin in held.items():
@@ -223,7 +239,7 @@ async def backfill_home_bins() -> int:
     held = await holdings()
     bins = {b.id: b for b in await Bin.filter(active=True)}
     set_count = 0
-    for product in await Product.filter(home_bin_id=None, id__in=list(held)):
+    for product in await _by_ids(Product, list(held), home_bin_id=None):
         choices = [(bid, qty) for bid, qty in held[product.id].items() if qty > ZERO and bid in bins]
         if not choices:
             continue

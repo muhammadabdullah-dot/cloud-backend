@@ -31,6 +31,17 @@ def start() -> None:
     if os.environ.get("BACKUP_AUTO", "on").lower() == "off":
         print("  backup: daily backup switched off (BACKUP_AUTO=off)", flush=True)
         return
+    # backup_service takes its copy with SQLite's own VACUUM INTO, so on any other engine every tick would raise.
+    # The loop below survives that, but it would write the same failure to the log every ten minutes for ever, which
+    # buries the failures worth reading. Said once here instead, and the Maintenance screen says it too.
+    from app.core.config import settings
+
+    if not settings.db_url.startswith("sqlite://"):
+        print("  backup: daily backup stood down. This database is not SQLite, and the backup is SQLite's own\n"
+              "          VACUUM INTO. Back it up with the engine's own tooling until backup_service is ported.",
+              flush=True)
+        logs.log.warning("backup: daily backup stood down, db_url is not sqlite")
+        return
     if _task is None or _task.done():
         _task = asyncio.create_task(_loop(), name="daily-backup")
 

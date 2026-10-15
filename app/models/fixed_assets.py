@@ -19,13 +19,13 @@ class FixedAsset(models.Model):
     name = fields.CharField(max_length=160)
     # The fixed asset account it sits in (VEHICLES, FURNITURE AND FIXTURES): its category on the register.
     category_account: fields.ForeignKeyRelation["Account"] = fields.ForeignKeyField(
-        "models.Account", related_name="fixed_assets", on_delete=fields.RESTRICT
+        "models.Account", related_name="fixed_assets", on_delete=fields.NO_ACTION
     )
     accumulated_account: fields.ForeignKeyRelation["Account"] = fields.ForeignKeyField(
-        "models.Account", related_name="fixed_assets_accumulated", on_delete=fields.RESTRICT
+        "models.Account", related_name="fixed_assets_accumulated", on_delete=fields.NO_ACTION
     )
     expense_account: fields.ForeignKeyRelation["Account"] = fields.ForeignKeyField(
-        "models.Account", related_name="fixed_assets_expense", on_delete=fields.RESTRICT
+        "models.Account", related_name="fixed_assets_expense", on_delete=fields.NO_ACTION
     )
     purchase_date = fields.DateField()
     cost = fields.DecimalField(max_digits=16, decimal_places=2)
@@ -94,7 +94,7 @@ class DepreciationRunLine(models.Model):
         "models.DepreciationRun", related_name="lines", on_delete=fields.CASCADE
     )
     asset: fields.ForeignKeyRelation[FixedAsset] = fields.ForeignKeyField(
-        "models.FixedAsset", related_name="run_lines", on_delete=fields.RESTRICT
+        "models.FixedAsset", related_name="run_lines", on_delete=fields.NO_ACTION
     )
     amount = fields.DecimalField(max_digits=16, decimal_places=2)
     # The asset's accumulated depreciation at the month's end, by its schedule.

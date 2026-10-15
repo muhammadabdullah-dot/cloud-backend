@@ -108,12 +108,18 @@ SCREEN_RESOURCE = {
     "/accounts/dashboard": "accounts.desk",
     "/accounts/vouchers": "accounts.vouchers",
     "/accounts/settings": "accounts.settings",
+    # Admin is reachable with any of several ticks, but the Technical Reports tab inside it is only there
+    # for this one -- so this is the tick that decides whether Open leads anywhere.
+    "/admin": "admin.sync-endpoints",
 }
 
 # The same work on the reader's own screen, tried when the one the alert names is out of their reach.
 # There is no Executive equivalent of the Transfers board, so that reader gets the alert with no Open
 # rather than a link that goes nowhere — the title and detail say what happened on their own.
-INSTEAD_OF = {"/warehouse/purchase-orders": "/executive/purchase-orders"}
+INSTEAD_OF = {"/warehouse/purchase-orders": "/executive/purchase-orders",
+              # An executive without the Branches tick cannot open Technical Reports; the Branch Errors
+              # tile on their own dashboard asks the same question.
+              "/admin": "/executive"}
 
 
 def _can_open(link: str, grants: dict[str, set[str]]) -> bool:
@@ -295,6 +301,84 @@ async def _low_stock_notice() -> None:
         )
 
 
+async def _running_out_notice() -> None:
+    """Once a day: the branches whose shelves empty within a week at their own rate.
+
+    This is the half of the purchasing loop that was missing. Head office could already look up which branch was
+    running out -- `purchasing_service.suggestions(branch_id=...)` answers it per branch -- but nothing said so,
+    so an order was raised when a shelf was empty rather than before it was. Measured 13 October 2026: Fort
+    Colony had 3.4 days of Panadol left and Garden Town 63.4, and no screen volunteered either.
+
+    It is deliberately NOT the Low Stock notice again. That one counts the godown's Items at or below a reorder
+    level. This one is per branch and measured in days of cover, which is the only figure comparable between a
+    line selling 180 a day and one selling 2 a week.
+
+    The link carries the worst branch, so the person reading it lands on that branch's own suggestion rather than
+    on a company-wide list they then have to filter.
+    """
+    from app.services import purchasing_service
+
+    today = day_start(today_pk())
+    if await Notice.filter(kind="branch.running-out", at__gte=today).exists():
+        return
+    rows = await purchasing_service.branches_running_out()
+    if not rows:
+        return
+    by_branch: dict[str, list] = {}
+    for row in rows:
+        by_branch.setdefault(row["branchCode"], []).append(row)
+    # The branch with the soonest empty shelf leads, because that is the one worth opening first.
+    worst = sorted(by_branch.items(), key=lambda kv: min(r["daysLeft"] for r in kv[1]))
+    lead = worst[0][1][0]
+    parts = []
+    for code, lines in worst[:4]:
+        soonest = min(lines, key=lambda r: r["daysLeft"])
+        parts.append(f"{code} {len(lines)} line(s), soonest {soonest['name'][:28]} in "
+                     f"{float(soonest['daysLeft']):.1f} day(s)")
+    await notify(
+        "branch.running-out",
+        f"{len(rows)} branch line(s) run out within {purchasing_service.RUNNING_OUT_DAYS} days",
+        body="; ".join(parts) + (" …" if len(worst) > 4 else "")
+             + ". Measured on each branch's own sales, counting what is already on its way.",
+        link=f"/warehouse/purchase-orders?branch={lead['branchId']}",
+        audience_any=[("executive.dashboard", "R"), ("warehouse.purchase-orders", "W")], tone="warning",
+    )
+
+
+async def _branch_errors_notice() -> None:
+    """Once a day per shop, say that a branch is reporting failures.
+
+    This is the one part of branch error reporting that goes looking for a person instead of waiting to be
+    found. The tile and the report are both things somebody has to open; nobody at head office opens the
+    Technical Reports tab on an ordinary Tuesday, and the whole premise of the first real install is that
+    nobody can visit the shop or log into its machine either. So a branch that starts failing has to arrive
+    in the bell.
+
+    Only failures from the last day, because a notice about something that stopped three days ago is noise
+    for whoever reads it. Once a day per branch, the same way `_low_stock_notice` holds itself back, and
+    keyed on the branch so one bad shop cannot crowd out another.
+    """
+    from app.services import technical_reports_service as tr
+
+    today = day_start(today_pk())
+    tally = await tr.failure_tally()
+    for shop in tally["branches"]:
+        if not shop["lastDay"]:
+            continue
+        if await Notice.filter(kind="branch.errors", subject_id=shop["id"], at__gte=today).exists():
+            continue
+        fresh, total = shop["lastDay"], shop["total"]
+        await notify(
+            "branch.errors",
+            f"{shop['name']}: {fresh} failure(s) reported today",
+            body=(f"{total} in the last {tally['days']} days. The branch is still pushing, so Sync Health reads "
+                  f"clear -- its staff are working around something. Admin > Technical Reports lists what broke, "
+                  f"with the reference each person there was shown."),
+            link="/admin", tone="bad", subject=("branch", shop["id"]),
+            audience_any=[("admin.sync-endpoints", "R"), ("executive.dashboard", "R"), ("executive.sync-health", "R")],
+        )
+
+
 async def notices_for(user: User, grants: dict[str, set[str]] | None = None) -> list[dict]:
     await use_saved_timings()
     grants = grants if grants is not None else await grants_of(user)
@@ -310,6 +394,8 @@ async def notices_for(user: User, grants: dict[str, set[str]] | None = None) -> 
 async def summary(user: User) -> dict:
     grants = await grants_of(user)
     await _low_stock_notice()
+    await _running_out_notice()
+    await _branch_errors_notice()
     tasks = await tasks_for(user, grants)
     notices = await notices_for(user, grants)
     return {"tasks": tasks, "notices": notices, "unread": sum(1 for n in notices if not n["read"])}

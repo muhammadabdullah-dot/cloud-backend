@@ -1,4 +1,5 @@
-"""Admin › Technical Reports over HTTP: the errors in head office's log, and each branch's sync problems.
+"""Admin › Technical Reports over HTTP: the errors in head office's log, each branch's sync problems, and what
+has gone wrong inside the branches themselves.
 Read-only, for whoever holds the Branches tick (admin.sync-endpoints), the same tick that shows the tab. See
 services/technical_reports_service.py."""
 from datetime import date
@@ -41,3 +42,16 @@ async def error_detail(key: str, user: User = Depends(_reader)) -> dict:
 async def sync_problems(user: User = Depends(_reader)) -> dict:
     """Per branch: when it last reported, events head office couldn't apply, and messages to it not yet applied."""
     return await reports.sync_problems()
+
+
+@router.get("/branch-errors")
+async def branch_errors(
+    days: int = Query(reports.ERROR_DAYS, ge=1, le=reports.MAX_ERROR_DAYS), user: User = Depends(_reader),
+) -> dict:
+    """What has broken inside each branch, grouped by what broke, worst first: its own failed requests, the
+    screens its staff saw break, and the work it does on a timer that nobody was watching. Each line carries the
+    reference the person there was shown, which is the same reference in that branch's own log file.
+
+    This is the only sight head office has of a branch's errors: the branch's log file is on a machine in a shop,
+    and a branch can be unusable all morning while its sync -- the one thing head office watches -- stays green."""
+    return await reports.branch_errors(days=days)

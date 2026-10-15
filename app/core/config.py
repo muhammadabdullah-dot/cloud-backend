@@ -6,7 +6,21 @@ class Settings(BaseSettings):
 
     app_name: str = "D.Marina Cloud Server"
     port: int = 4175
-    db_url: str = "sqlite://./cloud.db"
+    # NO DEFAULT, AND DELIBERATELY NOT SQLITE.
+    #
+    # Head office runs on SQL Server. This said `sqlite://./cloud.db`, and `.env` said the same, so the ONLY reason
+    # the server ran on SQL Server was that every start script overrode DB_URL at launch. Anything run without that
+    # override -- a script, a check, a one-off at a prompt -- silently opened the retired `cloud.db`, which still
+    # exists and still answers every query with figures that stopped moving when the migration finished.
+    #
+    # That is not hypothetical: on 13 October 2026 the first query of a profit-and-loss reconciliation went to it,
+    # and was caught only because the SQL happened to use a placeholder SQLite does not take. Had it been portable,
+    # a month of figures would have been reported off a stale database.
+    #
+    # A SQLite URL is still perfectly good and still accepted -- `ops/dev/start-headoffice.cmd` uses one, and so
+    # does a check run against a copy. What is gone is the silent default. `scripts/print_db_url.py` builds the real
+    # one out of the single file the password lives in, which is why no start script, document or log carries it.
+    db_url: str = ""
     jwt_secret: str = "change-me-cloud"
     # "*" is fine pre-launch (no cookies are used — auth is a Bearer header, so wildcard + no
     # credentials is safe per the CORS spec). Revisit before any real deployment: set this to
@@ -28,6 +42,15 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+if not settings.db_url:
+    raise RuntimeError(
+        "DB_URL is not set, and there is no default any more: there used to be one, and it pointed at the retired "
+        "SQLite copy of head office.\n"
+        "  To start the server:  fresh-test\\start-headoffice.cmd\n"
+        "  For a script:         set DB_URL=<the output of scripts\\print_db_url.py>\n"
+        "A sqlite:// URL is still accepted when you mean it, for dev or for a check against a copy."
+    )
 
 TORTOISE_ORM = {
     "connections": {"default": settings.db_url},

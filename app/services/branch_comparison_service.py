@@ -15,7 +15,8 @@ from decimal import Decimal
 from tortoise import Tortoise
 from tortoise.transactions import atomic
 
-from app.models import Branch, BranchSnapshotRun, Product, Transfer, TransferLine, User
+from app.core import dialect
+from app.models import Branch, BranchSnapshotRun, Product, Transfer, TransferLine, User, selling_branches
 from app.services import executive_service as ex
 from app.services import numbering_service
 
@@ -60,13 +61,16 @@ async def _latest_runs() -> dict[str, BranchSnapshotRun]:
 
 
 async def _branches(period: ex.Period) -> list[dict]:
-    """Every registered branch, and whether it is reporting enough to be compared."""
+    """Every selling branch, and whether it is reporting enough to be compared.
+
+    Head office is not among them -- it never sells, so "has not reported stock or sales" would read as a
+    branch that has gone quiet. See `selling_branches`."""
     runs = await _latest_runs()
     days = {str(r["branch_id"]): int(r["days"] or 0) for r in await _q(
         "SELECT branch_id, COUNT(DISTINCT day) AS days FROM branch_daily_stats WHERE day >= ? AND day <= ? GROUP BY branch_id",
         str(period.start), str(period.end))}
     out = []
-    for b in await Branch.all().order_by("name"):
+    for b in await selling_branches().order_by("name"):
         bid = str(b.id)
         run = runs.get(bid)
         trading = days.get(bid, 0)
@@ -125,12 +129,13 @@ async def compare(period: ex.Period, *, focus: str | None = None, q: str | None 
         return base
 
     by_id = {b["id"]: b for b in reporting}
-    pairs = " OR ".join("(s.branch_id = ? AND s.snapshot_id = ?)" for _ in reporting)
+    pairs = " OR ".join(f"(s.branch_id = {dialect.mark()} AND s.snapshot_id = {dialect.mark('varchar(60)')})"
+                        for _ in reporting)
     stock_params: list = []
     for b in reporting:
         stock_params += [b["id"], b["snapshotId"]]
     ids = [b["id"] for b in reporting]
-    marks = ",".join("?" for _ in ids)
+    marks = dialect.marks(ids)
     rows = await _q(f"""
         WITH st AS (
             SELECT s.branch_id AS branch_id, s.product_sku AS sku, MAX(s.product_name) AS name, MAX(s.category) AS category,
@@ -246,9 +251,9 @@ async def _held_at(branch: Branch, sku: str) -> tuple[Decimal | None, dict | Non
     run = await BranchSnapshotRun.filter(branch_id=branch.id, status="complete").order_by("-completed_at").first()
     if not run:
         return None, None
-    rows = await _q("""
+    rows = await _q(f"""
         SELECT SUM(CAST(qty AS REAL)) AS qty, MAX(product_name) AS name, MAX(CAST(price AS REAL)) AS price, MAX(CAST(avg_cost AS REAL)) AS avg_cost
-        FROM branch_product_stock WHERE branch_id = ? AND snapshot_id = ? AND product_sku = ?
+        FROM branch_product_stock WHERE branch_id = {dialect.mark()} AND snapshot_id = {dialect.mark('varchar(60)')} AND product_sku = {dialect.mark('varchar(60)')}
     """, str(branch.id), run.snapshot_id, sku)
     r = rows[0] if rows else None
     if not r or r["qty"] is None:
@@ -343,28 +348,28 @@ async def _pair_side(b: dict, period: ex.Period) -> tuple[dict, dict[str, dict]]
     from app.services.analytics_service import abc_class
 
     bid = b["id"]
-    day_rows = await _q("""
+    day_rows = await _q(f"""
         SELECT COALESCE(SUM(CAST(net_sales AS REAL)),0) AS net, COALESCE(SUM(CAST(cogs AS REAL)),0) AS cogs,
                COALESCE(SUM(invoices),0) AS bills, COALESCE(SUM(CAST(items_sold AS REAL)),0) AS units,
                COALESCE(SUM(CAST(returns_value AS REAL)),0) AS returns
-        FROM branch_daily_stats WHERE branch_id = ? AND day >= ? AND day <= ?
+        FROM branch_daily_stats WHERE branch_id = {dialect.mark()} AND day >= ? AND day <= ?
     """, bid, str(period.start), str(period.end))
     d = day_rows[0] if day_rows else {}
     items: dict[str, dict] = {}
-    for r in await _q("""
+    for r in await _q(f"""
         SELECT product_sku AS sku, MAX(product_name) AS name, MAX(category) AS category, SUM(CAST(qty AS REAL)) AS units,
                SUM(CAST(net_sales AS REAL)) AS net, SUM(CAST(cogs AS REAL)) AS cogs
-        FROM branch_product_stats WHERE branch_id = ? AND day >= ? AND day <= ? GROUP BY product_sku
+        FROM branch_product_stats WHERE branch_id = {dialect.mark()} AND day >= ? AND day <= ? GROUP BY product_sku
     """, bid, str(period.start), str(period.end)):
         items[r["sku"]] = {"name": r["name"], "category": r["category"], "units": float(r["units"] or 0), "net": float(r["net"] or 0),
                            "onHand": 0.0, "avgCost": 0.0, "held": False}
     stock_value = 0.0
     held_count = 0
     if b["snapshotId"]:
-        for r in await _q("""
+        for r in await _q(f"""
             SELECT product_sku AS sku, MAX(product_name) AS name, MAX(category) AS category, SUM(CAST(qty AS REAL)) AS qty,
                    MAX(CAST(avg_cost AS REAL)) AS avg_cost
-            FROM branch_product_stock WHERE branch_id = ? AND snapshot_id = ? GROUP BY product_sku
+            FROM branch_product_stock WHERE branch_id = {dialect.mark()} AND snapshot_id = {dialect.mark('varchar(60)')} GROUP BY product_sku
         """, bid, b["snapshotId"]):
             qty = float(r["qty"] or 0)
             if qty <= 0 and r["sku"] not in items:
