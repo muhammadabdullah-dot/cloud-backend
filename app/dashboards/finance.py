@@ -75,7 +75,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.core import dialect
-from app.dashboards._shape import card, line, money, pct, table
+from app.dashboards._shape import card, line, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.accounts_reports_service import SECTION_OF_CATEGORY, SECTION_TITLES
 from app.services.dashboards_service import Scope
@@ -292,8 +292,8 @@ def _cards(chain: dict[str, Decimal], days: int, with_entries: int | None, book:
         # whose books stop halfway has everything to add.
         span = f"{span}, {with_entries} with entries"
     return [
-        card("Revenue", money(revenue), sub=span),
-        card("Cost of Sale", money(chain["cost"]), sub=cost_sub),
+        card("Revenue", money(revenue), sub=span, go=to_screen("revenue_trend")),
+        card("Cost of Sale", money(chain["cost"]), sub=cost_sub, go=to_screen("cost_trend")),
         card("Gross Profit", money(chain["gross"]), sub=gross_sub),
         card("Other Income", money(chain["other"]), sub=_share(chain["other"], revenue)),
         card("Expense", money(chain["expense"]), sub=_share(chain["expense"], revenue)),

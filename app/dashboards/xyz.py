@@ -34,7 +34,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.core import dialect
-from app.dashboards._shape import bars, card, money, pct, table
+from app.dashboards._shape import bars, card, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -45,6 +45,9 @@ META = {
     "pages": [
         {"id": "overview", "label": "Steadiness"},
         {"id": "cross", "label": "ABC x XYZ"},
+        # Where a click on a class lands: the Items in it, steadiest first. Its own page rather than a panel,
+        # so it is a screen of the deck like everything else and reads in the dashboards' own table.
+        {"id": "items", "label": "Items by steadiness"},
     ],
 }
 
@@ -118,6 +121,25 @@ async def steadiest(scope: Scope, cls: str, limit: int = 15, worst: bool = False
     """, args + [cls])
 
 
+async def band_items(scope: Scope, limit: int = 400) -> list[dict]:
+    """Every Item of one class, steadiest first, or the whole range when no class has been clicked.
+
+    Filtered AFTER the classes are cut, like ABC's: the cut is on the window, so narrowing first would re-sort
+    everything into new classes inside whatever survived.
+    """
+    sql, args = _variability(scope)
+    where = "x.qty > 0"
+    if scope.band in ("X", "Y", "Z"):
+        where += f" AND x.cls = {dialect.mark('varchar(2)')}"
+        args = [*args, scope.band]
+    return await ds._rows(f"""
+        SELECT {dialect.top(limit)} x.sku AS key_, x.name AS label, x.category, x.brand, x.cls,
+               x.net, x.cogs, x.qty, x.sold_on, x.days, x.mean, x.spread
+          FROM ({sql}) x WHERE {where}
+         ORDER BY x.spread / x.mean ASC {dialect.limit(limit)}
+    """, args)
+
+
 async def cross(scope: Scope) -> list[dict]:
     """ABC against XYZ. The classes are cut here rather than imported so the two always agree about the window."""
     sql, args = _variability(scope)
@@ -138,7 +160,8 @@ async def cross(scope: Scope) -> list[dict]:
           ) r
     """
     return await ds._rows(f"""
-        SELECT a.abc, x.cls AS xyz, COUNT(*) AS items, SUM(x.net) AS net, SUM(x.cogs) AS cogs
+        SELECT a.abc, x.cls AS xyz, COUNT(*) AS items, SUM(x.net) AS net, SUM(x.cogs) AS cogs,
+               SUM(x.qty) AS qty
           FROM ({sql}) x JOIN ({abc}) a ON a.sku = x.sku
          GROUP BY a.abc, x.cls
     """, args + abc_args)
@@ -159,14 +182,19 @@ async def build(page_id: str, scope: Scope) -> dict:
         {"label": "trading days in the window", "value": (scope.end - scope.start).days + 1},
     ]
 
-    cards = [card("Items", str(total_items), kind="number"), card("Revenue", money(total_net))]
+    cards = [card("Items", str(total_items), kind="number", go=to_page("items")),
+             # The class chart is on this very screen, so the card would be a button that does nothing. It
+             # goes to the cross of ABC and XYZ, which is where the same revenue is cut both ways.
+             card("Revenue", money(total_net), go=to_page("cross"))]
     for name, what in (("X", "steady"), ("Y", "lumpy"), ("Z", "erratic")):
         row = by.get(name, {})
         items = int(row.get("items") or 0)
         cards.append(card(
             f"{name} -- {what}", str(items), kind="number",
             sub=f"{pct(ds._d(items), ds._d(total_items))}% of range · "
-                f"{pct(ds._d(row.get('net')), total_net)}% of revenue"))
+                f"{pct(ds._d(row.get('net')), total_net)}% of revenue",
+            # The drill: this class's own Items, steadiest first, in the dashboards' own table.
+            go=to_page("items", name)))
 
     visuals: list[dict] = []
 
@@ -194,10 +222,12 @@ async def build(page_id: str, scope: Scope) -> dict:
              {"key": "sold_on", "label": "Days sold", "align": "right"},
              {"key": "mean", "label": "Per day", "align": "right"},
              {"key": "spread", "label": "Spread", "align": "right"},
+             {"key": "qty", "label": "Units", "align": "right"},
              {"key": "value", "label": "Revenue", "align": "right"}],
             [{"key": str(r["key_"]), "label": str(r["label"] or r["key_"]),
               "sold_on": str(int(r["sold_on"] or 0)), "mean": f"{ds._d(r['mean']):.2f}",
-              "spread": f"{ds._d(r['spread']):.2f}", "value": money(r["net"])} for r in steady],
+              "spread": f"{ds._d(r['spread']):.2f}", "qty": money(r["qty"]),
+              "value": money(r["net"])} for r in steady],
             note="These are the Items to put on a standing order: they sell the same amount every day."))
         erratic = await steadiest(scope, "Z", 15, worst=True)
         visuals.append(table(
@@ -206,11 +236,42 @@ async def build(page_id: str, scope: Scope) -> dict:
              {"key": "sold_on", "label": "Days sold", "align": "right"},
              {"key": "mean", "label": "Per day", "align": "right"},
              {"key": "spread", "label": "Spread", "align": "right"},
+             {"key": "qty", "label": "Units", "align": "right"},
              {"key": "value", "label": "Revenue", "align": "right"}],
             [{"key": str(r["key_"]), "label": str(r["label"] or r["key_"]),
               "sold_on": str(int(r["sold_on"] or 0)), "mean": f"{ds._d(r['mean']):.2f}",
-              "spread": f"{ds._d(r['spread']):.2f}", "value": money(r["net"])} for r in erratic],
+              "spread": f"{ds._d(r['spread']):.2f}", "qty": money(r["qty"]),
+              "value": money(r["net"])} for r in erratic],
             note="Sold on very few days, in lumps. Holding stock for these is what ties up money."))
+        return {"cards": cards, "visuals": visuals, "covers": covers}
+
+    if page_id == "items":
+        band = scope.band if scope.band in ("X", "Y", "Z") else None
+        word = {"X": "steady", "Y": "lumpy", "Z": "erratic"}.get(band or "", "")
+        listed = await band_items(scope)
+        visuals.append(table(
+            "band", f"Class {band}: every Item in it, steadiest first" if band
+                    else "Every Item, steadiest first", "sku",
+            [{"key": "label", "label": "Item"},
+             {"key": "cls", "label": "Class"},
+             {"key": "category", "label": "Category"},
+             {"key": "brand", "label": "Brand"},
+             {"key": "sold_on", "label": "Days sold", "align": "right"},
+             {"key": "share_days", "label": "% of days", "align": "right"},
+             {"key": "mean", "label": "Per day", "align": "right"},
+             {"key": "spread", "label": "Variability", "align": "right"},
+             {"key": "qty", "label": "Units", "align": "right"},
+             {"key": "value", "label": "Revenue", "align": "right"}],
+            [{"key": str(r["key_"]), "label": str(r["label"] or r["key_"]), "cls": str(r["cls"]),
+              "category": str(r["category"] or ""), "brand": str(r["brand"] or ""),
+              "sold_on": str(int(r["sold_on"] or 0)),
+              "share_days": pct(ds._d(r["sold_on"]), ds._d(r["days"])),
+              "mean": f"{ds._d(r['mean']):.2f}", "spread": f"{ds._d(r['spread']):.2f}",
+              "qty": money(r["qty"]), "value": money(r["net"])} for r in listed],
+            note=(f"Every Item selling {word}ly enough to be class {band}, {len(listed):,} of them. "
+                  if band else f"The {len(listed):,} steadiest of {total_items:,}. ")
+                 + "Variability is how much the daily quantity moves about its own average: 0 is the same "
+                   "number every day, and the higher it climbs the harder the Item is to buy for."))
         return {"cards": cards, "visuals": visuals, "covers": covers}
 
     if page_id == "cross":
@@ -226,12 +287,14 @@ async def build(page_id: str, scope: Scope) -> dict:
             [{"key": "label", "label": "Class"},
              {"key": "meaning", "label": "What it means"},
              {"key": "items", "label": "Items", "align": "right"},
+             {"key": "qty", "label": "Units", "align": "right"},
              {"key": "value", "label": "Revenue", "align": "right"},
              {"key": "share", "label": "% of revenue", "align": "right"},
              {"key": "profit", "label": "Profit", "align": "right"}],
             [{
                 "key": f"{a}{x}", "label": f"{a}{x}", "meaning": meaning[(a, x)],
                 "items": str(int(cell.get((a, x), {}).get("items") or 0)),
+                "qty": money(cell.get((a, x), {}).get("qty")),
                 "value": money(cell.get((a, x), {}).get("net")),
                 "share": pct(ds._d(cell.get((a, x), {}).get("net")), total_net),
                 "profit": money(ds._d(cell.get((a, x), {}).get("net"))

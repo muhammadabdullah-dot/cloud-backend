@@ -111,7 +111,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from app.core import dialect
-from app.dashboards._shape import card, line, money, pct, table
+from app.dashboards._shape import card, line, money, pct, table, to_page, to_screen
 from app.models import HEAD_OFFICE_BOOK
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
@@ -557,14 +557,14 @@ def _cards(position: dict, flow_paid: Decimal, flow_billed: Decimal, days: int) 
         card("Balance", money(position["balance"]),
              sub=f"{_n(len(position['parties']))} {many} · outstanding less "
                  f"{_rs(position['advance'])} paid in advance"),
-        card("Outstanding", money(outstanding),
+        card("Outstanding", money(outstanding), go=to_screen("settle_status"),
              sub=f"{_n(position['open_items'])} open items {owed_word} {_n(owing)} {many}"),
-        card("Overdue", money(position["overdue"]),
+        card("Overdue", money(position["overdue"]), go=to_screen("past_due_brackets"),
              sub=f"{pct(position['overdue'], outstanding)}% of what is outstanding"
                  f" · oldest {_n(position['worst_days'])} days past due"),
         # The one card that has to name the credit days it was measured against, because it is the card whose
         # whole meaning is "inside them". A `sub` always draws; the note on the chart below it does not.
-        card("Not yet due", money(position["not_due"]),
+        card("Not yet due", money(position["not_due"]), go=to_screen("settle_status"),
              sub=f"{pct(position['not_due'], outstanding)}% of what is outstanding"
                  f"{_terms_tag(position)}"),
         card("Advance held", money(position["advance"]),

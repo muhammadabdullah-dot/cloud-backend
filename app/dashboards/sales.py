@@ -5,7 +5,7 @@ product-days the charts are, so a figure at the top can never disagree with the 
 """
 from __future__ import annotations
 
-from app.dashboards._shape import bars, card, donut, money
+from app.dashboards._shape import bars, card, donut, money, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -35,21 +35,28 @@ async def build(page_id: str, scope: Scope) -> dict:
     head = await ds.headline(scope)
     net, profit = head["net"], head["profit"]
     cards = [
-        card("Revenue", money(net)),
-        card("Gross Profit", money(profit), sub=f"{head['margin']:.1f}% margin"),
-        card("Cost of Sale", money(head["cogs"])),
-        card("Items Sold", money(head["qty"]), kind="number"),
-        card("Per Trading Day", money(head["per_day"]), sub=f"over {head['days']} day(s)"),
+        # Every figure here leads to the chart that takes it apart. The trend is on the overview and the
+        # mix pages are where the same money is split by department, so the cards point at whichever of the
+        # two the reader is not already looking at.
+        card("Revenue", money(net), go=to_screen("trend") if page_id == "overview" else to_screen("department")),
+        card("Gross Profit", money(profit), sub=f"{head['margin']:.1f}% margin",
+             go=to_screen("trend") if page_id == "overview" else to_page("overview")),
+        card("Cost of Sale", money(head["cogs"]), go=to_page("mix")),
+        card("Items Sold", money(head["qty"]), kind="number", go=to_page("mix")),
+        card("Per Trading Day", money(head["per_day"]), sub=f"over {head['days']} day(s)",
+             go=to_screen("trend") if page_id == "overview" else to_page("overview")),
     ]
     visuals: list[dict] = []
 
     if page_id == "overview":
         bill = await ds.invoices(scope)
         cards += [
+            # The hourly chart is the only thing on this dashboard about bills rather than Items, so the
+            # three bill figures all lead to it.
             card("Invoices", str(bill["bills"]), kind="number",
-                 sub="bills that contained this" if bill["narrowed"] else None),
-            card("Average Basket", money(bill["basket"])),
-            card("Discount", money(bill["disc"])),
+                 sub="bills that contained this" if bill["narrowed"] else None, go=to_screen("hours")),
+            card("Average Basket", money(bill["basket"]), go=to_screen("hours")),
+            card("Discount", money(bill["disc"]), go=to_screen("hours")),
         ]
         days = await ds.trend(scope)
         visuals.append({

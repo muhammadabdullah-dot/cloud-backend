@@ -87,7 +87,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.core import dialect
-from app.dashboards._shape import bars, card, donut, money, pct, table
+from app.dashboards._shape import bars, card, donut, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -632,16 +632,16 @@ async def build(page_id: str, scope: Scope) -> dict:
     ]
 
     cards = [
-        card("Orders", f"{orders}", kind="number",
+        card("Orders", f"{orders}", kind="number", go=to_screen("status"),
              sub=f"from {int(head['suppliers'] or 0)} supplier(s), "
                  f"{int(head['items'] or 0):,} Item(s) on {int(head['n_lines'] or 0):,} line(s)"),
         card("Ordered", money(value), sub="summed from the order lines, not the order header"),
-        card("Received", money(received_value),
+        card("Received", money(received_value), go=to_screen("lead"),
              sub=f"{pct(received_value, placed_value)}% of the {_rs(placed_value)} actually placed"),
-        card("Short", money(placed_value - received_value),
+        card("Short", money(placed_value - received_value), go=to_screen("shortfall"),
              sub=f"on {short_lines:,} of {placed_lines:,} placed line(s), "
                  f"{int(head['nothing_lines'] or 0):,} of which got nothing"),
-        card("Still a Draft", f"{n_drafts}", kind="number",
+        card("Still a Draft", f"{n_drafts}", kind="number", go=to_screen("drafts"),
              sub=(f"{_rs(draft_value)} that nobody has placed, so nothing can have arrived" if n_drafts
                   else "every order in this window was submitted")),
         card("Units Ordered", money(head["qty"]), kind="number",

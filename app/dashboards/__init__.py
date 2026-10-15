@@ -18,7 +18,19 @@ import importlib
 import pkgutil
 from typing import Any
 
+from app.core.resources import DASHBOARD_RESOURCES
+
 _LOADED: dict[str, Any] | None = None
+
+
+def resource_of(key: str) -> str:
+    """The access resource for a dashboard, from its module name. `accounts_trade` -> `dashboards.accounts-trade`.
+
+    Derived rather than declared in each module's META, so the two can never drift: a dashboard cannot name a
+    resource belonging to a different one, and renaming the file renames the tick, which `registry()` then
+    refuses until `resources.py` agrees.
+    """
+    return f"dashboards.{key.replace('_', '-')}"
 
 
 def registry() -> dict[str, Any]:
@@ -40,17 +52,35 @@ def registry() -> dict[str, Any]:
                     raise RuntimeError(
                         f"{info.name}: a dashboard page cannot be called 'preview'. That path belongs to the "
                         f"board's card preview; rename the page.")
+                # EVERY DASHBOARD HAS A TICK OF ITS OWN on the access screen, and it has to exist before the
+                # dashboard loads. Refused here rather than at request time, because the two ways this goes
+                # wrong are both silent: a resource nobody added means a dashboard nobody can ever be given,
+                # and a typo means one that is gated by a resource no role will ever hold. Both look like an
+                # empty board to whoever is wondering where their dashboard went.
+                if resource_of(info.name) not in set(DASHBOARD_RESOURCES):
+                    raise RuntimeError(
+                        f"{info.name}: no access resource. Add {resource_of(info.name)!r} to "
+                        f"DASHBOARD_RESOURCES in app/core/resources.py, or the dashboard cannot be granted "
+                        f"to anybody.")
                 found[info.name] = module
         _LOADED = found
     return _LOADED
 
 
 def visible(granted: set[str]) -> list[dict]:
-    """The dashboards these grants reach, in a stable order so the board does not shuffle between visits."""
+    """The dashboards these grants reach, in a stable order so the board does not shuffle between visits.
+
+    ONE TICK EACH, and it is the only gate. This used to read `META["resource"]`, the resource of the screen
+    the figures come from, so holding `executive.dashboard` handed you Sales Analysis whether anybody meant
+    it or not and there was no way to give one person ABC Analysis and not another. The screen resource is
+    still on META, because a dashboard says which screen it belongs beside, but it no longer decides who
+    sees it.
+    """
     out = []
     for key, module in sorted(registry().items()):
         meta = module.META
-        if meta["resource"] in granted:
+        resource = resource_of(key)
+        if resource in granted:
             out.append({"id": key, "label": meta["label"], "blurb": meta["blurb"],
-                        "resource": meta["resource"], "pages": meta["pages"]})
+                        "resource": resource, "draws": meta["resource"], "pages": meta["pages"]})
     return out

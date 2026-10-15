@@ -19,8 +19,26 @@ def money(value) -> str:
     return f"{ds._d(value):.2f}"
 
 
-def card(label: str, value: str, kind: str = "money", sub: str | None = None) -> dict:
-    return {"label": label, "value": value, "kind": kind, "sub": sub}
+def to_screen(visual_id: str) -> dict:
+    """A card that leads to the chart on this page that explains it. Stays on the page; moves the deck."""
+    return {"to": "screen", "visual": visual_id}
+
+
+def to_page(page_id: str, band: str | None = None) -> dict:
+    """A card that leads to another page of the SAME dashboard, optionally one band of it."""
+    return {"to": "page", "page": page_id, **({"band": band} if band else {})}
+
+
+def card(label: str, value: str, kind: str = "money", sub: str | None = None,
+         go: dict | None = None) -> dict:
+    """One figure in the strip, and where clicking it goes.
+
+    `go` is the whole of a card's interactivity and it only ever points INSIDE this dashboard: a screen of this
+    page, or another page of this same dashboard. Never another module, never an older report. A card with
+    nowhere honest to go is left plain rather than made into a button that shrugs, which is why this defaults
+    to None and why several cards below keep it.
+    """
+    return {"label": label, "value": value, "kind": kind, "sub": sub, "go": go}
 
 
 def bars(id_: str, title: str, dimension: str | None, rows: list[dict],

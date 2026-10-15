@@ -65,7 +65,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from app.dashboards._shape import bars, card, donut, line, money, pct, table
+from app.dashboards._shape import bars, card, donut, line, money, pct, table, to_page, to_screen
 from app.models import selling_branches
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
@@ -771,18 +771,18 @@ async def build(page_id: str, scope: Scope) -> dict:
     total_invoices = None if dimensional else sum(int(r["invoices"] or 0) for r in rows)
 
     cards = [
-        card("Revenue", money(total_net),
+        card("Revenue", money(total_net), go=to_screen("branches"),
              sub=f"{trading} of {len(rows)} branch(es) traded in these dates" if rows else "no branch traded"),
         card("Gross Profit", money(total_profit), sub=f"{pct(total_profit, total_net)}% margin"),
-        card("Per Branch Trading Day", money(_per(total_net, branch_days)),
+        card("Per Branch Trading Day", money(_per(total_net, branch_days)), go=to_screen("per_day"),
              sub=f"over {branch_days} branch-day(s), each branch counted only for the days it traded"),
-        card("Items Sold", money(total_qty), kind="number"),
+        card("Items Sold", money(total_qty), kind="number", go=to_screen("ranked")),
     ]
     if total_invoices is None:
         cards.append(card("Bills", "--", kind="number", sub="bills cannot follow an Item filter"))
     else:
         cards += [
-            card("Bills", str(total_invoices), kind="number"),
+            card("Bills", str(total_invoices), kind="number", go=to_page("people")),
             card("Average Basket", money(total_net / total_invoices if total_invoices else D0)),
         ]
 
@@ -808,7 +808,8 @@ async def build(page_id: str, scope: Scope) -> dict:
             card("People Who Rang a Sale",
                  "--" if dimensional else str(len({(str(r['branch_id']), str(r['name'])) for r in cashiers})),
                  kind="number",
-                 sub="one person at two branches counts once per branch" if not dimensional else None),
+                 sub="one person at two branches counts once per branch" if not dimensional else None,
+                 go=to_screen("cashiers")),
             # Counted from the session rows, not from the branches' own `tills_closed`. The two differ by three
             # over the test month (319 here against 316 there) and the Branches page says why; this is the one
             # the tables below are built from, so it is the one that has to be on the card above them.

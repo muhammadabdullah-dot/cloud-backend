@@ -35,7 +35,7 @@ the dates rather than a column somebody forgot to fill.
 from __future__ import annotations
 
 from app.core import dialect
-from app.dashboards._shape import bars, card, donut, money, pct, table
+from app.dashboards._shape import bars, card, donut, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -405,16 +405,16 @@ async def build(page_id: str, scope: Scope) -> dict:
         at_cost, at_retail = ds._d(head.get("at_cost")), ds._d(head.get("at_retail"))
         lines = int(head.get("lines") or 0)
         cards = [
-            card("Stock at Cost", money(at_cost),
+            card("Stock at Cost", money(at_cost), go=to_screen("branches"),
                  sub=f"the last picture from {int(head.get('branches') or 0)} branch(es), not these dates"),
-            card("Stock at Retail", money(at_retail)),
+            card("Stock at Retail", money(at_retail), go=to_screen("where")),
             card("Markup on the Shelf", money(at_retail - at_cost),
                  sub=f"{pct(at_retail - at_cost, at_cost)}% over cost"),
-            card("Units on Hand", money(head.get("units")), kind="number",
+            card("Units on Hand", money(head.get("units")), kind="number", go=to_page("movement"),
                  sub=f"{int(head.get('skus') or 0):,} distinct Items"),
             card("Stock Lines", f"{lines}", kind="number",
                  sub=f"{int(head.get('negative') or 0):,} negative, {int(head.get('at_zero') or 0):,} at zero"),
-            card("Value Below Nothing", money(head.get("negative_cost")),
+            card("Value Below Nothing", money(head.get("negative_cost")), go=to_screen("negatives"),
                  sub="what the negative lines take off the total"),
         ]
         godown = await _godown(scope)
@@ -468,11 +468,11 @@ async def build(page_id: str, scope: Scope) -> dict:
         dead = await _not_sold_totals(scope, where, args)
         on_hand, sold_units = ds._d(head.get("units")), sold["qty"]
         cards = [
-            card("Not Sold in These Dates", money(dead.get("at_cost")),
+            card("Not Sold in These Dates", money(dead.get("at_cost")), go=to_screen("dead"),
                  sub=f"{int(dead.get('lines') or 0):,} of {int(head.get('holding') or 0):,} lines holding stock"),
-            card("Units Not Sold", money(dead.get("units")), kind="number"),
+            card("Units Not Sold", money(dead.get("units")), kind="number", go=to_screen("dead")),
             card("Units Sold", money(sold_units), kind="number", sub=f"over {days} day(s)"),
-            card("Sales in These Dates", money(sold["net"])),
+            card("Sales in These Dates", money(sold["net"]), go=to_page("overview")),
             # Stock on hand against the rate it is leaving at. Rs 124.1M of stock against 411,977.871 units sold
             # in the 30 day test window comes out at 56 days, which is a figure a buyer can argue with.
             card("Days of Cover", f"{on_hand * days / sold_units:.0f}" if sold_units else "0", kind="number",

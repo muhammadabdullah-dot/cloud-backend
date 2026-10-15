@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app import dashboards as registry
 from app.controllers import dashboards_controller as dc
 from app.middlewares.auth import get_current_user
 from app.models import User, UserPermission
@@ -56,8 +57,8 @@ async def dashboard_preview(
     module = dc.find(dashboard)
     if not module:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such dashboard.")
-    if module.META["resource"] not in await _granted(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your access does not cover what this dashboard draws.")
+    if registry.resource_of(dashboard) not in await _granted(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You have not been given this dashboard.")
     first, last = _window(start, end)
     return await dc.preview(dashboard, Scope(start=first, end=last))
 
@@ -77,14 +78,18 @@ async def dashboard_page(
     category: str | None = None,
     brand: str | None = None,
     sku: str | None = None,
+    # One band of a classed dashboard: A, B or C on ABC Analysis, X, Y or Z on XYZ. Not a dimension: a class is
+    # not a column anywhere, it is cut from the window each time, so it travels beside `picked` rather than in it.
+    band: str | None = None,
     user: User = Depends(get_current_user),
 ) -> dict:
     module = dc.find(dashboard)
     if not module:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No such dashboard.")
-    if module.META["resource"] not in await _granted(user):
-        raise HTTPException(status.HTTP_403_FORBIDDEN,
-                            "Your access does not cover what this dashboard draws.")
+    # The dashboard's OWN resource, not the resource of the screen it draws. One tick each, administered on
+    # the person like everything else; see `app/core/resources.py`.
+    if registry.resource_of(dashboard) not in await _granted(user):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "You have not been given this dashboard.")
 
     first, last = _window(start, end)
 
@@ -103,6 +108,7 @@ async def dashboard_page(
         at_start=start if start and start.time() != midnight else None,
         at_end=end if end and end.time() != midnight else None,
         picked=picked,
+        band=(band.strip().upper()[:1] or None) if band else None,
     )
     try:
         return await dc.page(dashboard, page, scope, user)

@@ -41,6 +41,33 @@ AREA_KEYS: list[str] = [
 ]
 AREA_RESOURCES: list[str] = [f"accounts.area.{key}" for key in AREA_KEYS]
 
+# ── the analytical dashboards, one tick each ──────────────────────────────────────────────────────
+# A dashboard used to be gated by the resource of the SCREEN it draws: Sales Analysis rode on
+# `executive.dashboard`, the books ones on `accounts.*`. That made them invisible to the person handing out
+# access -- there was no line to tick, so "who can see ABC Analysis" had no answer and no control.
+#
+# One resource each, so they are administered exactly like every other screen. The name is the module's own
+# file name in `app/dashboards/`, hyphenated: `app/dashboards/accounts_trade.py` is `dashboards.accounts-trade`.
+# `app.dashboards.registry()` refuses to load a module whose resource is not on this list, so a new dashboard
+# cannot ship ungated and cannot ship invisible to the access screen -- it fails at import, loudly, here.
+#
+# READ THIS BEFORE GRANTING ONE. A dashboard resource is now the ONLY gate on it, which means it can be given
+# to somebody who does not hold the screen the figures come from: `dashboards.finance` shows a profit and loss
+# without `accounts.income-statement`, and `dashboards.payables` shows who is owed what without
+# `accounts.registers`. That is the point of per-dashboard control and it is also its sharp edge. The figures
+# are summaries rather than the ledger itself, but they are real money and a person given one can read it.
+DASHBOARD_RESOURCES: list[str] = [
+    "dashboards.abc",
+    "dashboards.accounts-trade",
+    "dashboards.branches",
+    "dashboards.finance",
+    "dashboards.payables",
+    "dashboards.purchasing",
+    "dashboards.sales",
+    "dashboards.stock",
+    "dashboards.xyz",
+]
+
 RESOURCES: list[str] = [
     "warehouse.dashboard",
     "warehouse.bins",
@@ -99,6 +126,8 @@ RESOURCES: list[str] = [
     *ACCOUNTS_RESOURCES,
     # Which accounts a person sees (R) and can put on a voucher line (W), one resource per area.
     *AREA_RESOURCES,
+    # The analytical dashboards, one tick each. See the note above DASHBOARD_RESOURCES.
+    *DASHBOARD_RESOURCES,
 ]
 
 # Resource that gates the delegated permission-management endpoints themselves (contracts.md §2.6).
@@ -121,7 +150,8 @@ def _matches(resource: str, prefix: str) -> bool:
 # who accepts the variance), and the Decisions queue that exists to hold both. Dispatch is NOT
 # excluded — picking and dispatching is exactly the Picker's job.
 ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
-    "warehouse-manager": {"prefixes": ["warehouse"], "extra": [], "exclude": []},
+    "warehouse-manager": {"prefixes": ["warehouse"],
+                          "extra": ["dashboards.purchasing", "dashboards.stock"], "exclude": []},
     # A Picker / Packer is a floor worker (actors-and-interfaces.md §19): pick, pack, dispatch what's been
     # approved, count shelves, and find Items and bins. Everything that spends money, commits stock to a
     # branch, changes master data or signs something off belongs to the Warehouse Manager (§18).
@@ -144,12 +174,22 @@ ROLE_TEMPLATES: dict[str, dict[str, list[str]]] = {
             "warehouse.promotions.approve",   # writing a campaign is one right, sending it to the tills is another
             "warehouse.bins.manage",
             "warehouse.item-lists",
+            # Not inherited anyway -- `dashboards` is its own prefix and a Picker holds none of it -- but
+            # named so that adding "dashboards" to the prefixes above can never quietly hand a floor worker
+            # the company's revenue and margins.
+            *DASHBOARD_RESOURCES,
         ],
     },
     # The Executive holds the books until an Accountant is added — like the Branch Manager at a branch.
     # The Executive holds every head office screen: their own view first, then the godown, the books and admin.
-    "executive": {"prefixes": ["executive", "warehouse", "accounts", "admin"], "extra": [], "exclude": []},
-    "accountant": {"prefixes": ["accounts"], "extra": ["executive.branches"], "exclude": []},
+    "executive": {"prefixes": ["executive", "warehouse", "accounts", "admin", "dashboards"],
+                  "extra": [], "exclude": []},
+    # The books ones, and nothing else. An accountant has no business being handed Branch Performance by
+    # default: they can be given it, by somebody, deliberately. That is now a tick rather than a side effect.
+    "accountant": {"prefixes": ["accounts"],
+                   "extra": ["executive.branches", "dashboards.finance", "dashboards.payables",
+                             "dashboards.accounts-trade"],
+                   "exclude": []},
     "system-admin": {"prefixes": ["admin"], "extra": [], "exclude": []},
 }
 

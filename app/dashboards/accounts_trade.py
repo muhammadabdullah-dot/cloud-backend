@@ -26,7 +26,7 @@ If customer-level analysis is wanted later, the branch is where identity lives; 
 from __future__ import annotations
 
 from app.core import dialect
-from app.dashboards._shape import bars, card, money, pct, table
+from app.dashboards._shape import bars, card, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -104,11 +104,11 @@ async def build(page_id: str, scope: Scope) -> dict:
         {"label": "days in the window", "value": (scope.end - scope.start).days + 1},
     ]
     cards = [
-        card("Named Accounts", str(s["accounts"]), kind="number",
+        card("Named Accounts", str(s["accounts"]), kind="number", go=to_screen("accounts"),
              sub="everyone else is the counter"),
-        card("Their Revenue", money(s["named_net"]),
+        card("Their Revenue", money(s["named_net"]), go=to_screen("accounts"),
              sub=f"{pct(s['named_net'], s['net'])}% of all trade"),
-        card("Their Bills", str(s["named_bills"]), kind="number",
+        card("Their Bills", str(s["named_bills"]), kind="number", go=to_screen("frequency"),
              sub=f"{pct(ds._d(s['named_bills']), ds._d(s['bills']))}% of all bills"),
         card("Average Bill", money(s["named_net"] / s["named_bills"] if s["named_bills"] else 0),
              sub="against " + money(s["walk_net"] / s["walk_bills"] if s["walk_bills"] else 0)

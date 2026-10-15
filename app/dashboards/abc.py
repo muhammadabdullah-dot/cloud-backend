@@ -36,7 +36,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from app.core import dialect
-from app.dashboards._shape import bars, card, donut, money, pct, table
+from app.dashboards._shape import bars, card, donut, money, pct, table, to_page, to_screen
 from app.services import dashboards_service as ds
 from app.services.dashboards_service import Scope
 
@@ -125,9 +125,20 @@ async def classes_by(scope: Scope, dimension: str, limit: int = 12) -> list[dict
 
 
 async def ranked_items(scope: Scope, limit: int = 300) -> list[dict]:
+    """Every Item in the window, best first, or one band of them when a class has been clicked.
+
+    The band is filtered AFTER the ranking, never before it: the classes are cut on the whole window, so
+    narrowing first would re-cut A, B and C inside whatever was left and the Item that was a C would come back
+    an A. The place number and the cumulative share therefore stay the ones from the full list, which is what
+    makes "number 412 of 11,661" mean anything.
+    """
     sql, args = _ranked(scope)
+    where = ""
+    if scope.band in CLASS_ORDER:
+        where = f"WHERE x.cls = {dialect.mark('varchar(2)')}"
+        args = [*args, scope.band]
     return await ds._rows(f"""
-        SELECT {dialect.top(limit)} x.* FROM ({sql}) x ORDER BY x.place {dialect.limit(limit)}
+        SELECT {dialect.top(limit)} x.* FROM ({sql}) x {where} ORDER BY x.place {dialect.limit(limit)}
     """, args)
 
 
@@ -156,17 +167,31 @@ async def build(page_id: str, scope: Scope) -> dict:
     ]
 
     cards = [
-        card("Items", str(total_items), kind="number"),
-        card("Revenue", money(total_net)),
-        card("Gross Profit", money(total_profit), sub=f"{pct(total_profit, total_net)}% margin"),
+        # Items goes to the ranked list, which IS the Items. The two money figures go to the rings that
+        # split them by class, which is what this dashboard is for.
+        card("Items", str(total_items), kind="number", go=to_page("items")),
+        # NOT the ring and the profit bars: both are on the first screen, beside these very cards, and the app
+        # correctly refuses to make a card a button when its target is already in front of the reader. A card
+        # earns its click by going somewhere else, so these go on to where the same money is broken down.
+        card("Revenue", money(total_net), go=to_screen("class_spread")),
+        card("Gross Profit", money(total_profit), sub=f"{pct(total_profit, total_net)}% margin",
+             go=to_page("items")),
     ]
+    total_qty = sum(ds._d(r["qty"]) for r in rows)
     for name in ("A", "B", "C"):
         items = int(by_class.get(name, {}).get("items") or 0)
         cards.append(card(
             f"Class {name}", money(klass(name, "net")),
+            # Three shares, and the third is the one that was missing: share of the RANGE, share of the money,
+            # and share of the units that went over the counter. A class can be 5% of revenue and a quarter of
+            # everything carried out of the shop, which is a fact about shelf space and replenishment that
+            # neither of the other two figures tells you.
             sub=f"{items} Item{'' if items == 1 else 's'}"
                 f" ({pct(ds._d(items), ds._d(total_items))}% of range)"
-                f" · {pct(klass(name, 'net'), total_net)}% of revenue"))
+                f" · {pct(klass(name, 'net'), total_net)}% of revenue"
+                f" · {pct(klass(name, 'qty'), total_qty)}% of units",
+            # The drill the whole dashboard exists for: the band's own Items, in the dashboards' own table.
+            go=to_page("items", name)))
 
     visuals: list[dict] = []
 
@@ -183,6 +208,14 @@ async def build(page_id: str, scope: Scope) -> dict:
             "rows": [{"key": str(r["cls"]), "label": f"Class {r['cls']}",
                       "value": str(int(r["items"] or 0)),
                       "qty": money(r["qty"])} for r in rows],
+        })
+        visuals.append({
+            "id": "by_class_qty", "kind": "bars", "title": "Units sold by class", "dimension": None,
+            "note": "What left the shelf, against what it earned. Class C is the long tail by revenue and is "
+                    "usually nothing of the kind by units: these are the Items staff handle all day.",
+            "rows": [{"key": str(r["cls"]), "label": f"Class {r['cls']}",
+                      "value": money(r["qty"]),
+                      "qty": money(r["net"])} for r in rows],
         })
         visuals.append({
             "id": "by_class_profit", "kind": "bars", "title": "Gross profit by class", "dimension": None,
@@ -209,25 +242,44 @@ async def build(page_id: str, scope: Scope) -> dict:
             deepest = levels[-1]
             word = ds.LEVEL_WORD[deepest]
             rows_deep = await classes_by(scope, deepest, 40 if deepest == "sku" else 14)
+            # AT ITEM GRAIN THE SPREAD COLUMNS ARE NOISE. An Item is in exactly one class, so A, B and C read
+            # 1, 0, 0 down the whole table and "Items" reads 1 on every row: four columns saying nothing, which
+            # is what they did when a brand was picked. One Class column says the same thing and leaves the
+            # width for figures. Above Item grain they are the point of the table and stay.
+            at_item = deepest == "sku"
+            spread = ([{"key": "cls", "label": "Class"}] if at_item else
+                      [{"key": "a", "label": "A", "align": "right"},
+                       {"key": "b", "label": "B", "align": "right"},
+                       {"key": "c", "label": "C", "align": "right"},
+                       {"key": "items", "label": "Items", "align": "right"}])
+
+            def cells(r: dict) -> dict:
+                a, b, c = int(r["a_items"] or 0), int(r["b_items"] or 0), int(r["c_items"] or 0)
+                if at_item:
+                    return {"cls": "A" if a else "B" if b else "C"}
+                return {"a": str(a), "b": str(b), "c": str(c), "items": str(int(r["items"] or 0))}
+
             visuals.append(table(
                 "class_spread", f"Where the long tail sits, by {word}", deepest,
-                [{"key": "label", "label": word.capitalize()},
-                 {"key": "a", "label": "A", "align": "right"},
-                 {"key": "b", "label": "B", "align": "right"},
-                 {"key": "c", "label": "C", "align": "right"},
-                 {"key": "items", "label": "Items", "align": "right"},
+                [{"key": "label", "label": word.capitalize()}, *spread,
+                 # Units beside the money, because the two disagree and the disagreement is the finding: the
+                 # cheap Item at the bottom of the revenue table is often the one being handled most.
+                 {"key": "qty", "label": "Units", "align": "right"},
                  {"key": "value", "label": "Revenue", "align": "right"},
-                 {"key": "share", "label": "% of revenue", "align": "right"}],
-                [{"key": str(r["key_"] or ""), "label": str(r["label"] or "--"),
-                  "a": str(int(r["a_items"] or 0)), "b": str(int(r["b_items"] or 0)),
-                  "c": str(int(r["c_items"] or 0)), "items": str(int(r["items"] or 0)),
-                  "value": money(r["net"]), "share": pct(ds._d(r["net"]), total_net)} for r in rows_deep]))
+                 {"key": "share", "label": "% of revenue", "align": "right"},
+                 {"key": "qshare", "label": "% of units", "align": "right"}],
+                [{"key": str(r["key_"] or ""), "label": str(r["label"] or "--"), **cells(r),
+                  "qty": money(r["qty"]), "value": money(r["net"]),
+                  "share": pct(ds._d(r["net"]), total_net),
+                  "qshare": pct(ds._d(r["qty"]), total_qty)} for r in rows_deep]))
         return {"cards": cards, "visuals": visuals, "covers": covers}
 
     if page_id == "items":
-        items = await ranked_items(scope, 300)
+        band = scope.band if scope.band in CLASS_ORDER else None
+        items = await ranked_items(scope, 400 if band else 300)
+        title = f"Class {band}: every Item in it" if band else "Every Item, best first"
         visuals.append(table(
-            "ranked", "Every Item, best first", "sku",
+            "ranked", title, "sku",
             [{"key": "place", "label": "#", "align": "right"},
              {"key": "cls", "label": "Class"},
              {"key": "label", "label": "Item"},
@@ -247,8 +299,12 @@ async def build(page_id: str, scope: Scope) -> dict:
                 "margin": pct(ds._d(r["net"]) - ds._d(r["cogs"]), ds._d(r["net"])),
                 "running": pct(ds._d(r["running"]), ds._d(r["grand"])),
             } for r in items],
-            note="The first 300 by revenue. Cumulative % is what this Item and everything above it adds up to, "
-                 "which is the line the classes are cut on."))
+            note=(f"Every Item classed {band}, the first {len(items):,} of them by revenue. The place and the "
+                  f"cumulative share are from the whole range, not from this band: that is what makes "
+                  f"“number 412 of {total_items:,}” mean something."
+                  if band else
+                  f"The first {len(items):,} by revenue, of {total_items:,}. Cumulative % is what this Item and "
+                  f"everything above it adds up to, which is the line the classes are cut on.")))
         return {"cards": cards, "visuals": visuals, "covers": covers}
 
     raise KeyError(page_id)

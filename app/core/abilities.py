@@ -125,11 +125,62 @@ for _key, _label, _hint in AREAS:
     ABILITIES.append((AREAS_GROUP, f"accounts.area.{_key}", "R", f"{_label} (see)", _hint))
     ABILITIES.append((AREAS_GROUP, f"accounts.area.{_key}", "W", f"{_label} (use on vouchers)", _hint))
 
+# ── the analytical dashboards, one tick each ──────────────────────────────────────────────────────
+# A dashboard is gated by a resource of its own (see `resources.DASHBOARD_RESOURCES`), and a resource that is
+# not an ability here cannot be given to anybody at all -- so these rows ARE the per-dashboard access the
+# User Access screen offers. The label and the hint are written for whoever is handing access out, which is
+# why they say what the reader would learn rather than repeating the dashboard's own strapline.
+#
+# R only. There is nothing on a dashboard to change and nothing to decide, and a W tick that did nothing
+# would be a question somebody asks once a year forever.
+DASHBOARD_ABILITIES: list[tuple[str, str, str]] = [
+    ("dashboards.sales", "Sales Analysis",
+     "Revenue, profit and margin by branch, department, category, brand and Item, by day and by hour."),
+    ("dashboards.abc", "ABC Analysis",
+     "Which Items earn the money and which only take up shelf, with revenue and units per class."),
+    ("dashboards.xyz", "XYZ Analysis",
+     "Which Items sell steadily and which arrive in lumps, crossed with what they earn."),
+    ("dashboards.stock", "Stock Health",
+     "What stock is worth at cost and at retail, where it sits, and what has not moved."),
+    ("dashboards.branches", "Branch Performance",
+     "Every branch ranked, per trading day, with its people and its till closes."),
+    ("dashboards.accounts-trade", "Trade Accounts",
+     "The named buyers behind the counter trade: who they are, what they take and how often."),
+    ("dashboards.finance", "Finance Overview",
+     "Revenue, cost of sale and what is left, in the order the books add it up. A profit and loss in "
+     "summary: give it only to somebody who may see the company's earnings."),
+    ("dashboards.payables", "Payables and Receivables",
+     "Who we owe and who owes us, aged against each party's credit days. Shows supplier and customer "
+     "balances by name."),
+    ("dashboards.purchasing", "Purchasing and Suppliers",
+     "What was ordered, what arrived, how long it took and who came short, with supplier fill rates."),
+]
+for _resource, _label, _hint in DASHBOARD_ABILITIES:
+    ABILITIES.append(("dashboards", _resource, "R", _label, _hint))
+
+# A dashboard with no ability row is a dashboard nobody can ever be given, and it would fail silently: the
+# board would simply be empty for everyone and the access screen would offer nothing to fix it. Checked at
+# import, against the catalog, so the two lists cannot drift.
+def _check_dashboards() -> None:
+    from app.core.resources import DASHBOARD_RESOURCES
+
+    listed = {r for r, _, _ in DASHBOARD_ABILITIES}
+    missing = set(DASHBOARD_RESOURCES) - listed
+    extra = listed - set(DASHBOARD_RESOURCES)
+    if missing or extra:
+        raise RuntimeError(
+            f"DASHBOARD_ABILITIES does not match DASHBOARD_RESOURCES. "
+            f"Missing a tick: {sorted(missing)}. Ticks for nothing: {sorted(extra)}.")
+
+
+_check_dashboards()
+
 GROUPS: list[tuple[str, str]] = [
     ("godown", "Godown and stock"),
     ("buying", "Buying from suppliers"),
     ("shipping", "Branch requests and shipments"),
     ("company", "The company view"),
+    ("dashboards", "Analytical dashboards"),
     ("admin", "Running head office"),
     ("accounts-books", "Accounts: books and reports"),
     ("accounts-vouchers", "Accounts: vouchers"),

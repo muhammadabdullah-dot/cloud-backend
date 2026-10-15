@@ -95,6 +95,11 @@ class Scope:
     at_start: datetime | None = None
     at_end: datetime | None = None
     picked: dict[str, str] = field(default_factory=dict)
+    # ONE BAND OF A CLASSED DASHBOARD: "A" on ABC Analysis, "X" on XYZ. Not a dimension and deliberately not in
+    # `picked`, because a class is not a column on any table -- it is worked out from the window, by the
+    # dashboard, every time. So `where()` knows nothing about it and only the two dashboards that cut classes
+    # read it, to show one band of the list they already rank. Clicking Class A is what sets it.
+    band: str | None = None
 
     @property
     def timed(self) -> bool:

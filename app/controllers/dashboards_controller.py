@@ -126,6 +126,24 @@ async def page(dashboard: str, page_id: str, scope: Scope, user: User) -> dict:
                  ("branches", "branches"), ("days", "trading days")]
         covers = [{"label": label, "value": covers[key]} for key, label in order if key in covers]
 
+    # A CARD ONLY LEADS SOMEWHERE THAT IS ACTUALLY THERE.
+    #
+    # The card strip is built once per dashboard and served on every page of it, so a card pointing at a chart
+    # on the overview is pointing at nothing when the Items page is being served. Checked here rather than in
+    # each module because every module would otherwise have to thread `page_id` through its card list, and the
+    # one that forgot would ship a figure that looks clickable and does nothing. Dropped, not redirected: a
+    # card quietly becoming plain text on a page that cannot answer it is right, and guessing a different
+    # destination would move the reader somewhere they did not ask to go.
+    here = {v["id"] for v in built.get("visuals", [])}
+    page_ids = {p["id"] for p in meta["pages"]}
+    for c in built.get("cards", []):
+        go = c.get("go")
+        if not go:
+            continue
+        reachable = (go["visual"] in here) if go.get("to") == "screen" else (go.get("page") in page_ids)
+        if not reachable:
+            c["go"] = None
+
     return {
         "id": dashboard, "label": meta["label"], "page": page_id, "pages": meta["pages"],
         # EVERY DASHBOARD CAN BE READ ONE BRANCH AT A TIME, so every page carries the list its picker needs. It
